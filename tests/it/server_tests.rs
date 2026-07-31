@@ -9,15 +9,23 @@
     clippy::similar_names
 )]
 
+#[cfg(feature = "http1")]
 use bytes::Bytes;
+#[cfg(feature = "http1")]
 use std::time::Duration;
-use tachyon_web::{Router, Server, get, post};
+use tachyon_web::{Router, Server};
+#[cfg(feature = "http1")]
+use tachyon_web::{get, post};
+#[cfg(feature = "http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(any(feature = "http1", feature = "cert-gen"))]
 use tokio::net::TcpListener;
 
 /// Binds an ephemeral port, immediately frees it, and returns the `SocketAddr` so a
 /// convenience entry point that takes an address/string (rather than a pre-bound
 /// `TcpListener`) can be exercised without racing a fixed port.
+// Every caller is behind one of these two gates.
+#[cfg(any(feature = "http1", feature = "cert-gen"))]
 async fn free_loopback_addr() -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -56,6 +64,7 @@ async fn test_start_all_invalid_address() {
 // waiting for the body if it actually extracts it. A `413`/timeout can only surface once
 // something reads the body, so this route uses `Bytes` (rather than an arity-0 handler)
 // to exercise the read path.
+#[cfg(feature = "http1")]
 #[tokio::test(start_paused = true)]
 async fn test_server_request_timeout() {
     let router = Router::new().route("/", post(|_body: Bytes| async { "ok" }));
@@ -86,6 +95,7 @@ async fn test_server_request_timeout() {
 // A handler that never touches the body (arity-0) must respond immediately rather than
 // waiting for the (never-sent) body — a deliberate improvement over always buffering the
 // full body up front before dispatching to the handler at all.
+#[cfg(feature = "http1")]
 #[tokio::test]
 async fn test_server_ignores_unread_body_for_bodyless_handler() {
     let router = Router::new().route("/", post(|| async { "ok" }));
@@ -127,6 +137,7 @@ async fn test_server_ignores_unread_body_for_bodyless_handler() {
 // need to prove the address-parsing/binding/QUIC-setup convenience layer on top actually works,
 // so they stay minimal (one request each) rather than re-testing HTTP semantics again.
 
+#[cfg(feature = "http1")]
 #[tokio::test]
 async fn test_start_http_addr() {
     let addr = free_loopback_addr().await;
@@ -145,6 +156,7 @@ async fn test_start_http_addr() {
     handle.abort();
 }
 
+#[cfg(feature = "http1")]
 #[tokio::test]
 async fn test_start_http_with_address_string() {
     let addr = free_loopback_addr().await;
@@ -304,6 +316,7 @@ async fn test_start_https_and_h3_with_config() {
     handle.abort();
 }
 
+#[cfg(feature = "http1")]
 #[tokio::test]
 async fn test_free_serve_function() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

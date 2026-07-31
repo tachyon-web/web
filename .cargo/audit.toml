@@ -1,0 +1,36 @@
+# cargo-audit configuration.
+#
+# Every entry below is an advisory that is real but that this crate cannot act on: the
+# affected code is reached only through a transitive dependency with no patched release
+# available. Each one is listed with why it is not exploitable here and what would let us
+# drop the exemption — an ignore without that reasoning is just a silenced alarm.
+#
+# Re-check this list whenever `Cargo.lock` changes. Anything that becomes fixable upstream
+# should be fixed and removed from here, not left to rot.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack": non-constant-time RSA in the `rsa` crate.
+    #
+    # Reached only via `arti-client -> tor-key-forge -> ssh-key-fork-arti -> rsa`, so it is
+    # present only in builds with the `tor` feature. Arti uses it to parse OpenSSH-format
+    # key files on local disk, not for RSA operations against network-controlled input, and
+    # the attack requires an attacker who can observe timing of RSA private-key operations
+    # over the network. No patched version of `rsa` exists (the fix is a full rewrite to a
+    # constant-time implementation, still in progress upstream).
+    #
+    # Drop this once `rsa` ships a constant-time release and Arti bumps to it.
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0436 — `paste` is unmaintained (archived by its author).
+    #
+    # Informational only: no vulnerability, and it is a compile-time proc-macro that emits
+    # no runtime code. Transitive, with no direct dependency on it from this crate.
+    "RUSTSEC-2024-0436",
+
+    # RUSTSEC-2025-0141 — `bincode` is unmaintained (development ceased).
+    #
+    # Informational only: no vulnerability. Transitive, and not on any path this crate
+    # feeds attacker-controlled bytes into.
+    "RUSTSEC-2025-0141",
+]

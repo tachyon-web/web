@@ -23,6 +23,8 @@ mod e2e_tests;
 ))]
 mod integration_tests;
 mod server_tests;
+// Its only test drives the server with an HTTP/1.1 client.
+#[cfg(feature = "http1")]
 mod static_dir_tests;
 
 #[cfg(feature = "lets-encrypt")]

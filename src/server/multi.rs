@@ -28,7 +28,7 @@ enum Transport {
 }
 
 /// Builds a group of transports to drive concurrently from one [`Server`] — see the
-/// [module docs](self).
+/// [module docs](crate::server#publishing-over-more-than-one-transport-at-once).
 ///
 /// Constructed via [`Server::with_http`]/[`Server::with_https`]/[`Server::with_onion`]/
 /// [`Server::with_i2p`]/[`Server::with_h3`], chained with more of the same to add further

@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -62,11 +62,6 @@ jobs:
         with:
           key: tor
       - run: cargo clippy --locked -p tachyon-web --all-targets --features tor,tls,cert-gen
-      # The onion round-trip test that bootstraps Arti against the live Tor network is
-      # `#[ignore]`d and stays that way here: it needs real network egress and can take
-      # minutes to publish and become reachable, which is a flaky signal, not a useful one.
-      # Everything else — routing decisions, the redirect builder, the `OnionConfig`
-      # contract — is offline and does run.
       - run: cargo test --locked -p tachyon-web --features tor,tls,cert-gen
 
   i2p:
@@ -74,22 +69,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # i2pd-sys vendors every source it needs (zlib, Boost subset, AWS-LC, libi2pd) and
-      # never fetches at build time — so a C++17 compiler and CMake are the whole
-      # requirement. No system boost/openssl/i2pd packages.
       - name: Install CMake
         run: sudo apt-get update && sudo apt-get install -y cmake
-      # Keyed separately from every other job: this cache holds the compiled C++ artifacts
-      # and is the difference between a ~10-minute run and a ~60-minute one.
       - uses: Swatinem/rust-cache@v2
         with:
           key: i2p
       - run: cargo clippy --locked -p tachyon-web --all-targets --features i2p,tls,cert-gen
-      # As with tor: the eepsite round-trip against the live I2P network is `#[ignore]`d.
       - run: cargo test --locked -p tachyon-web --features i2p,tls,cert-gen
 
   # Both transports plus everything else, in one build — the configuration `docs.rs`
@@ -100,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
