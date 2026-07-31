@@ -12,8 +12,13 @@ use tokio::net::TcpListener;
 /// One transport this [`MultiServer`] will drive, alongside its configuration.
 enum Transport {
     Http(TcpListener),
+    // Boxed because `rustls::ServerConfig` is ~280 bytes against the ~40 of the next-largest
+    // variant, and `Vec<Transport>` pays the largest variant's size for *every* element — so
+    // an unboxed config made a plain HTTP-only `MultiServer` seven times bigger than it needs
+    // to be. Boxing costs one allocation per HTTPS transport, of which there are a handful at
+    // startup and never any afterwards.
     #[cfg(feature = "tls")]
-    Https(TcpListener, rustls::ServerConfig),
+    Https(TcpListener, Box<rustls::ServerConfig>),
     #[cfg(feature = "http3")]
     H3(s2n_quic::Server),
     #[cfg(feature = "tor")]
@@ -64,7 +69,8 @@ where
     /// [`Server::serve_https_config`]. Requires the `tls` feature.
     #[cfg(feature = "tls")]
     pub fn with_https(mut self, listener: TcpListener, config: rustls::ServerConfig) -> Self {
-        self.transports.push(Transport::Https(listener, config));
+        self.transports
+            .push(Transport::Https(listener, Box::new(config)));
         self
     }
 
@@ -126,7 +132,7 @@ where
                 Transport::Https(listener, config) => {
                     set.spawn(async move {
                         server
-                            .serve_https_config(listener, config)
+                            .serve_https_config(listener, *config)
                             .await
                             .map_err(Into::into)
                     });

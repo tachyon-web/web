@@ -237,17 +237,13 @@ mod tests {
     }
 
     /// Builds a self-signed `rustls::ServerConfig` (ALPN "h3") from PEM cert/key strings.
-    /// Hand-rolled with `rustls_pemfile` (mirroring `Server::start_all_inner`/`RustlsConfig::
+    /// Hand-rolled via `crate::tls::pem` (mirroring `Server::start_all_inner`/`RustlsConfig::
     /// from_pem` in `server/mod.rs`) rather than reusing `TlsPolicy::server_config_from_pem`, so
     /// this test module only needs `cert-gen` — not also `tor`/`i2p` — to compile.
     fn build_server_config(cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
-        let cert_chain: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_pem.as_bytes())
-                .filter_map(Result::ok)
-                .collect();
-        let key_der: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-            .expect("parse private key")
-            .expect("private key present in PEM");
+        let cert_chain: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_pem.as_bytes());
+        let key_der: PrivateKeyDer<'static> =
+            crate::tls::pem::private_key(key_pem.as_bytes()).expect("parse private key");
 
         let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()

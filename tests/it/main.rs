@@ -13,7 +13,14 @@
 
 #[cfg(feature = "cookies")]
 mod advanced_tests;
+#[cfg(feature = "json")]
 mod e2e_tests;
+#[cfg(all(
+    feature = "json",
+    feature = "form",
+    feature = "query",
+    feature = "cookies"
+))]
 mod integration_tests;
 mod server_tests;
 mod static_dir_tests;
@@ -22,7 +29,7 @@ mod static_dir_tests;
 mod acme_tests;
 #[cfg(feature = "i2p")]
 mod i2p_tests;
-#[cfg(all(feature = "tls", feature = "http3"))]
+#[cfg(all(feature = "cert-gen", feature = "http3"))]
 mod tls_h3_tests;
 #[cfg(feature = "tor")]
 mod tor_tests;

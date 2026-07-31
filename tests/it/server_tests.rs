@@ -37,7 +37,7 @@ fn test_server_debug_and_config() {
 }
 
 #[tokio::test]
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 async fn test_start_all_invalid_address() {
     let router = Router::new();
     let server = Server::new(router);
@@ -174,7 +174,7 @@ async fn test_start_http_rejects_unparseable_address() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[tokio::test]
 async fn test_start_https_with_config_addr() {
     use tachyon_web::tls::generate_self_signed_cert;
@@ -210,7 +210,7 @@ async fn test_start_https_with_config_addr() {
     handle.abort();
 }
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[tokio::test]
 async fn test_start_https_with_config_string() {
     use tachyon_web::tls::generate_self_signed_cert;
@@ -247,7 +247,7 @@ async fn test_start_https_with_config_string() {
     handle.abort();
 }
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[tokio::test]
 async fn test_start_https_with_config_rejects_unparseable_address() {
     use tachyon_web::tls::generate_self_signed_cert;
@@ -266,7 +266,7 @@ async fn test_start_https_with_config_rejects_unparseable_address() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
 
-#[cfg(all(feature = "tls", feature = "http3"))]
+#[cfg(all(feature = "cert-gen", feature = "http3"))]
 #[tokio::test]
 async fn test_start_https_and_h3_with_config() {
     use tachyon_web::tls::generate_self_signed_cert;
@@ -323,7 +323,7 @@ async fn test_free_serve_function() {
     handle.abort();
 }
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[tokio::test]
 async fn test_bind_rustls_https_server_serve() {
     use tachyon_web::RustlsConfig;
@@ -355,7 +355,7 @@ async fn test_bind_rustls_https_server_serve() {
     handle.abort();
 }
 
-#[cfg(all(feature = "tls", feature = "http3"))]
+#[cfg(all(feature = "cert-gen", feature = "http3"))]
 #[tokio::test]
 async fn test_bind_rustls_https_server_serve_with_http3_enabled() {
     use tachyon_web::RustlsConfig;

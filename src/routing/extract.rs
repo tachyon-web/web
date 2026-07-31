@@ -1338,6 +1338,7 @@ mod tests {
     use hyper::http::Request;
     use serde::Deserialize;
 
+    #[cfg(any(feature = "query", feature = "form"))]
     #[derive(Deserialize, Debug)]
     #[allow(clippy::struct_excessive_bools)]
     struct BigCoerce {
@@ -1367,6 +1368,7 @@ mod tests {
         Blue,
     }
 
+    #[cfg(any(feature = "query", feature = "form"))]
     #[derive(Deserialize)]
     struct EnumTest {
         val: Color,

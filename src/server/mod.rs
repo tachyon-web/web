@@ -871,28 +871,12 @@ where
         key_pem: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use rustls_pemfile::{certs, private_key};
         enforce_fips_compliance()?;
 
-        let mut cert_reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
-            .filter_map(std::result::Result::ok)
-            .collect();
+        let cert_chain: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_pem.as_bytes());
 
-        let mut key_reader = std::io::BufReader::new(key_pem.as_bytes());
-        let key_der: PrivateKeyDer<'static> = private_key(&mut key_reader)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to read private key: {e}"),
-                )
-            })?
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "No private key found in PEM",
-                )
-            })?;
+        let key_der: PrivateKeyDer<'static> = crate::tls::pem::private_key(key_pem.as_bytes())
+            .map_err(|e| crate::tls::pem::key_io_error(&e))?;
 
         // Shares the same crypto/TLS policy as the onion/i2p listeners — see
         // `Server::tls_policy`. Call `.tls_policy(TlsPolicy::hardened().tls13_only())` (or a
@@ -1160,24 +1144,11 @@ impl RustlsConfig {
     #[allow(clippy::unused_async)]
     pub async fn from_pem(cert: Vec<u8>, key: Vec<u8>) -> Result<Self, std::io::Error> {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use rustls_pemfile::{certs, private_key};
 
-        let mut cert_reader = std::io::BufReader::new(cert.as_slice());
-        let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
-            .filter_map(std::result::Result::ok)
-            .collect();
+        let cert_chain: Vec<CertificateDer<'static>> = crate::tls::pem::certs(&cert);
 
-        let mut key_reader = std::io::BufReader::new(key.as_slice());
-        let key_der: PrivateKeyDer<'static> = private_key(&mut key_reader)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to read private key: {e}"),
-                )
-            })?
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "No private key found in PEM")
-            })?;
+        let key_der: PrivateKeyDer<'static> =
+            crate::tls::pem::private_key(&key).map_err(|e| crate::tls::pem::key_io_error(&e))?;
 
         let mut server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -1353,7 +1324,7 @@ mod tests {
         )));
     }
 
-    #[cfg(feature = "tls")]
+    #[cfg(feature = "cert-gen")]
     #[test]
     fn rustls_config_debug_smoke() {
         let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
@@ -1379,7 +1350,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
-    #[cfg(feature = "tls")]
+    #[cfg(feature = "cert-gen")]
     #[tokio::test]
     async fn rustls_config_from_pem_builds_from_a_valid_self_signed_cert() {
         let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
@@ -1390,7 +1361,7 @@ mod tests {
         assert!(!config.server_config.alpn_protocols.is_empty());
     }
 
-    #[cfg(feature = "tls")]
+    #[cfg(feature = "cert-gen")]
     #[test]
     fn bind_rustls_and_https_server_builders() {
         let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])

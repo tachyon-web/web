@@ -18,7 +18,6 @@ on:
       - 'src/server/i2p.rs'
       - 'src/server/conn.rs'
       - 'src/anonymity.rs'
-      - 'tachyon-i2p/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/transports.yml'
@@ -28,7 +27,6 @@ on:
       - 'src/server/i2p.rs'
       - 'src/server/conn.rs'
       - 'src/anonymity.rs'
-      - 'tachyon-i2p/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/transports.yml'
@@ -93,7 +91,6 @@ jobs:
       - run: cargo clippy --locked -p tachyon-web --all-targets --features i2p,tls,cert-gen
       # As with tor: the eepsite round-trip against the live I2P network is `#[ignore]`d.
       - run: cargo test --locked -p tachyon-web --features i2p,tls,cert-gen
-      - run: cargo test --locked -p tachyon-i2p
 
   # Both transports plus everything else, in one build — the configuration `docs.rs`
   # publishes and the one the `anonymity_guard` middleware is actually written for (it is

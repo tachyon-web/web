@@ -600,6 +600,7 @@ impl IntoResponse for Redirect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cookies")]
     use crate::routing::extract::Cookies;
     use hyper::HeaderMap;
 
@@ -689,9 +690,12 @@ mod tests {
         assert_eq!(r6.status(), StatusCode::CREATED);
         assert_eq!(r6.headers().get("x-custom").unwrap(), "val");
 
-        let cookies = Cookies::new();
-        let r7 = (StatusCode::ACCEPTED, cookies, "body").into_response();
-        assert_eq!(r7.status(), StatusCode::ACCEPTED);
+        #[cfg(feature = "cookies")]
+        {
+            let cookies = Cookies::new();
+            let r7 = (StatusCode::ACCEPTED, cookies, "body").into_response();
+            assert_eq!(r7.status(), StatusCode::ACCEPTED);
+        }
 
         let r8 = ().into_response();
         assert_eq!(r8.status(), StatusCode::OK);

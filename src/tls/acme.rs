@@ -521,14 +521,9 @@ impl AcmeManager {
         let cert_pem = fs::read_to_string(cert_path)?;
         let key_pem = fs::read_to_string(key_path)?;
 
-        let mut cert_reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .filter_map(std::result::Result::ok)
-            .collect();
-
-        let mut key_reader = std::io::BufReader::new(key_pem.as_bytes());
-        let key =
-            rustls_pemfile::private_key(&mut key_reader)?.ok_or(AcmeError::MissingPrivateKey)?;
+        let certs: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_pem.as_bytes());
+        let key = crate::tls::pem::private_key(key_pem.as_bytes())
+            .map_err(|_| AcmeError::MissingPrivateKey)?;
 
         Ok((certs, key))
     }
@@ -648,14 +643,9 @@ impl AcmeManager {
         }
 
         // 9. Parse PEM → DER for immediate use in rustls.
-        let mut cert_reader = std::io::BufReader::new(cert_chain_pem.as_bytes());
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-            .filter_map(std::result::Result::ok)
-            .collect();
-
-        let mut key_reader = std::io::BufReader::new(private_key_pem.as_bytes());
-        let key =
-            rustls_pemfile::private_key(&mut key_reader)?.ok_or(AcmeError::MissingPrivateKey)?;
+        let certs: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_chain_pem.as_bytes());
+        let key = crate::tls::pem::private_key(private_key_pem.as_bytes())
+            .map_err(|_| AcmeError::MissingPrivateKey)?;
 
         Ok((certs, key))
     }

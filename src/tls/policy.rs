@@ -121,24 +121,10 @@ impl TlsPolicy {
         cert: &[u8],
         key: &[u8],
     ) -> Result<rustls::ServerConfig, std::io::Error> {
-        use rustls_pemfile::{certs, private_key};
+        let cert_chain: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert);
 
-        let mut cert_reader = std::io::BufReader::new(cert);
-        let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
-            .filter_map(std::result::Result::ok)
-            .collect();
-
-        let mut key_reader = std::io::BufReader::new(key);
-        let key_der: PrivateKeyDer<'static> = private_key(&mut key_reader)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to read private key: {e}"),
-                )
-            })?
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "No private key found in PEM")
-            })?;
+        let key_der: PrivateKeyDer<'static> =
+            crate::tls::pem::private_key(key).map_err(|e| crate::tls::pem::key_io_error(&e))?;
 
         let mut server_config = rustls::ServerConfig::builder_with_provider(self.provider())
             .with_protocol_versions(&self.versions)
