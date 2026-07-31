@@ -127,7 +127,6 @@ members = [
     "benches/static",
     "benches/api",
     "parity-tests",
-    "tachyon-i2p",
 ]
 
 [workspace.dependencies]

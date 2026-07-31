@@ -2723,9 +2723,9 @@ dependencies = [
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.13"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "818356c5132c1fede50f837ca96afbe78ff42413047f4abb886217845e1b6c8c"
+checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
 dependencies = [
  "subtle",
  "typenum",
@@ -6092,15 +6092,6 @@ dependencies = [
 [[package]]
 name = "tachyon-i2p"
 version = "0.0.2"
-dependencies = [
- "i2pd-sys",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "tachyon-i2p"
-version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27cfc0b8592cf123689b9da458a6dffe0a6a7cc19ff0df568eaac547c32f92b0"
 dependencies = [
@@ -6140,7 +6131,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.6.5",
- "tachyon-i2p 0.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tachyon-i2p",
  "tempfile",
  "tokio",
  "tokio-rustls",
