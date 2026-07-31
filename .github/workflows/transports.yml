@@ -58,8 +58,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # `prefix-key` bumped to discard caches populated while `.cargo/config.toml` still set
+      # `-C target-cpu=native`: those hold `target/` artifacts built for whichever runner CPU
+      # happened to serve that run, and restoring them onto a different host is what produced
+      # `SIGILL`. rust-cache keys on Cargo.lock and the toolchain, not on the cargo config, so
+      # nothing else would evict them.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: tor
       - run: cargo clippy --locked -p tachyon-web --all-targets --features tor,tls,cert-gen
       - run: cargo test --locked -p tachyon-web --features tor,tls,cert-gen
@@ -75,8 +81,14 @@ jobs:
           components: clippy
       - name: Install CMake
         run: sudo apt-get update && sudo apt-get install -y cmake
+      # `prefix-key` bumped to discard caches populated while `.cargo/config.toml` still set
+      # `-C target-cpu=native`: those hold `target/` artifacts built for whichever runner CPU
+      # happened to serve that run, and restoring them onto a different host is what produced
+      # `SIGILL`. rust-cache keys on Cargo.lock and the toolchain, not on the cargo config, so
+      # nothing else would evict them.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: i2p
       - run: cargo clippy --locked -p tachyon-web --all-targets --features i2p,tls,cert-gen
       - run: cargo test --locked -p tachyon-web --features i2p,tls,cert-gen
@@ -95,8 +107,14 @@ jobs:
           components: clippy
       - name: Install CMake
         run: sudo apt-get update && sudo apt-get install -y cmake
+      # `prefix-key` bumped to discard caches populated while `.cargo/config.toml` still set
+      # `-C target-cpu=native`: those hold `target/` artifacts built for whichever runner CPU
+      # happened to serve that run, and restoring them onto a different host is what produced
+      # `SIGILL`. rust-cache keys on Cargo.lock and the toolchain, not on the cargo config, so
+      # nothing else would evict them.
       - uses: Swatinem/rust-cache@v2
         with:
+          prefix-key: v1-rust
           key: all-features
       - run: cargo clippy --locked -p tachyon-web --all-targets --all-features
       - run: cargo test --locked -p tachyon-web --all-features

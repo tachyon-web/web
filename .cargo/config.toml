@@ -1,5 +1,20 @@
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# NOTE: deliberately no `[build] rustflags = ["-C", "target-cpu=native"]` here.
+#
+# `[build]` applies to every `cargo build`/`cargo test` anyone runs in this workspace, and
+# `target-cpu=native` bakes in whatever instruction set the *compiling* machine happens to
+# support. That makes the resulting artifacts non-portable, which breaks the moment build
+# and execution are not the same machine — most visibly in CI, where `Swatinem/rust-cache`
+# restores a `target/` directory populated on a previous runner. GitHub's `ubuntu-latest`
+# pool mixes Intel (AVX-512-capable) and AMD hosts, so a cache built on one and restored on
+# the other yields `SIGILL: illegal instruction` the instant a test touches vectorized code.
+#
+# To get the same codegen for local benchmarking, pass it per-invocation instead — this
+# affects only that command, and never leaks into a cached `target/` that CI might reuse:
+#
+#     RUSTFLAGS="-C target-cpu=native" cargo bench
+#
+# Or set it once for your own machine in your user-global `~/.cargo/config.toml`, which is
+# not committed and so cannot follow the repo into CI.
 
 [profile.bench]
 lto = "thin"

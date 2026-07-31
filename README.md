@@ -234,14 +234,14 @@ meaningful). Enable only what you need, e.g. HTTP/1.1 + HTTP/2 + TLS with
 everything else off:
 
 ```toml
-tachyon-web = { version = "0.0.1", default-features = false, features = ["http1", "http2", "tls"] }
+tachyon-web = { version = "0.0.3", default-features = false, features = ["http1", "http2", "tls"] }
 ```
 
 Or the smallest possible build — HTTP/1.1 cleartext only, no JSON/Form/Query/
 MatchedPath/OriginalUri, no TLS, no crypto deps at all:
 
 ```toml
-tachyon-web = { version = "0.0.1", default-features = false, features = ["http1"] }
+tachyon-web = { version = "0.0.3", default-features = false, features = ["http1"] }
 ```
 
 ### HTTP/2 over cleartext (h2c)
