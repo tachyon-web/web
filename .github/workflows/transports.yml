@@ -16,6 +16,7 @@ on:
     paths:
       - 'src/server/tor.rs'
       - 'src/server/i2p.rs'
+      - 'src/server/conn.rs'
       - 'src/anonymity.rs'
       - 'tachyon-i2p/**'
       - 'Cargo.toml'
@@ -25,6 +26,7 @@ on:
     paths:
       - 'src/server/tor.rs'
       - 'src/server/i2p.rs'
+      - 'src/server/conn.rs'
       - 'src/anonymity.rs'
       - 'tachyon-i2p/**'
       - 'Cargo.toml'
@@ -34,9 +36,15 @@ on:
     - cron: '0 4 * * 1'
   workflow_dispatch:
 
+# Same rule as the main CI workflow, and it matters even more here: these jobs run for
+# tens of minutes, so a superseded run is tens of minutes of wasted runner time. A new
+# push to the same ref cancels the one already going.
 concurrency:
   group: transports-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always

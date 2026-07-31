@@ -6,9 +6,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Any new push supersedes the run already in flight for the same ref — that older run is
+# testing code nobody is looking at any more, so it is cancelled outright rather than left
+# to finish. The group key is per-ref, so `main` and each PR keep independent lanes; only a
+# run for the *same* ref gets displaced.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +24,7 @@ env:
 jobs:
   # ── Fast gate ───────────────────────────────────────────────────────────────
   # Formatting is seconds-cheap and needs no dependency build, so it runs alone and
-  # fails before anything expensive is scheduled.
+  # fails before anything expensive gets far.
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
@@ -45,8 +52,8 @@ jobs:
 
   # ── Unit + integration tests, default features ──────────────────────────────
   # Scoped to `-p tachyon-web` on purpose: the workspace also contains `benches/*`, which
-  # pull in axum/actix/rocket/salvo purely for comparison benchmarking. Those are not
-  # this crate's dependencies and have no business being built on every CI run.
+  # pull in axum/actix/rocket/salvo purely for comparison benchmarking. Those are not this
+  # crate's dependencies and have no business being built on every CI run.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -63,12 +70,15 @@ jobs:
   # ── Feature-combination matrix ──────────────────────────────────────────────
   # Every optional feature gates real `#[cfg]` code, so a combination nobody builds is a
   # combination that silently stops compiling. This covers each independently-toggleable
-  # axis without ever building `--all-features` (which drags in Arti and a from-source
-  # C++ I2P router — see the `transports` workflow, where those live).
+  # axis without ever building `--all-features` (which drags in Arti and a from-source C++
+  # I2P router — see the `transports` workflow, where those live).
   features:
     name: "features: ${{ matrix.name }}"
     runs-on: ubuntu-latest
     strategy:
+      # Same reasoning as above, and it matters more here: when a change breaks feature
+      # gating you want the full list of which combinations broke in one run, not just
+      # whichever one happened to fail first.
       fail-fast: false
       matrix:
         include:
@@ -92,8 +102,8 @@ jobs:
             flags: --features lets-encrypt
           - name: http/3 (quic)
             flags: --features http3
-          # Everything that does not require an anonymity transport, together — this is
-          # the combination most real deployments actually build.
+          # Everything that does not require an anonymity transport, together — the
+          # combination most real deployments actually build.
           - name: full (no tor/i2p)
             flags: --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3
     steps:
@@ -123,10 +133,10 @@ jobs:
       - run: cargo test --locked -p parity-tests
 
   # ── MSRV ────────────────────────────────────────────────────────────────────
-  # `rust-version = "1.92"` in Cargo.toml is a published compatibility promise; without a
-  # job pinned to it, the first use of a newer stdlib API breaks downstream users rather
-  # than CI. `cargo check` (not `test`) is enough — dev-dependencies are not covered by
-  # the MSRV promise.
+  # `rust-version` in Cargo.toml is a published compatibility promise; without a job
+  # pinned to it, the first use of a newer stdlib API breaks downstream users rather than
+  # CI. `cargo check` (not `test`) is enough — dev-dependencies aren't covered by the MSRV
+  # promise.
   msrv:
     name: msrv (1.92)
     runs-on: ubuntu-latest
@@ -159,6 +169,10 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
