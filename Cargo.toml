@@ -1,0 +1,172 @@
+[package]
+name = "tachyon-web"
+version = "0.0.3"
+edition = "2024"
+rust-version = "1.92"
+authors = ["Hacer"]
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+description = "A fast, Axum-compatible async web framework with native TLS, HTTP/3, Tor (.onion), and I2P (.i2p) support"
+repository = "https://github.com/tachyon-web/web"
+homepage = "https://github.com/tachyon-web/web"
+documentation = "https://docs.rs/tachyon-web"
+keywords = ["web", "framework", "server", "routing"]
+categories = ["web-programming", "development-tools::debugging", "development-tools::profiling"]
+
+[dependencies]
+# Async & Concurrency
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+pin-project-lite = "0.2"
+
+# HTTP & Web
+hyper = { version = "1", default-features = false, features = ["server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+
+# QUIC & HTTP/3
+s2n-quic = { version = "1.84", default-features = false, features = ["provider-tls-rustls"], optional = true }
+h3 = { version = "0.0.8", optional = true }
+s2n-quic-h3 = { version = "0.2", optional = true }
+
+# TLS & Cryptography
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "prefer-post-quantum"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
+aws-lc-rs = { version = "1.17", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "aws-lc-rs"], optional = true }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"], optional = true }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+
+# Utilities & Performance
+bytes = "1"
+tracing = "0.1"
+matchit = "0.9"
+socket2 = { version = "0.6", features = ["all"] }
+cookie = { version = "0.18", features = ["percent-encode"], optional = true }
+core_affinity = "0.8"
+rustc-hash = "2"
+
+# Optional Tower interop (see the `tower` feature) — not used on the native hot path.
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
+
+# Optional WebSocket support (see the `ws` feature).
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"], optional = true }
+
+# Optional Server-Sent Events support (see the `sse` feature).
+futures-core = { version = "0.3", default-features = false, optional = true }
+
+# Optional native .onion hidden-service support (see the `tor` feature).
+arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
+tor-hsservice = { version = "0.44", default-features = false, optional = true }
+tor-proto = { version = "0.44", default-features = false, features = ["hs-service"], optional = true }
+tor-cell = { version = "0.44", default-features = false, optional = true }
+safelog = { version = "0.9", default-features = false, optional = true }
+tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"], optional = true }
+tor-guardmgr = { version = "0.44", default-features = false, features = ["vanguards"], optional = true }
+tor-config = { version = "0.44", default-features = false, optional = true }
+
+# Optional native .i2p eepsite support (see the `i2p` feature).
+tachyon-i2p = { version = "0.0.2", optional = true, default-features = false }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "cookies", "form"] }
+tempfile = "3.27"
+tokio-stream = "0.1"
+tokio = { version = "1", features = ["test-util"] }
+futures = "0.3"
+hyper = { version = "1", features = ["client", "http2"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+[features]
+default = [
+    "json", "matched-path", "original-uri",
+    "http1", "http2", "tower-log", "form", "query", "cookies",
+]
+
+# Axum-parity features
+http1 = ["hyper/http1", "hyper-util/http1"]
+http2 = ["hyper/http2", "hyper-util/http2"]
+json = ["dep:serde_json"]
+cookies = ["dep:cookie"]
+matched-path = []
+original-uri = []
+tower-log = ["tower?/log"]
+ws = ["dep:tungstenite", "dep:futures-util", "dep:flate2"]
+form = []
+query = []
+
+# Tachyon-only additions
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls-pemfile"]
+cert-gen = ["dep:rcgen", "tls"]
+http3 = ["dep:s2n-quic", "dep:h3", "dep:s2n-quic-h3", "tls"]
+fips = [
+    "aws-lc-rs?/fips", "rustls?/fips", "instant-acme?/fips", "rcgen?/fips", 
+    "tachyon-i2p?/fips", "s2n-quic-h3?/fips", "s2n-quic?/provider-tls-fips",
+]
+lets-encrypt = ["dep:instant-acme", "dep:webpki", "dep:serde_json", "tls", "cert-gen"]
+tower = ["dep:tower"]
+sse = ["dep:futures-core", "dep:serde_json"]
+tor = [
+    "dep:arti-client", "dep:tor-hsservice", "dep:tor-proto", "dep:tor-cell",
+    "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",
+]
+i2p = ["dep:tachyon-i2p", "tachyon-i2p/aws-lc"]
+
+[workspace]
+members = [
+    ".",
+    "benches/optimistic",
+    "benches/static",
+    "benches/api",
+    "parity-tests",
+    "tachyon-i2p",
+]
+
+[workspace.dependencies]
+tokio = { version = "1" }
+serde = { version = "1" }
+serde_json = "1"
+axum = "0.8"
+axum-server = "0.8"
+actix-web = "4"
+actix-files = "0.6"
+rocket = "0.5"
+salvo = "0.95"
+tower-http = "0.7"
+rustls = { version = "0.23", default-features = false }
+rustls-pki-types = "1"
+
+[lints.rust]
+warnings = "deny"
+future_incompatible = "deny"
+unused = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unreachable_pub = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+nursery = "deny"
+cargo = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[[example]]
+name = "onion_i2p_server"
+required-features = ["tor", "i2p"]
+
+[package.metadata.docs.rs]
+all-features = true

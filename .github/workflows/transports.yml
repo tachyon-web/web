@@ -1,0 +1,108 @@
+name: Anonymity transports
+
+# The `tor` and `i2p` features are split out of the main CI workflow because they are in a
+# different cost class entirely:
+#
+#   * `tor` links Arti — ~40 crates of pure Rust, but a long link step.
+#   * `i2p` builds a real in-process I2P router: `i2pd-sys` compiles vendored zlib, a Boost
+#     subset, AWS-LC and libi2pd from C++ source via CMake. That is tens of minutes cold.
+#
+# Running either on every push to every branch would make CI useless as a fast signal, so
+# they run on changes that can actually affect them, on a weekly cron (to catch upstream
+# breakage in Arti/i2pd independently of this repo changing), and on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/server/tor.rs'
+      - 'src/server/i2p.rs'
+      - 'src/anonymity.rs'
+      - 'tachyon-i2p/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/transports.yml'
+  pull_request:
+    paths:
+      - 'src/server/tor.rs'
+      - 'src/server/i2p.rs'
+      - 'src/anonymity.rs'
+      - 'tachyon-i2p/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/transports.yml'
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: transports-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  tor:
+    name: tor (.onion)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tor
+      - run: cargo clippy --locked -p tachyon-web --all-targets --features tor,tls,cert-gen
+      # The onion round-trip test that bootstraps Arti against the live Tor network is
+      # `#[ignore]`d and stays that way here: it needs real network egress and can take
+      # minutes to publish and become reachable, which is a flaky signal, not a useful one.
+      # Everything else — routing decisions, the redirect builder, the `OnionConfig`
+      # contract — is offline and does run.
+      - run: cargo test --locked -p tachyon-web --features tor,tls,cert-gen
+
+  i2p:
+    name: i2p (.b32.i2p)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # i2pd-sys vendors every source it needs (zlib, Boost subset, AWS-LC, libi2pd) and
+      # never fetches at build time — so a C++17 compiler and CMake are the whole
+      # requirement. No system boost/openssl/i2pd packages.
+      - name: Install CMake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+      # Keyed separately from every other job: this cache holds the compiled C++ artifacts
+      # and is the difference between a ~10-minute run and a ~60-minute one.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: i2p
+      - run: cargo clippy --locked -p tachyon-web --all-targets --features i2p,tls,cert-gen
+      # As with tor: the eepsite round-trip against the live I2P network is `#[ignore]`d.
+      - run: cargo test --locked -p tachyon-web --features i2p,tls,cert-gen
+      - run: cargo test --locked -p tachyon-i2p
+
+  # Both transports plus everything else, in one build — the configuration `docs.rs`
+  # publishes and the one the `anonymity_guard` middleware is actually written for (it is
+  # gated on `tor` *or* `i2p`, so a single-transport build never type-checks all of it).
+  all-features:
+    name: all features
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install CMake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: all-features
+      - run: cargo clippy --locked -p tachyon-web --all-targets --all-features
+      - run: cargo test --locked -p tachyon-web --all-features

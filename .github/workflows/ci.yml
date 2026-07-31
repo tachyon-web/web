@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ── Fast gate ───────────────────────────────────────────────────────────────
+  # Formatting is seconds-cheap and needs no dependency build, so it runs alone and
+  # fails before anything expensive is scheduled.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # ── Lints ───────────────────────────────────────────────────────────────────
+  # `Cargo.toml`'s `[lints]` already sets `warnings = "deny"` plus clippy
+  # pedantic/nursery/cargo and the `unwrap_used`/`expect_used`/`panic` bans, so a plain
+  # `cargo clippy` is already a deny-by-default run — no extra `RUSTFLAGS` needed.
+  clippy:
+    name: clippy (default features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked -p tachyon-web --all-targets
+
+  # ── Unit + integration tests, default features ──────────────────────────────
+  # Scoped to `-p tachyon-web` on purpose: the workspace also contains `benches/*`, which
+  # pull in axum/actix/rocket/salvo purely for comparison benchmarking. Those are not
+  # this crate's dependencies and have no business being built on every CI run.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p tachyon-web
+
+  # ── Feature-combination matrix ──────────────────────────────────────────────
+  # Every optional feature gates real `#[cfg]` code, so a combination nobody builds is a
+  # combination that silently stops compiling. This covers each independently-toggleable
+  # axis without ever building `--all-features` (which drags in Arti and a from-source
+  # C++ I2P router — see the `transports` workflow, where those live).
+  features:
+    name: "features: ${{ matrix.name }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The floor: `lib.rs` has a `compile_error!` if neither http1 nor http2 is on,
+          # so `--no-default-features` alone is not a valid configuration.
+          - name: minimal (http1 only)
+            flags: --no-default-features --features http1
+          - name: http2 only (h2c, no HTTP/1.1 fallback)
+            flags: --no-default-features --features http2
+          - name: extractors (json, form, query, cookies)
+            flags: --no-default-features --features http1,json,form,query,cookies,matched-path,original-uri
+          - name: websockets
+            flags: --features ws
+          - name: server-sent events
+            flags: --features sse
+          - name: tower interop
+            flags: --features tower,tower-log
+          - name: tls + self-signed certs
+            flags: --features tls,cert-gen
+          - name: acme / let's encrypt
+            flags: --features lets-encrypt
+          - name: http/3 (quic)
+            flags: --features http3
+          # Everything that does not require an anonymity transport, together — this is
+          # the combination most real deployments actually build.
+          - name: full (no tor/i2p)
+            flags: --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: clippy
+        run: cargo clippy --locked -p tachyon-web --all-targets ${{ matrix.flags }}
+      - name: test
+        run: cargo test --locked -p tachyon-web ${{ matrix.flags }}
+
+  # ── Axum parity ─────────────────────────────────────────────────────────────
+  # `parity-tests` runs the same request against tachyon-web and against real Axum and
+  # asserts the responses match. This is the job that keeps the "1:1 with Axum" claim
+  # honest, so it is a required signal, not an optional extra.
+  parity:
+    name: axum parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p parity-tests
+
+  # ── MSRV ────────────────────────────────────────────────────────────────────
+  # `rust-version = "1.92"` in Cargo.toml is a published compatibility promise; without a
+  # job pinned to it, the first use of a newer stdlib API breaks downstream users rather
+  # than CI. `cargo check` (not `test`) is enough — dev-dependencies are not covered by
+  # the MSRV promise.
+  msrv:
+    name: msrv (1.92)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p tachyon-web --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3
+
+  # ── Docs ────────────────────────────────────────────────────────────────────
+  # `missing_docs` is already denied at compile time; this catches the other half —
+  # broken intra-doc links, which only rustdoc sees. docs.rs builds with all features, so
+  # this job does too (it is doc-only: no codegen, no linking of the native I2P router).
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cmake (i2pd-sys builds its vendored C++ router)
+        run: sudo apt-get update && sudo apt-get install -y cmake
+      - run: cargo doc --locked -p tachyon-web --all-features --no-deps
+
+  # ── Supply chain ────────────────────────────────────────────────────────────
+  # Checks the committed Cargo.lock against the RustSec advisory database. Runs on the
+  # lockfile alone, so it needs no dependency build and costs seconds.
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

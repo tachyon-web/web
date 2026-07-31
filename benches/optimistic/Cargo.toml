@@ -1,0 +1,61 @@
+[package]
+name = "optimistic-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tachyon"
+path = "src/tachyon.rs"
+
+[[bin]]
+name = "tachyon-tls"
+path = "src/tachyon_tls.rs"
+
+[[bin]]
+name = "axum"
+path = "src/axum.rs"
+
+[[bin]]
+name = "axum-tls"
+path = "src/axum_tls.rs"
+
+[[bin]]
+name = "actix"
+path = "src/actix.rs"
+
+[[bin]]
+name = "actix-tls"
+path = "src/actix_tls.rs"
+
+[[bin]]
+name = "rocket"
+path = "src/rocket.rs"
+
+[[bin]]
+name = "salvo"
+path = "src/salvo.rs"
+
+[[bin]]
+name = "salvo-tls"
+path = "src/salvo_tls.rs"
+
+[[bin]]
+name = "tachyon-h3"
+path = "src/tachyon_h3.rs"
+
+[[bin]]
+name = "salvo-h3"
+path = "src/salvo_h3.rs"
+
+[dependencies]
+tachyon-web = { path = "../..", features = ["tls", "cert-gen", "http3"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+serde = { workspace = true, features = ["derive"] }
+axum = { workspace = true }
+axum-server = { workspace = true, features = ["tls-rustls"] }
+actix-web = { workspace = true, features = ["rustls-0_23"] }
+rocket = { workspace = true, features = ["json"] }
+salvo = { workspace = true, features = ["rustls", "quinn"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "logging", "std", "tls12"] }
+rustls-pki-types = { workspace = true }

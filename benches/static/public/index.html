@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Normal Workload Benchmark</title>
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        body {
+            background-color: #f0f2f5;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #1a1a1a;
+        }
+        p {
+            color: #4a4a4a;
+            line-height: 1.6;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Static Workload Testing</h1>
+        <p>This is a simulated workload designed to match 99% of non-API / dynamic websites. We serve HTML, CSS, JS, and image assets.</p>
+        <div id="status">Loading...</div>
+    </div>
+    <script src="/script.js"></script>
+    <script>
+        document.getElementById('status').innerText = 'Benchmark client loaded successfully.';
+    </script>
+</body>
+</html>

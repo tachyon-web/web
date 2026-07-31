@@ -1,0 +1,23 @@
+[package]
+name = "parity-tests"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "Golden-response tests proving tachyon-web's behavior matches real Axum for every feature it claims to mirror."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tachyon-web = { path = "..", features = ["tls", "http2", "cert-gen", "tower", "ws", "sse"] }
+axum = { workspace = true }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+hyper = { version = "1" }
+http-body-util = "0.1"
+bytes = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
