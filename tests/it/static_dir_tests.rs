@@ -1,30 +1,17 @@
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names
-)]
-
-use reqwest::Client;
+use crate::common::TestServer;
 use std::fs;
-use tachyon_web::{Router, ServeDir, Server};
-use tokio::net::TcpListener;
+use tachyon_web::{Router, ServeDir};
 
 #[tokio::test]
 async fn test_static_dir_serving() {
-    let temp_dir = std::env::temp_dir().join("tachyon_static_test2");
-    let _ = fs::remove_dir_all(&temp_dir);
-    fs::create_dir_all(&temp_dir).expect("create dir");
+    // A `tempfile` dir rather than a fixed path under the system temp dir: the fixed path
+    // was shared by every concurrent run of this test (and left behind on failure), so two
+    // runs at once raced over the same files.
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(dir.path().join("index.html"), "<h1>Home</h1>").expect("write html");
+    fs::write(dir.path().join("style.css"), "body { color: red; }").expect("write css");
 
-    fs::write(temp_dir.join("index.html"), "<h1>Home</h1>").expect("write html");
-    fs::write(temp_dir.join("style.css"), "body { color: red; }").expect("write css");
-
-    // Simple API: .index() replaces the confusing .fallback_override()
-    let static_service = ServeDir::new(&temp_dir)
+    let static_service = ServeDir::new(dir.path())
         .index("index.html")
         .preload()
         .await
@@ -32,57 +19,28 @@ async fn test_static_dir_serving() {
 
     // Serve at / — root → index.html, /style.css → style.css
     let app: Router<()> = Router::new().serve_dir("/", static_service);
+    let server = TestServer::spawn(app).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("local_addr").port();
-    let server = Server::new(app);
-    let _handle = tokio::spawn(async move {
-        server.serve_http(listener).await.expect("serve");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let client = Client::new();
-    let base = format!("http://127.0.0.1:{}", port);
-
-    // Root → index.html
-    let res = client
-        .get(format!("{}/", base))
-        .send()
-        .await
-        .expect("get /");
-    assert_eq!(res.status(), 200);
-    assert!(
-        res.headers()
+    for (path, expected_type, expected_body) in [
+        ("/", "text/html", "<h1>Home</h1>"),
+        ("/style.css", "text/css", "body { color: red; }"),
+    ] {
+        let res = server.get(path).send().await.expect("request");
+        assert_eq!(res.status(), 200, "path: {path}");
+        let content_type = res
+            .headers()
             .get("content-type")
-            .unwrap()
+            .expect("content-type")
             .to_str()
-            .unwrap()
-            .starts_with("text/html")
-    );
-    assert_eq!(res.text().await.unwrap(), "<h1>Home</h1>");
+            .expect("utf-8 content-type")
+            .to_owned();
+        assert!(
+            content_type.starts_with(expected_type),
+            "path: {path}, content-type: {content_type}"
+        );
+        assert_eq!(res.text().await.unwrap(), expected_body, "path: {path}");
+    }
 
-    // Direct file path
-    let res = client
-        .get(format!("{}/style.css", base))
-        .send()
-        .await
-        .expect("get css");
-    assert_eq!(res.status(), 200);
-    assert!(
-        res.headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("text/css")
-    );
-    assert_eq!(res.text().await.unwrap(), "body { color: red; }");
-
-    // Missing file → 404
-    let res = client
-        .get(format!("{}/missing.js", base))
-        .send()
-        .await
-        .expect("get missing");
+    let res = server.get("/missing.js").send().await.expect("get missing");
     assert_eq!(res.status(), 404);
 }

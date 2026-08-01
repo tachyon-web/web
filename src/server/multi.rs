@@ -104,8 +104,8 @@ where
     ///
     /// Each transport is driven from an independent clone of this `MultiServer`'s underlying
     /// [`Server`] (cheap — [`Server`]'s settings are `Arc`/`Copy` under the hood), so
-    /// [`Server::max_body_size`]/[`Server::max_connections`]/[`Server::tls_policy`]/
-    /// [`Server::response_jitter`] apply identically across all of them.
+    /// [`Server::max_body_size`]/[`Server::max_connections`]/[`Server::tls_policy`] apply
+    /// identically across all of them.
     ///
     /// # Errors
     ///

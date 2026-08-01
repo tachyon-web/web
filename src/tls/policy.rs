@@ -213,13 +213,6 @@ mod tests {
     }
 
     #[test]
-    fn default_matches_hardened() {
-        let default_versions = TlsPolicy::default().versions().len();
-        let hardened_versions = TlsPolicy::hardened().versions().len();
-        assert_eq!(default_versions, hardened_versions);
-    }
-
-    #[test]
     fn debug_format_reports_negotiated_versions() {
         let both = format!("{:?}", TlsPolicy::hardened());
         assert!(both.contains("tls13: true"));

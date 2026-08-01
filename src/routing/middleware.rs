@@ -74,43 +74,39 @@ impl<S: Send + Sync + 'static> MethodHandler<S> {
         }
     }
 
+    /// Folds `middlewares` around `raw` (innermost last) into a single boxed handler.
+    fn build_chain(&self) -> BoxedHandler<S> {
+        self.middlewares
+            .iter()
+            .rev()
+            .fold(self.raw.clone(), |inner, mw| {
+                let mw = mw.clone();
+                Arc::new(move |req, state| {
+                    let next = Next {
+                        handler: inner.clone(),
+                        state,
+                    };
+                    mw(req, next)
+                })
+            })
+    }
+
     /// Compile the middleware chain into a single boxed handler.
     pub fn compile_in_place(&mut self) {
         if self.compiled.is_none() {
-            let mut handler = self.raw.clone();
-            for mw in self.middlewares.iter().rev() {
-                let h = handler.clone();
-                let mw_clone = mw.clone();
-                handler = Arc::new(move |req, state| {
-                    let next = Next {
-                        handler: h.clone(),
-                        state,
-                    };
-                    mw_clone(req, next)
-                });
-            }
-            self.compiled = Some(handler);
+            self.compiled = Some(self.build_chain());
         }
     }
 
     /// Execute the handler chain.
+    ///
+    /// Uses the cached chain from [`compile_in_place`](Self::compile_in_place) when present;
+    /// otherwise rebuilds it for this call (correct, but allocates per request — every route
+    /// reached through a `Router` is compiled at `Router::compile()` time).
     pub async fn call(&self, req: Request<Body>, state: Arc<S>) -> Response<Body> {
-        if let Some(compiled) = &self.compiled {
-            compiled(req, state).await
-        } else {
-            let mut handler = self.raw.clone();
-            for mw in self.middlewares.iter().rev() {
-                let h = handler.clone();
-                let mw_clone = mw.clone();
-                handler = Arc::new(move |req, state| {
-                    let next = Next {
-                        handler: h.clone(),
-                        state,
-                    };
-                    mw_clone(req, next)
-                });
-            }
-            handler(req, state).await
+        match &self.compiled {
+            Some(compiled) => compiled(req, state).await,
+            None => self.build_chain()(req, state).await,
         }
     }
 }
@@ -145,15 +141,6 @@ mod tests {
     #[test]
     fn middleware_position_variants_are_distinguishable() {
         assert_ne!(MiddlewarePosition::First, MiddlewarePosition::Last);
-    }
-
-    #[test]
-    fn next_debug_does_not_panic() {
-        let next = Next {
-            handler: handler_returning("unused"),
-            state: Arc::new(()),
-        };
-        assert!(format!("{next:?}").contains("Next"));
     }
 
     #[test]

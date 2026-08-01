@@ -1,20 +1,28 @@
 //! Single aggregated integration-test binary.
 //!
-//! Every suite here used to be its own `tests/*.rs` file, which cargo compiles and *links*
-//! as an independent binary. With TLS/QUIC/Tor/I2P features enabled, several of those suites
-//! statically link heavy crypto and native (`libi2pd`) code — paying that link cost once per
-//! file rather than once total made full-feature test builds far more CPU/RAM-hungry than the
-//! tests themselves warrant. Folding them into modules of one binary keeps per-suite file
-//! boundaries (and each suite's own `#![allow(...)]` lints) while cargo links the heavy
-//! dependencies exactly once.
-//!
-//! Per-suite feature gates mirror what each file previously declared with
-//! `#![cfg(feature = "...")]`.
+//! Cargo compiles and links each `tests/*.rs` file as its own binary. With TLS/QUIC/Tor/I2P
+//! enabled these suites statically link heavy crypto and native (`libi2pd`) code, so keeping
+//! them as modules of one binary pays that link cost once rather than once per suite.
+
+// Relaxations for the whole test binary.
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::uninlined_format_args,
+    clippy::items_after_statements,
+    clippy::use_self,
+    clippy::semicolon_if_nothing_returned,
+    clippy::similar_names,
+    clippy::let_underscore_future,
+    clippy::option_if_let_else
+)]
+
+mod common;
 
 #[cfg(feature = "cookies")]
 mod advanced_tests;
-#[cfg(feature = "json")]
-mod e2e_tests;
 #[cfg(all(
     feature = "json",
     feature = "form",

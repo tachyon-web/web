@@ -456,7 +456,7 @@ mod tests {
         // Polling immediately (no time advanced) must not yield a ping — the
         // stream hasn't been idle for a full interval yet. This regression-tests
         // `tokio::time::interval`'s "first tick fires immediately" behavior,
-        // which previously leaked through as a spurious ping.
+        // which must not leak through as a spurious ping.
         assert!(
             kas.as_mut().poll_next(&mut cx).is_pending(),
             "keep-alive must not fire before the configured interval elapses"

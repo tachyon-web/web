@@ -1,21 +1,20 @@
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names,
-    clippy::panic
-)]
-
+use crate::common::TestServer;
 use futures_util::{SinkExt, StreamExt};
-use std::time::Duration;
 use tachyon_web::ws::{Message, WebSocket, WebSocketUpgrade};
-use tachyon_web::{Router, Server, get};
-use tokio::net::{TcpListener, TcpStream};
+use tachyon_web::{Router, get};
+use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite;
+
+/// A `WebSocketStream` connected to `server`'s `/ws` route, plus the handshake response.
+type ClientStream = tokio_tungstenite::WebSocketStream<TcpStream>;
+
+async fn ws_connect(server: &TestServer) -> (ClientStream, tungstenite::handshake::client::Response) {
+    let addr = server.addr();
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    tokio_tungstenite::client_async(format!("ws://{addr}/ws"), tcp)
+        .await
+        .unwrap()
+}
 
 async fn echo_socket(mut socket: WebSocket) {
     while let Some(Ok(msg)) = socket.recv().await {
@@ -35,17 +34,8 @@ fn echo_app() -> Router {
 
 #[tokio::test]
 async fn test_ws_echo_over_plain_http() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = Server::new(echo_app());
-    tokio::spawn(async move {
-        let _ = server.serve_http(listener).await;
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let tcp = TcpStream::connect(addr).await.unwrap();
-    let url = format!("ws://{addr}/ws");
-    let (mut ws_stream, response) = tokio_tungstenite::client_async(url, tcp).await.unwrap();
+    let server = TestServer::spawn(echo_app()).await;
+    let (mut ws_stream, response) = ws_connect(&server).await;
     assert_eq!(response.status(), 101);
 
     ws_stream
@@ -75,17 +65,8 @@ async fn test_ws_reassembles_many_small_fragments_across_yield_boundary() {
     use tokio_tungstenite::tungstenite::protocol::frame::Frame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data as OpData, OpCode};
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = Server::new(echo_app());
-    tokio::spawn(async move {
-        let _ = server.serve_http(listener).await;
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let tcp = TcpStream::connect(addr).await.unwrap();
-    let url = format!("ws://{addr}/ws");
-    let (mut ws_stream, _response) = tokio_tungstenite::client_async(url, tcp).await.unwrap();
+    let server = TestServer::spawn(echo_app()).await;
+    let (mut ws_stream, _response) = ws_connect(&server).await;
 
     // Comfortably more fragments than `socket::RECV_YIELD_BUDGET` (128), so the server's
     // `poll_recv` is guaranteed to hit its budget and yield at least once mid-message.
@@ -127,13 +108,8 @@ async fn test_ws_protocol_negotiation() {
         }),
     );
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = Server::new(app);
-    tokio::spawn(async move {
-        let _ = server.serve_http(listener).await;
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let server = TestServer::spawn(app).await;
+    let addr = server.addr();
 
     let tcp = TcpStream::connect(addr).await.unwrap();
     let req =
@@ -240,13 +216,14 @@ async fn test_wss_echo_over_tls() {
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // No sleep: `bind` already put the socket in the listen state, so the client's connect
+    // is queued in the backlog even if the accept loop hasn't been polled yet.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Server::new(echo_app());
+    let server = tachyon_web::Server::new(echo_app());
     tokio::spawn(async move {
         let _ = server.serve_https(listener, acceptor).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client_config = rustls::ClientConfig::builder()
         .dangerous()

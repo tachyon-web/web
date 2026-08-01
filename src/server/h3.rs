@@ -172,23 +172,8 @@ where
         // unified `Body` type so it flows through the same extractor pipeline —
         // `BodyStream`/`Request<Body>` handlers work identically, they just don't get
         // the zero-buffering benefit over HTTP/3 in this version.
-        let mut rebuild_req =
-            Request::from_parts(parts, crate::http::response::Body::full(body_bytes));
-        #[cfg(feature = "original-uri")]
-        {
-            let orig_uri = rebuild_req.uri().clone();
-            rebuild_req
-                .extensions_mut()
-                .insert(crate::routing::extract::OriginalUri(orig_uri));
-        }
-        rebuild_req
-            .extensions_mut()
-            .insert(crate::routing::extract::ConnectInfo(peer));
-        rebuild_req
-            .extensions_mut()
-            .insert(crate::routing::extract::MaxBodySize(self.max_body_size));
-
-        let full_resp = self.router.handle_request(rebuild_req).await;
+        let req = Request::from_parts(parts, crate::http::response::Body::full(body_bytes));
+        let full_resp = self.dispatch(req, peer).await;
 
         let (resp_parts, body) = full_resp.into_parts();
         let resp = Response::from_parts(resp_parts, ());

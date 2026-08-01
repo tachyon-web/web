@@ -53,23 +53,24 @@ impl From<hyper::Error> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response<crate::http::response::Body> {
-        match self {
-            Self::Rejection { status, message } => Response::builder()
-                .status(status)
-                .header("content-type", "text/plain; charset=utf-8")
-                .body(crate::http::response::Body::full(Bytes::from(message)))
-                .unwrap_or_else(|_| Response::new(crate::http::response::Body::empty())),
+        // The `Internal` message is deliberately not echoed to the client — it's logged
+        // server-side and replaced with a generic body, since it can carry internals.
+        let (status, body) = match self {
+            Self::Rejection { status, message } => (status, Bytes::from(message)),
             Self::Internal(msg) => {
                 tracing::error!("internal error: {msg}");
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .header("content-type", "text/plain; charset=utf-8")
-                    .body(crate::http::response::Body::full(Bytes::from_static(
-                        b"Internal Server Error",
-                    )))
-                    .unwrap_or_else(|_| Response::new(crate::http::response::Body::empty()))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Bytes::from_static(b"Internal Server Error"),
+                )
             }
-        }
+        };
+        let mut resp = crate::http::response::with_content_type(
+            body,
+            crate::http::response::TEXT_PLAIN,
+        );
+        *resp.status_mut() = status;
+        resp
     }
 }
 

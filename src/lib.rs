@@ -178,8 +178,6 @@ compile_error!(
     "tachyon-web requires at least one of the \"http1\" or \"http2\" features to serve anything"
 );
 
-#[cfg(any(feature = "tor", feature = "i2p"))]
-pub mod anonymity;
 pub mod http;
 pub mod routing;
 pub mod server;

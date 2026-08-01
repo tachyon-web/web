@@ -1,23 +1,9 @@
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names,
-    clippy::let_underscore_future,
-    clippy::option_if_let_else
-)]
-
+use crate::common::TestServer;
 use cookie::Cookie;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tachyon_web::http::response::{Body, Html, Json};
 use tachyon_web::routing::extract::{Cookies, Form};
-use tachyon_web::{Router, Server, get, post};
-use tokio::net::TcpListener;
+use tachyon_web::{Router, get, post};
 
 #[derive(Clone, Default)]
 struct AppState {
@@ -91,78 +77,37 @@ async fn test_advanced_features() {
         .nest("/api/v1", api_router)
         .with_state(AppState::default());
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("expected result");
-    let port = listener.local_addr().expect("expected result").port();
+    // A cookie-storing client, so the second `/cookies` request sends back what the first set.
+    let server = TestServer::spawn_with_cookie_store(app).await;
 
-    let server = Server::new(app);
-    let _handle = tokio::spawn(async move {
-        server.serve_http(listener).await.expect("expected result");
-    });
+    // Cookies round-trip across two requests.
+    let res = server.get("/cookies").send().await.expect("get /cookies");
+    assert_eq!(res.text().await.unwrap(), "Visited before: no");
+    let res = server.get("/cookies").send().await.expect("get /cookies");
+    assert_eq!(res.text().await.unwrap(), "Visited before: yes");
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Use a client that stores cookies automatically
-    let client = Client::builder()
-        .cookie_store(true)
-        .build()
-        .expect("expected result");
-
-    let base_url = format!("http://127.0.0.1:{}", port);
-
-    // Test Cookies
-    let res = client
-        .get(format!("{}/cookies", base_url))
+    // Form extractor, on a nested route.
+    let res = server
+        .post("/api/v1/form")
+        .form(&[("username", "hacer"), ("age", "30")])
         .send()
         .await
-        .expect("expected result");
-    assert_eq!(
-        res.text().await.expect("expected result"),
-        "Visited before: no"
-    );
+        .expect("post form");
+    let submitted: SubmitData = res.json().await.expect("json");
+    assert_eq!(submitted.username, "hacer");
+    assert_eq!(submitted.age, 30);
 
-    let res2 = client
-        .get(format!("{}/cookies", base_url))
-        .send()
-        .await
-        .expect("expected result");
-    assert_eq!(
-        res2.text().await.expect("expected result"),
-        "Visited before: yes"
-    );
-
-    // Test Nested Form
-    let form_data = [("username", "hacer"), ("age", "30")];
-    let res_form = client
-        .post(format!("{}/api/v1/form", base_url))
-        .form(&form_data)
-        .send()
-        .await
-        .expect("expected result");
-    let response_data: SubmitData = res_form.json().await.expect("expected result");
-    assert_eq!(response_data.username, "hacer");
-    assert_eq!(response_data.age, 30);
-
-    // Test Nested Stream
-    let res_stream = client
-        .get(format!("{}/api/v1/stream", base_url))
-        .send()
-        .await
-        .expect("expected result");
-    assert_eq!(
-        res_stream.text().await.expect("expected result"),
-        "Chunk 1\nChunk 2\n"
-    );
+    // Streaming body, on a nested route.
+    let res = server.get("/api/v1/stream").send().await.expect("get stream");
+    assert_eq!(res.text().await.unwrap(), "Chunk 1\nChunk 2\n");
 }
 
-#[tokio::test]
+#[test]
 #[cfg(feature = "tls")]
-async fn test_custom_crypto_provider() {
+fn test_custom_crypto_provider() {
     use std::sync::Arc;
-    let router = Router::new();
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let _server = Server::new(router).crypto_provider(provider);
+    let _server = tachyon_web::Server::new(Router::new()).crypto_provider(provider);
 }
 
 #[tokio::test]
@@ -184,20 +129,9 @@ async fn test_hoop_middleware() {
     }
 
     let app = Router::new().route("/hello", get(handler)).hoop(add_header);
+    let server = TestServer::spawn(app).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let server = Server::new(app);
-    let _ = tokio::spawn(async move {
-        server.serve_http(listener).await.unwrap();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let res = reqwest::get(format!("http://127.0.0.1:{}/hello", port))
-        .await
-        .unwrap();
+    let res = server.get("/hello").send().await.unwrap();
 
     assert_eq!(res.headers().get("server").unwrap(), "Tachyon");
     assert_eq!(res.text().await.unwrap(), "hello");
@@ -249,20 +183,9 @@ async fn test_hoop_at_ordering_and_state() {
         .hoop_at(MiddlewarePosition::First, first_mw)
         .hoop_at(MiddlewarePosition::Last, last_mw)
         .with_state(state);
+    let server = TestServer::spawn(app).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let server = Server::new(app);
-    let _ = tokio::spawn(async move {
-        server.serve_http(listener).await.unwrap();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let res = reqwest::get(format!("http://127.0.0.1:{}/hello", port))
-        .await
-        .unwrap();
+    let res = server.get("/hello").send().await.unwrap();
 
     let first_order = res
         .headers()

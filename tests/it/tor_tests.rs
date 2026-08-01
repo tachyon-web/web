@@ -14,23 +14,22 @@
 //! cargo test --features tor --test it -- --ignored
 //! ```
 
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args
-)]
-
 use tachyon_web::Router;
 use tachyon_web::server::tor::OnionConfig;
 
 // ─── OnionConfig builder contract ──────────────────────────────────────────────
 
+/// `OnionConfig::new` defaults to a self-signed certificate only when `cert-gen` is compiled
+/// in — there is no certificate to generate otherwise, so it defaults to plaintext. The three
+/// tests below asserted the `cert-gen` default unconditionally and so failed on a plain
+/// `--features tor` build.
+const TLS_ON_BY_DEFAULT: bool = cfg!(feature = "cert-gen");
+
 #[test]
 fn onion_config_defaults_are_tls_on_dual_stack_no_redirect() {
     let config = OnionConfig::new("my-nickname");
     assert_eq!(config.nickname(), "my-nickname");
-    assert!(config.tls_enabled());
+    assert_eq!(config.tls_enabled(), TLS_ON_BY_DEFAULT);
     assert!(!config.redirect_http_enabled());
 }
 
@@ -40,6 +39,10 @@ fn onion_config_no_tls_disables_https() {
     assert!(!config.tls_enabled());
 }
 
+// `OnionConfig::self_signed_tls` is only compiled with `cert-gen` (it has to generate the
+// certificate), so this test has to be gated the same way — without the gate, a plain
+// `--features tor` build failed to compile this file at all.
+#[cfg(feature = "cert-gen")]
 #[test]
 fn onion_config_self_signed_tls_reenables_https() {
     let config = OnionConfig::new("my-nickname").no_tls().self_signed_tls();
@@ -49,7 +52,7 @@ fn onion_config_self_signed_tls_reenables_https() {
 #[test]
 fn onion_config_redirect_http_is_independently_toggleable() {
     let config = OnionConfig::new("my-nickname").redirect_http(true);
-    assert!(config.tls_enabled());
+    assert_eq!(config.tls_enabled(), TLS_ON_BY_DEFAULT);
     assert!(config.redirect_http_enabled());
 }
 
@@ -70,7 +73,7 @@ fn onion_config_builder_methods_chain_in_any_order() {
         .vanguards(false)
         .redirect_http(true);
     assert_eq!(config.nickname(), "chained");
-    assert!(config.tls_enabled());
+    assert_eq!(config.tls_enabled(), TLS_ON_BY_DEFAULT);
     assert!(config.redirect_http_enabled());
     assert!(!config.vanguards_enabled());
 }

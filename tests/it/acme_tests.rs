@@ -9,17 +9,6 @@
 //! - End-to-end HTTP challenge serving via an in-process HTTP server.
 //! - Challenge isolation: tokens from separate issuances don't collide.
 
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names
-)]
-
 use bytes::Bytes;
 use hyper::{Request, StatusCode};
 use tachyon_web::http::response::Body;

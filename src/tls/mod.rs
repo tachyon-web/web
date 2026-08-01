@@ -49,11 +49,6 @@ pub use cert_gen::{SelfSignedCert, generate_self_signed_cert};
 
 /// PEM parsing, on `rustls-pki-types`' own [`PemObject`] implementation.
 ///
-/// This replaces the `rustls-pemfile` crate, which was archived in August 2025 and flagged
-/// unmaintained by RUSTSEC-2025-0134. That crate's final release was already a thin wrapper
-/// around exactly this code — `rustls-pki-types` has carried the PEM parser since 1.9.0 — so
-/// dropping it removes a dependency without changing which parser actually runs.
-///
 /// [`PemObject`]: rustls::pki_types::pem::PemObject
 // `unreachable_pub` (rustc) requires these items be `pub(crate)` rather than `pub`, while
 // `clippy::redundant_pub_crate` calls `pub(crate)` redundant inside a `pub(crate)` module.
@@ -64,12 +59,9 @@ pub(crate) mod pem {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-    /// Parses a PEM certificate chain, skipping entries that fail to parse.
-    ///
-    /// Skipping rather than failing is the behavior the `rustls_pemfile::certs(..)`
-    /// `.filter_map(Result::ok)` call this replaces already had at every call site, kept
-    /// deliberately: a chain whose *leaf* parses is servable even if a later entry is
-    /// malformed, and `with_single_cert` rejects an empty chain anyway.
+    /// Parses a PEM certificate chain, skipping entries that fail to parse: a chain whose leaf
+    /// parses is servable even if a later entry is malformed, and `with_single_cert` rejects an
+    /// empty chain anyway.
     pub(crate) fn certs(pem: &[u8]) -> Vec<CertificateDer<'static>> {
         CertificateDer::pem_slice_iter(pem)
             .filter_map(std::result::Result::ok)
@@ -82,9 +74,6 @@ pub(crate) mod pem {
     /// # Errors
     ///
     /// Returns [`rustls::pki_types::pem::Error`] if no key is present or it cannot be parsed.
-    /// Note the shape change from `rustls_pemfile::private_key`, which returned
-    /// `io::Result<Option<_>>` and so made "absent" a distinct, easily-ignored case: here a
-    /// missing key is simply `Err(NoItemsFound)`.
     pub(crate) fn private_key(
         pem: &[u8],
     ) -> Result<PrivateKeyDer<'static>, rustls::pki_types::pem::Error> {
@@ -96,9 +85,8 @@ pub(crate) mod pem {
     /// [`NotFound`](std::io::ErrorKind::NotFound), anything malformed is
     /// [`InvalidData`](std::io::ErrorKind::InvalidData).
     ///
-    /// Kept distinct deliberately — `RustlsConfig::from_pem`'s error kind is observable public
-    /// behavior that callers match on, and collapsing both cases into one kind while swapping
-    /// out the PEM parser would have been a silent breaking change.
+    /// The distinction is observable public behavior: `RustlsConfig::from_pem` callers match on
+    /// the error kind.
     pub(crate) fn key_io_error(e: &rustls::pki_types::pem::Error) -> std::io::Error {
         let kind = if matches!(e, rustls::pki_types::pem::Error::NoItemsFound) {
             std::io::ErrorKind::NotFound

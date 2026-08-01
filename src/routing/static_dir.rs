@@ -52,66 +52,55 @@ impl Default for CacheConfig {
 /// warning before pointing a `ServeDir` at a directory that can contain files an
 /// untrusted user chose the bytes of.
 pub(crate) fn guess_mime_type(path: &Path) -> &'static str {
+    const DEFAULT: &str = "application/octet-stream";
+    /// Longest extension in the table below (`webmanifest`), with headroom. Anything
+    /// longer can't match, so it doesn't need lowercasing at all.
+    const MAX_EXT_LEN: usize = 16;
+
     let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-        return "application/octet-stream";
+        return DEFAULT;
+    };
+    if ext.len() > MAX_EXT_LEN {
+        return DEFAULT;
+    }
+
+    let mut buf = [0u8; MAX_EXT_LEN];
+    let lowered = &mut buf[..ext.len()];
+    lowered.copy_from_slice(ext.as_bytes());
+    lowered.make_ascii_lowercase();
+    let Ok(ext) = std::str::from_utf8(lowered) else {
+        return DEFAULT;
     };
 
-    if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm") {
-        "text/html; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("css") {
-        "text/css; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("js") || ext.eq_ignore_ascii_case("mjs") {
-        "application/javascript; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("json") {
-        "application/json"
-    } else if ext.eq_ignore_ascii_case("wasm") {
-        "application/wasm"
-    } else if ext.eq_ignore_ascii_case("webmanifest") {
-        "application/manifest+json"
-    } else if ext.eq_ignore_ascii_case("xml") {
-        "text/xml; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("txt") {
-        "text/plain; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("csv") {
-        "text/csv; charset=utf-8"
-    } else if ext.eq_ignore_ascii_case("png") {
-        "image/png"
-    } else if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
-        "image/jpeg"
-    } else if ext.eq_ignore_ascii_case("gif") {
-        "image/gif"
-    } else if ext.eq_ignore_ascii_case("svg") || ext.eq_ignore_ascii_case("svgz") {
-        "image/svg+xml"
-    } else if ext.eq_ignore_ascii_case("ico") {
-        "image/x-icon"
-    } else if ext.eq_ignore_ascii_case("webp") {
-        "image/webp"
-    } else if ext.eq_ignore_ascii_case("avif") {
-        "image/avif"
-    } else if ext.eq_ignore_ascii_case("bmp") {
-        "image/bmp"
-    } else if ext.eq_ignore_ascii_case("woff") {
-        "font/woff"
-    } else if ext.eq_ignore_ascii_case("woff2") {
-        "font/woff2"
-    } else if ext.eq_ignore_ascii_case("ttf") {
-        "font/ttf"
-    } else if ext.eq_ignore_ascii_case("otf") {
-        "font/otf"
-    } else if ext.eq_ignore_ascii_case("mp3") {
-        "audio/mpeg"
-    } else if ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("m4v") {
-        "video/mp4"
-    } else if ext.eq_ignore_ascii_case("webm") {
-        "video/webm"
-    } else if ext.eq_ignore_ascii_case("pdf") {
-        "application/pdf"
-    } else if ext.eq_ignore_ascii_case("zip") {
-        "application/zip"
-    } else if ext.eq_ignore_ascii_case("gz") {
-        "application/gzip"
-    } else {
-        "application/octet-stream"
+    match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json",
+        "wasm" => "application/wasm",
+        "webmanifest" => "application/manifest+json",
+        "xml" => "text/xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" | "svgz" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "mp3" => "audio/mpeg",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        _ => DEFAULT,
     }
 }
 
@@ -121,25 +110,15 @@ fn is_safe_path(base: &Path, candidate: &Path) -> bool {
 }
 
 /// Files at or below this size are read into one buffer and served from memory; anything larger
-/// is streamed off disk in [`STREAM_CHUNK`]-sized frames.
-///
-/// Without a cutoff, the disk path called `fs::read`, buffering the *whole* file per in-flight
-/// request — so N concurrent requests for one large asset cost N × its size in resident memory,
-/// and a directory containing a multi-GiB file was an unauthenticated way to push the process
-/// into the OOM killer with a handful of parallel `GET`s. Streaming makes the per-request cost
-/// constant regardless of file size.
+/// is streamed off disk in [`STREAM_CHUNK`]-sized frames, keeping the per-request memory cost
+/// constant rather than N × file size for N concurrent requests.
 const STREAM_THRESHOLD: u64 = 1024 * 1024;
 
 /// Chunk size used when streaming a file off disk.
 const STREAM_CHUNK: usize = 64 * 1024;
 
-/// Whether `accept_encoding` positively accepts `token`.
-///
-/// This is a real token match against each comma-separated coding, honoring `q=0`. The previous
-/// `accept_encoding.contains("br")` substring test was wrong in both directions: it matched a
-/// coding that merely *contained* the token, and it ignored `q=0` — which is precisely how a
-/// client says it cannot decode a coding, so answering `Accept-Encoding: br;q=0` with a brotli
-/// body handed the client bytes it had explicitly said it would not be able to read.
+/// Whether `accept_encoding` positively accepts `token`: a token match against each
+/// comma-separated coding, honoring `q=0` (a client's explicit refusal of that coding).
 fn accepts_encoding(accept_encoding: &str, token: &str) -> bool {
     accept_encoding.split(',').any(|part| {
         let mut params = part.split(';').map(str::trim);
@@ -160,11 +139,8 @@ fn is_q_zero(param: &str) -> bool {
 
 /// Whether `if_none_match` should suppress the body, per RFC 9110 §13.1.2.
 ///
-/// The header is a comma-separated *list* of entity tags, or the wildcard `*`, and tags are
-/// compared with the weak comparison function (so a `W/`-prefixed tag matches the same entity).
-/// Comparing the raw header against a single tag for string equality — as this did — silently
-/// failed to revalidate for any client that sent more than one tag, sent `*`, or weakened its
-/// tag, re-sending the full body every time instead of a `304`.
+/// The header is a comma-separated list of entity tags, or the wildcard `*`. Tags are compared
+/// with the weak comparison function, so a `W/`-prefixed tag matches the same entity.
 fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
     let header = if_none_match.trim();
     if header.is_empty() {
@@ -446,26 +422,7 @@ impl ServeDir {
             let etag_header = hyper::header::HeaderValue::from_str(&etag)
                 .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("\"0\""));
 
-            let mime_type = guess_mime_type(&path);
-            let mut headers = hyper::HeaderMap::new();
-            let _ = headers.insert(
-                CONTENT_TYPE,
-                hyper::header::HeaderValue::from_static(mime_type),
-            );
-            // Prevent the browser from MIME-sniffing away from the declared
-            // Content-Type (e.g. treating a misconfigured upload as HTML). See the
-            // module-level docs for why this alone does not make it safe to serve
-            // user-uploaded files (notably `.svg`) from the same directory.
-            let _ = headers.insert(
-                X_CONTENT_TYPE_OPTIONS,
-                hyper::header::HeaderValue::from_static("nosniff"),
-            );
-            // Cache-Control: 1 hour for versioned assets; 5 min for HTML. Shared with the
-            // disk-serving path so the two can't drift apart.
-            let _ = headers.insert(
-                CACHE_CONTROL,
-                hyper::header::HeaderValue::from_static(cache_control_for(mime_type)),
-            );
+            let mut headers = base_asset_headers(guess_mime_type(&path));
             // Vary: Accept-Encoding whenever we have compressed variants.
             if content_gz.is_some() || content_br.is_some() {
                 let _ = headers.insert(
@@ -513,26 +470,32 @@ fn cache_control_for(mime_type: &str) -> &'static str {
     }
 }
 
-/// Builds the response for a file read off disk, giving it the same `ETag`/`Cache-Control`
-/// treatment the preloaded path applies. Without this, whether a client got a revalidatable,
-/// cacheable response depended on whether `preload()` happened to have been called (and, for a
-/// preloaded `ServeDir`, on whether the file was under `max_file_bytes`) rather than on anything
-/// about the request — so an oversized asset silently became uncacheable and unconditional.
+/// Builds the response for a file read off disk, with the same `ETag`/`Cache-Control` treatment
+/// the preloaded path applies, so cacheability doesn't depend on whether `preload()` was called.
 fn disk_response(path: &Path, content: Vec<u8>, if_none_match: &str) -> Response<Body> {
     let etag = make_etag(&content);
     if if_none_match_matches(if_none_match, &etag) {
         return not_modified();
     }
-    // ZERO-COPY from Vec<u8> to Bytes
     finish_disk_response(path, Body::full(Bytes::from(content)), &etag)
 }
 
 /// Applies the shared `Content-Type`/`nosniff`/`Cache-Control`/`ETag` headers to a disk-served
 /// body, whether that body was buffered whole or is being streamed.
 fn finish_disk_response(path: &Path, body: Body, etag: &str) -> Response<Body> {
-    let mime_type = guess_mime_type(path);
     let mut resp = Response::new(body);
-    let headers = resp.headers_mut();
+    *resp.headers_mut() = base_asset_headers(guess_mime_type(path));
+    if let Ok(etag_value) = hyper::header::HeaderValue::from_str(etag) {
+        let _ = resp.headers_mut().insert(ETAG, etag_value);
+    }
+    resp
+}
+
+/// The `Content-Type`/`nosniff`/`Cache-Control` trio every static asset carries, whether it
+/// was preloaded into the RAM cache or read off disk — built in one place so the two paths
+/// can't drift apart.
+fn base_asset_headers(mime_type: &'static str) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::with_capacity(4);
     let _ = headers.insert(
         CONTENT_TYPE,
         hyper::header::HeaderValue::from_static(mime_type),
@@ -545,10 +508,7 @@ fn finish_disk_response(path: &Path, body: Body, etag: &str) -> Response<Body> {
         CACHE_CONTROL,
         hyper::header::HeaderValue::from_static(cache_control_for(mime_type)),
     );
-    if let Ok(etag_value) = hyper::header::HeaderValue::from_str(etag) {
-        let _ = headers.insert(ETAG, etag_value);
-    }
-    resp
+    headers
 }
 
 /// A response body that reads a file off disk incrementally instead of buffering it whole.
@@ -586,9 +546,6 @@ impl hyper::body::Body for FileBody {
             Poll::Ready(Ok(())) => {
                 let filled = read_buf.filled();
                 if filled.is_empty() {
-                    // Truncated relative to the length we advertised: the file shrank mid-read.
-                    // Ending the body here is the only honest option — hyper will treat the
-                    // short body as a connection error rather than framing a lie as success.
                     this.remaining = 0;
                     return Poll::Ready(None);
                 }
@@ -629,12 +586,10 @@ fn metadata_etag(meta: &std::fs::Metadata) -> String {
 #[inline]
 fn make_etag(content: &[u8]) -> String {
     let len = content.len();
-    // Grab up to 8 bytes and fold into a u64 for a quick fingerprint.
     let mut sample: u64 = 0;
     for &b in content.iter().take(8) {
         sample = sample.wrapping_mul(31).wrapping_add(u64::from(b));
     }
-    // Also mix in a few bytes from the tail for better collision resistance.
     for &b in content.iter().rev().take(4) {
         sample = sample.wrapping_mul(37).wrapping_add(u64::from(b));
     }
@@ -675,13 +630,11 @@ impl ServeDir {
     /// The body of [`handle_request_with_encoding`](Self::handle_request_with_encoding), minus
     /// the percent-decoding step, for callers whose path has already been decoded.
     ///
-    /// Split out because [`into_method_router`](Self::into_method_router) reads the file path
-    /// from the `{*path}` capture, and the router already percent-decodes captures when it
-    /// builds `PathParams`. Routing that back through the decoding entry point decoded it a
-    /// second time, so a request for a file whose name legitimately contains a percent
-    /// sequence (`%2541` → `%41` → `A`) resolved to the wrong file — and, worse, a
-    /// double-encoded separator (`%252f` → `%2f` → `/`) reintroduced a path separator *after*
-    /// the router had already finished segmenting the path.
+    /// Split out because [`into_method_router`](Self::into_method_router) reads the path from
+    /// the `{*path}` capture, which the router has already percent-decoded. Decoding twice
+    /// resolves the wrong file for names containing a percent sequence (`%2541` → `%41` → `A`)
+    /// and, worse, reintroduces a path separator (`%252f` → `%2f` → `/`) after the router has
+    /// finished segmenting the path.
     async fn serve_decoded(
         &self,
         decoded: &str,
@@ -690,7 +643,6 @@ impl ServeDir {
     ) -> Result<Response<Body>, StatusCode> {
         let req_clean = decoded.trim_start_matches('/');
 
-        // ── Security: reject obvious traversal before anything else ──────────
         if req_clean.contains("..") || req_clean.contains('\0') {
             return Err(StatusCode::FORBIDDEN);
         }
@@ -701,21 +653,16 @@ impl ServeDir {
             return Err(StatusCode::NOT_FOUND);
         }
 
-        // ── 1. Preloaded memory cache (zero I/O) ─────────────────────────────
         if let Some(resp) = self.serve_from_cache(resolved, accept_encoding, if_none_match) {
             return Ok(resp);
         }
-        // If preloaded but missing from cache (e.g. too large), fall through to disk!
 
-        // ── 2. Dynamic disk mode with path-traversal hardening ───────────────
         self.serve_from_disk(resolved, if_none_match).await
     }
 
-    /// Appends the configured index file to a request that names a directory rather than a
-    /// file — the root (`""`) *and* any path with a trailing slash (`docs/` → `docs/index.html`),
-    /// matching `tower_http`'s `ServeDir`. Resolving only the root — as this previously did —
-    /// meant `/docs/` fell through to the disk path, found a directory rather than a file, and
-    /// 404'd even when an index was present.
+    /// Appends the configured index file to a request naming a directory rather than a file:
+    /// the root (`""`) and any path with a trailing slash (`docs/` → `docs/index.html`),
+    /// matching `tower_http`'s `ServeDir`.
     fn resolve_index<'a>(&'a self, req_clean: &'a str) -> Result<Cow<'a, str>, StatusCode> {
         if req_clean.is_empty() {
             self.index_file
@@ -743,12 +690,10 @@ impl ServeDir {
     ) -> Option<Response<Body>> {
         let asset = self.memory_cache.as_ref()?.get(resolved)?;
 
-        // ETag 304 short-circuit — zero body, minimal CPU.
         if if_none_match_matches(if_none_match, &asset.etag) {
             return Some(not_modified());
         }
 
-        // Content-negotiation: prefer br > gz > identity.
         let (body_bytes, encoding) = if accepts_encoding(accept_encoding, "br") {
             asset.content_br.as_ref().map_or_else(
                 || (asset.content.clone(), None),
@@ -795,8 +740,6 @@ impl ServeDir {
 
         let (canonical, meta) = self.resolve_disk_target(canonical).await?;
 
-        // Large files are streamed rather than buffered, so one request's memory cost is a
-        // fixed `STREAM_CHUNK` no matter how big the file is. See `STREAM_THRESHOLD`.
         if meta.len() > STREAM_THRESHOLD {
             return Self::stream_from_disk(&canonical, &meta, if_none_match).await;
         }
@@ -873,22 +816,16 @@ impl ServeDir {
             let this = self_arc.clone();
 
             async move {
-                // By moving `req` into the async block FIRST, we can borrow `&str`
-                // directly from its extensions or URI, achieving zero allocations!
                 let path_ext = req
                     .extensions()
                     .get::<crate::routing::extract::PathParams>();
 
-                // `PathParams` values arrive already percent-decoded (the router decodes every
-                // capture in `resolve()`); `req.uri().path()` does not. Track which source this
-                // came from so the path is decoded exactly once either way.
                 let captured = path_ext.and_then(|p| {
                     p.0.iter()
                         .find(|(k, _)| k.as_ref() == "path" || k.as_ref() == "*path")
                         .map(|(_, v)| v.as_str())
                 });
 
-                // Extract encoding negotiation headers before calling the handler.
                 let accept_enc = req
                     .headers()
                     .get(hyper::header::ACCEPT_ENCODING)
@@ -1002,7 +939,7 @@ mod tests {
     }
 
     /// A subdirectory request must resolve to that directory's index file, with and without a
-    /// trailing slash, in both preloaded and disk modes — previously only the root did.
+    /// trailing slash, in both preloaded and disk modes.
     #[tokio::test]
     async fn test_index_file_on_subdirectory_request() {
         let dir = make_temp_dir();

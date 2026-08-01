@@ -76,7 +76,7 @@ tachyon-i2p = { version = "0.0.2", optional = true, default-features = false }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "cookies", "form"] }
-tempfile = "3.27"
+tempfile = "3"
 tokio-stream = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 futures = "0.3"

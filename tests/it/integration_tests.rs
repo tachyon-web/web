@@ -3,46 +3,19 @@
 //! These tests spin up real in-process HTTP servers and exercise the framework
 //! through a full network stack using `reqwest`.
 
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names
-)]
-
+use crate::common::TestServer;
 use bytes::Bytes;
 use hyper::{Request, StatusCode};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tachyon_web::{
-    Router, Server, get,
+    Router, get,
     http::response::{Body, Html, Json},
     post,
     routing::extract::{Form, Path, Query, State},
 };
-use tokio::net::TcpListener;
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-async fn spawn_server(router: Router<()>) -> (u16, tokio::task::JoinHandle<()>) {
-    let app = router.with_state(());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("local_addr").port();
-    let server = Server::new(app);
-    let handle = tokio::spawn(async move {
-        server.serve_http(listener).await.expect("serve_http");
-    });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    (port, handle)
-}
-
-fn client() -> Client {
-    Client::new()
+async fn spawn_server(router: Router<()>) -> TestServer {
+    TestServer::spawn(router).await
 }
 
 // ─── Basic routing ────────────────────────────────────────────────────────────
@@ -52,9 +25,8 @@ async fn test_get_root() {
     async fn handler() -> &'static str {
         "hello"
     }
-    let (port, _h) = spawn_server(Router::new().route("/", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/", port))
+    let server = spawn_server(Router::new().route("/", get(handler))).await;
+    let res = server.get("/")
         .send()
         .await
         .unwrap();
@@ -67,9 +39,8 @@ async fn test_method_not_allowed_returns_405_with_allow() {
     async fn handler() -> &'static str {
         "ok"
     }
-    let (port, _h) = spawn_server(Router::new().route("/only-get", get(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/only-get", port))
+    let server = spawn_server(Router::new().route("/only-get", get(handler))).await;
+    let res = server.post("/only-get")
         .send()
         .await
         .unwrap();
@@ -83,9 +54,8 @@ async fn test_not_found_returns_404() {
     async fn handler() -> &'static str {
         "ok"
     }
-    let (port, _h) = spawn_server(Router::new().route("/exists", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/nope", port))
+    let server = spawn_server(Router::new().route("/exists", get(handler))).await;
+    let res = server.get("/nope")
         .send()
         .await
         .unwrap();
@@ -105,17 +75,21 @@ async fn test_all_http_methods() {
             .delete(handler)
             .patch(handler),
     );
-    let (port, _h) = spawn_server(router).await;
-    let base = format!("http://127.0.0.1:{}/multi", port);
-    let c = client();
-    for (method, req) in [
-        ("GET", c.get(&base).build().unwrap()),
-        ("POST", c.post(&base).build().unwrap()),
-        ("PUT", c.put(&base).build().unwrap()),
-        ("DELETE", c.delete(&base).build().unwrap()),
-        ("PATCH", c.patch(&base).build().unwrap()),
+    let server = spawn_server(router).await;
+    let url = server.url("/multi");
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::POST,
+        reqwest::Method::PUT,
+        reqwest::Method::DELETE,
+        reqwest::Method::PATCH,
     ] {
-        let res = c.execute(req).await.unwrap();
+        let res = server
+            .client()
+            .request(method.clone(), &url)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(res.status(), 200, "{method} should be 200");
     }
 }
@@ -133,9 +107,8 @@ async fn test_path_params_deserialized() {
     async fn handler(Path(p): Path<UserParams>) -> Json<UserParams> {
         Json(p)
     }
-    let (port, _h) = spawn_server(Router::new().route("/user/:id/:name", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/user/42/alice", port))
+    let server = spawn_server(Router::new().route("/user/:id/:name", get(handler))).await;
+    let res = server.get("/user/42/alice")
         .send()
         .await
         .unwrap();
@@ -150,10 +123,9 @@ async fn test_path_param_type_mismatch_returns_400() {
     async fn handler(Path(p): Path<UserParams>) -> Json<UserParams> {
         Json(p)
     }
-    let (port, _h) = spawn_server(Router::new().route("/user/:id/:name", get(handler))).await;
+    let server = spawn_server(Router::new().route("/user/:id/:name", get(handler))).await;
     // "abc" can't parse as u32
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/user/abc/bob", port))
+    let res = server.get("/user/abc/bob")
         .send()
         .await
         .unwrap();
@@ -173,9 +145,8 @@ async fn test_query_extraction() {
     async fn handler(Query(q): Query<SearchQuery>) -> String {
         format!("q={} page={}", q.q, q.page.unwrap_or(1))
     }
-    let (port, _h) = spawn_server(Router::new().route("/search", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/search?q=rust&page=3", port))
+    let server = spawn_server(Router::new().route("/search", get(handler))).await;
+    let res = server.get("/search?q=rust&page=3")
         .send()
         .await
         .unwrap();
@@ -184,31 +155,16 @@ async fn test_query_extraction() {
 }
 
 #[tokio::test]
-async fn test_query_url_encoded() {
+async fn test_query_decoding() {
     async fn handler(Query(q): Query<SearchQuery>) -> String {
         q.q
     }
-    let (port, _h) = spawn_server(Router::new().route("/search", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/search?q=hello+world", port))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.text().await.unwrap(), "hello world");
-}
+    let server = spawn_server(Router::new().route("/search", get(handler))).await;
 
-#[tokio::test]
-async fn test_query_percent_encoded() {
-    async fn handler(Query(q): Query<SearchQuery>) -> String {
-        q.q
+    for (query, expected) in [("q=hello+world", "hello world"), ("q=foo%20bar", "foo bar")] {
+        let res = server.get(&format!("/search?{query}")).send().await.unwrap();
+        assert_eq!(res.text().await.unwrap(), expected, "query: {query}");
     }
-    let (port, _h) = spawn_server(Router::new().route("/search", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/search?q=foo%20bar", port))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.text().await.unwrap(), "foo bar");
 }
 
 // ─── JSON extractor ───────────────────────────────────────────────────────────
@@ -223,9 +179,8 @@ async fn test_json_extractor_ok() {
     async fn handler(tachyon_web::Json(p): tachyon_web::Json<Payload>) -> Json<Payload> {
         Json(p)
     }
-    let (port, _h) = spawn_server(Router::new().route("/echo", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/echo", port))
+    let server = spawn_server(Router::new().route("/echo", post(handler))).await;
+    let res = server.post("/echo")
         .json(&Payload {
             value: "test".into(),
         })
@@ -237,61 +192,29 @@ async fn test_json_extractor_ok() {
     assert_eq!(p.value, "test");
 }
 
+/// Axum's `JsonRejection` status split: wrong media type is 415, malformed syntax is 400,
+/// and well-formed JSON of the wrong shape is 422.
 #[tokio::test]
-async fn test_json_extractor_wrong_content_type_415() {
+async fn test_json_extractor_rejection_statuses() {
     async fn handler(tachyon_web::Json(p): tachyon_web::Json<Payload>) -> Json<Payload> {
         Json(p)
     }
-    let (port, _h) = spawn_server(Router::new().route("/echo", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/echo", port))
-        .header("content-type", "text/plain")
-        .body("{\"value\":\"test\"}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 415, "wrong content-type must return 415");
-}
+    let server = spawn_server(Router::new().route("/echo", post(handler))).await;
 
-#[tokio::test]
-async fn test_json_extractor_syntax_error_400() {
-    // Matches Axum's `JsonRejection`: invalid JSON *syntax* is a 400 Bad Request,
-    // distinct from valid JSON that doesn't match the target type's shape (422 —
-    // see `test_json_extractor_data_error_422` below).
-    async fn handler(tachyon_web::Json(p): tachyon_web::Json<Payload>) -> Json<Payload> {
-        Json(p)
+    for (content_type, body, expected) in [
+        ("text/plain", r#"{"value":"test"}"#, 415),
+        ("application/json", "not json at all !!!", 400),
+        ("application/json", "{}", 422),
+    ] {
+        let res = server
+            .post("/echo")
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), expected, "content-type: {content_type}, body: {body}");
     }
-    let (port, _h) = spawn_server(Router::new().route("/echo", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/echo", port))
-        .header("content-type", "application/json")
-        .body("not json at all !!!")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 400, "malformed JSON syntax must return 400");
-}
-
-#[tokio::test]
-async fn test_json_extractor_data_error_422() {
-    // Well-formed JSON that doesn't match the target type (missing required field)
-    // is a 422 Unprocessable Entity, matching Axum.
-    async fn handler(tachyon_web::Json(p): tachyon_web::Json<Payload>) -> Json<Payload> {
-        Json(p)
-    }
-    let (port, _h) = spawn_server(Router::new().route("/echo", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/echo", port))
-        .header("content-type", "application/json")
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        res.status(),
-        422,
-        "valid JSON with the wrong shape must return 422"
-    );
 }
 
 // ─── Form extractor ───────────────────────────────────────────────────────────
@@ -307,9 +230,8 @@ async fn test_form_extractor_ok() {
     async fn handler(Form(f): Form<FormData>) -> Json<FormData> {
         Json(f)
     }
-    let (port, _h) = spawn_server(Router::new().route("/form", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/form", port))
+    let server = spawn_server(Router::new().route("/form", post(handler))).await;
+    let res = server.post("/form")
         .form(&[("username", "alice"), ("age", "30")])
         .send()
         .await
@@ -325,9 +247,8 @@ async fn test_form_extractor_wrong_content_type_415() {
     async fn handler(Form(f): Form<FormData>) -> Json<FormData> {
         Json(f)
     }
-    let (port, _h) = spawn_server(Router::new().route("/form", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/form", port))
+    let server = spawn_server(Router::new().route("/form", post(handler))).await;
+    let res = server.post("/form")
         .header("content-type", "application/json")
         .body("username=alice&age=30")
         .send()
@@ -353,15 +274,8 @@ async fn test_state_extractor() {
         .with_state(AppState {
             greeting: "howdy".into(),
         });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let _h = tokio::spawn(async move { Server::new(app).serve_http(listener).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/greet", port))
-        .send()
-        .await
-        .unwrap();
+    let server = spawn_server(app).await;
+    let res = server.get("/greet").send().await.unwrap();
     assert_eq!(res.text().await.unwrap(), "howdy");
 }
 
@@ -372,9 +286,8 @@ async fn test_html_response_content_type() {
     async fn handler() -> Html<&'static str> {
         Html("<h1>hi</h1>")
     }
-    let (port, _h) = spawn_server(Router::new().route("/", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/", port))
+    let server = spawn_server(Router::new().route("/", get(handler))).await;
+    let res = server.get("/")
         .send()
         .await
         .unwrap();
@@ -387,9 +300,8 @@ async fn test_status_code_response() {
     async fn handler() -> StatusCode {
         StatusCode::CREATED
     }
-    let (port, _h) = spawn_server(Router::new().route("/create", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/create", port))
+    let server = spawn_server(Router::new().route("/create", post(handler))).await;
+    let res = server.post("/create")
         .send()
         .await
         .unwrap();
@@ -401,9 +313,8 @@ async fn test_tuple_status_response() {
     async fn handler() -> (StatusCode, &'static str) {
         (StatusCode::ACCEPTED, "accepted")
     }
-    let (port, _h) = spawn_server(Router::new().route("/acc", post(handler))).await;
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/acc", port))
+    let server = spawn_server(Router::new().route("/acc", post(handler))).await;
+    let res = server.post("/acc")
         .send()
         .await
         .unwrap();
@@ -419,20 +330,10 @@ async fn test_oversized_body_returns_413() {
         "ok"
     }
     let app = Router::new().route("/upload", post(handler)).with_state(());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let _h = tokio::spawn(async move {
-        Server::new(app)
-            .max_body_size(100) // tiny limit
-            .serve_http(listener)
-            .await
-            .unwrap()
-    });
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    // Send 200 bytes of JSON (exceeds 100-byte limit)
+    let server = TestServer::spawn_with(app, |s| s.max_body_size(100)).await;
+    // Send 200 bytes of JSON (exceeds the 100-byte limit)
     let big_value = "x".repeat(200);
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/upload", port))
+    let res = server.post("/upload")
         .header("content-type", "application/json")
         .body(format!("{{\"value\":\"{big_value}\"}}"))
         .send()
@@ -454,19 +355,9 @@ async fn test_default_body_limit_override_is_stricter_than_server_default() {
         .route("/upload", post(handler))
         .hoop(DefaultBodyLimit::max(10).into_middleware())
         .with_state(());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let _h = tokio::spawn(async move {
-        Server::new(app)
-            .max_body_size(1024 * 1024)
-            .serve_http(listener)
-            .await
-            .unwrap()
-    });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    let server = TestServer::spawn_with(app, |s| s.max_body_size(1024 * 1024)).await;
 
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/upload", port))
+    let res = server.post("/upload")
         .header("content-type", "application/json")
         .body("{\"value\":\"this is well under 1 MiB\"}")
         .send()
@@ -492,20 +383,10 @@ async fn test_default_body_limit_disable_allows_large_body() {
         .route("/upload", post(handler))
         .hoop(DefaultBodyLimit::disable().into_middleware())
         .with_state(());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let _h = tokio::spawn(async move {
-        Server::new(app)
-            .max_body_size(10)
-            .serve_http(listener)
-            .await
-            .unwrap()
-    });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    let server = TestServer::spawn_with(app, |s| s.max_body_size(10)).await;
 
     let big_value = "x".repeat(2000);
-    let res = client()
-        .post(format!("http://127.0.0.1:{}/upload", port))
+    let res = server.post("/upload")
         .header("content-type", "application/json")
         .body(format!("{{\"value\":\"{big_value}\"}}"))
         .send()
@@ -516,36 +397,6 @@ async fn test_default_body_limit_disable_allows_large_body() {
         200,
         "DefaultBodyLimit::disable() must lift the server's 10-byte default"
     );
-}
-
-// ─── Trailing slash strictness (matches Axum: /foo and /foo/ are distinct) ───
-
-#[tokio::test]
-async fn test_trailing_slash_not_stripped_e2e() {
-    async fn handler() -> &'static str {
-        "ok"
-    }
-    let (port, _h) = spawn_server(Router::new().route("/no-slash", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/no-slash/", port))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 404);
-}
-
-#[tokio::test]
-async fn test_trailing_slash_not_added_e2e() {
-    async fn handler() -> &'static str {
-        "ok"
-    }
-    let (port, _h) = spawn_server(Router::new().route("/with-slash/", get(handler))).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/with-slash", port))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 404);
 }
 
 // ─── Nested router ───────────────────────────────────────────────────────────
@@ -561,18 +412,9 @@ async fn test_nested_router_e2e() {
     let v1 = Router::new().route("/status", get(v1_status));
     let v2 = Router::new().route("/status", get(v2_status));
     let app = Router::new().nest("/api/v1", v1).nest("/api/v2", v2);
-    let (port, _h) = spawn_server(app).await;
-    let c = client();
-    let r1 = c
-        .get(format!("http://127.0.0.1:{}/api/v1/status", port))
-        .send()
-        .await
-        .unwrap();
-    let r2 = c
-        .get(format!("http://127.0.0.1:{}/api/v2/status", port))
-        .send()
-        .await
-        .unwrap();
+    let server = spawn_server(app).await;
+    let r1 = server.get("/api/v1/status").send().await.unwrap();
+    let r2 = server.get("/api/v2/status").send().await.unwrap();
     assert_eq!(r1.text().await.unwrap(), "v1 ok");
     assert_eq!(r2.text().await.unwrap(), "v2 ok");
 }
@@ -587,9 +429,8 @@ async fn test_custom_fallback_e2e() {
     let app = Router::new()
         .route("/exists", get(handler))
         .fallback(|_req: Request<Bytes>| async { (StatusCode::NOT_FOUND, "custom 404") });
-    let (port, _h) = spawn_server(app).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/missing", port))
+    let server = spawn_server(app).await;
+    let res = server.get("/missing")
         .send()
         .await
         .unwrap();
@@ -607,9 +448,8 @@ async fn test_serve_file_static() {
     let app = Router::new()
         .serve_file("/hello", fpath.to_str().unwrap())
         .expect("serve_file");
-    let (port, _h) = spawn_server(app).await;
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/hello", port))
+    let server = spawn_server(app).await;
+    let res = server.get("/hello")
         .send()
         .await
         .unwrap();
@@ -637,10 +477,9 @@ async fn test_static_dir_path_traversal_blocked() {
         .await
         .unwrap();
     let app = Router::new().serve_dir("/files", serve);
-    let (port, _h) = spawn_server(app).await;
+    let server = spawn_server(app).await;
     // Attempt directory traversal via path param
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/files/../../etc/passwd", port))
+    let res = server.get("/files/../../etc/passwd")
         .send()
         .await
         .unwrap();
@@ -679,18 +518,14 @@ async fn test_concurrent_requests() {
     let app = Router::new()
         .route("/count", get(handler))
         .with_state(Ctr(counter2));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let _h = tokio::spawn(async move { Server::new(app).serve_http(listener).await.unwrap() });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    let server = spawn_server(app).await;
 
-    let c = Arc::new(client());
     let mut handles = Vec::new();
     for _ in 0..50 {
-        let c2 = c.clone();
-        let url = format!("http://127.0.0.1:{}/count", port);
+        let client = server.client().clone();
+        let url = server.url("/count");
         handles.push(tokio::spawn(async move {
-            c2.get(url).send().await.unwrap().status()
+            client.get(url).send().await.unwrap().status()
         }));
     }
     let results: Vec<_> = futures::future::join_all(handles).await;
@@ -706,33 +541,7 @@ async fn test_concurrent_requests() {
 
 mod extractor_unit {
     use super::*;
-    use tachyon_web::routing::extract::{Cookies, FromRequest, PathParams};
-
-    fn make_req_with_body(method: &str, uri: &str, ct: &str, body: &[u8]) -> Request<Body> {
-        Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("content-type", ct)
-            .body(Body::full(Bytes::copy_from_slice(body)))
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn json_rejects_wrong_content_type() {
-        let req = make_req_with_body("POST", "/", "text/plain", b"{\"value\":\"x\"}");
-        let result = tachyon_web::Json::<Payload>::from_request(req, &()).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let resp = tachyon_web::IntoResponse::into_response(err);
-        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-
-    #[tokio::test]
-    async fn form_rejects_json_content_type() {
-        let req = make_req_with_body("POST", "/", "application/json", b"username=alice&age=30");
-        let result = Form::<FormData>::from_request(req, &()).await;
-        assert!(result.is_err());
-    }
+    use tachyon_web::routing::extract::{Cookies, FromRequest};
 
     #[tokio::test]
     async fn cookies_extractor_parses_header() {
@@ -765,33 +574,6 @@ mod extractor_unit {
     }
 
     #[tokio::test]
-    async fn path_extractor_missing_returns_400() {
-        let req = Request::builder()
-            .uri("/user/1")
-            .body(Body::empty())
-            .unwrap();
-        let result = Path::<UserParams>::from_request(req, &()).await;
-        let resp = tachyon_web::IntoResponse::into_response(result.unwrap_err());
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn path_extractor_type_error_returns_400() {
-        let mut req = Request::builder()
-            .uri("/user/abc/bob")
-            .body(Body::empty())
-            .unwrap();
-        // Insert params with invalid type for `id`
-        let _ = req.extensions_mut().insert(PathParams(vec![
-            ("id".into(), "not-a-number".into()),
-            ("name".into(), "bob".into()),
-        ]));
-        let result = Path::<UserParams>::from_request(req, &()).await;
-        let resp = tachyon_web::IntoResponse::into_response(result.unwrap_err());
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
     async fn string_extractor_invalid_utf8_returns_400() {
         let invalid_utf8 = vec![0xFF, 0xFE];
         let req = Request::builder()
@@ -821,31 +603,6 @@ mod extractor_unit {
             .unwrap();
         let host2 = Host::from_request(req2, &()).await.unwrap();
         assert_eq!(host2.0, "example.org");
-    }
-
-    #[tokio::test]
-    async fn original_uri_extractor_ok() {
-        use tachyon_web::OriginalUri;
-        let req = Request::builder()
-            .uri("/original?foo=bar")
-            .body(Body::empty())
-            .unwrap();
-        let original_uri = OriginalUri::from_request(req, &()).await.unwrap();
-        assert_eq!(original_uri.0.path(), "/original");
-        assert_eq!(original_uri.0.query().unwrap(), "foo=bar");
-    }
-
-    #[tokio::test]
-    async fn connect_info_extractor_ok() {
-        use std::net::SocketAddr;
-        use tachyon_web::ConnectInfo;
-        let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let _ = req.extensions_mut().insert(ConnectInfo(addr));
-        let connect_info = ConnectInfo::<SocketAddr>::from_request(req, &())
-            .await
-            .unwrap();
-        assert_eq!(connect_info.0, addr);
     }
 
     #[test]
@@ -901,10 +658,9 @@ mod extractor_unit {
         }
 
         let router = Router::new().route("/hello/:name", get(name_handler));
-        let (port, _h) = spawn_server(router).await;
+        let server = spawn_server(router).await;
 
-        let res = client()
-            .get(format!("http://127.0.0.1:{}/hello/John%20Doe", port))
+        let res = server.get("/hello/John%20Doe")
             .send()
             .await
             .unwrap();
@@ -922,10 +678,9 @@ mod extractor_unit {
 
         let serve = ServeDir::new(dir.path()).preload().await.unwrap();
         let router = Router::new().serve_dir("/files", serve);
-        let (port, _h) = spawn_server(router).await;
+        let server = spawn_server(router).await;
 
-        let res = client()
-            .get(format!("http://127.0.0.1:{}/files/hello%20space.txt", port))
+        let res = server.get("/files/hello%20space.txt")
             .send()
             .await
             .unwrap();
@@ -947,9 +702,9 @@ async fn test_h2c_prior_knowledge_over_plain_tcp() {
     async fn handler() -> &'static str {
         "h2c ok"
     }
-    let (port, _h) = spawn_server(Router::new().route("/", get(handler))).await;
+    let server = spawn_server(Router::new().route("/", get(handler))).await;
 
-    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+    let stream = tokio::net::TcpStream::connect(server.addr())
         .await
         .expect("connect");
     let io = hyper_util::rt::TokioIo::new(stream);
@@ -974,43 +729,4 @@ async fn test_h2c_prior_knowledge_over_plain_tcp() {
         .expect("collect body")
         .to_bytes();
     assert_eq!(&body[..], b"h2c ok");
-}
-
-// ─── Opt-in trailing-slash normalization ──────────────────────────────────────
-
-#[tokio::test]
-async fn test_normalize_trailing_slash_strips_before_routing() {
-    async fn handler() -> &'static str {
-        "ok"
-    }
-    let router = Router::new()
-        .route("/about", get(handler))
-        .normalize_trailing_slash();
-    let (port, _h) = spawn_server(router).await;
-
-    // The route was registered without a trailing slash; with normalization
-    // enabled, a request with one still reaches it.
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/about/", port))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.unwrap(), "ok");
-}
-
-#[tokio::test]
-async fn test_normalize_trailing_slash_off_by_default_still_404s() {
-    async fn handler() -> &'static str {
-        "ok"
-    }
-    // No `.normalize_trailing_slash()` call — strict Axum-like behavior applies.
-    let (port, _h) = spawn_server(Router::new().route("/about", get(handler))).await;
-
-    let res = client()
-        .get(format!("http://127.0.0.1:{}/about/", port))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 404);
 }

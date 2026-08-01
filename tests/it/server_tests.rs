@@ -1,14 +1,7 @@
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names
-)]
-
+#[cfg(any(feature = "http1", feature = "cert-gen"))]
+use crate::common::{free_loopback_addr, wait_until_listening};
+#[cfg(feature = "cert-gen")]
+use crate::common::tls_client;
 #[cfg(feature = "http1")]
 use bytes::Bytes;
 #[cfg(feature = "http1")]
@@ -18,21 +11,30 @@ use tachyon_web::{Router, Server};
 use tachyon_web::{get, post};
 #[cfg(feature = "http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-#[cfg(any(feature = "http1", feature = "cert-gen"))]
+#[cfg(feature = "http1")]
 use tokio::net::TcpListener;
 
-/// Binds an ephemeral port, immediately frees it, and returns the `SocketAddr` so a
-/// convenience entry point that takes an address/string (rather than a pre-bound
-/// `TcpListener`) can be exercised without racing a fixed port.
-// Every caller is behind one of these two gates.
+/// A `rustls::ServerConfig` holding a fresh self-signed `localhost` certificate, with the
+/// given ALPN list — the setup five of the TLS tests below each spelled out in full.
+#[cfg(feature = "cert-gen")]
+fn self_signed_config(alpn: &[&[u8]]) -> rustls::ServerConfig {
+    let cert = tachyon_web::tls::generate_self_signed_cert(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert_der], cert.key_der)
+        .expect("build rustls ServerConfig");
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config
+}
+
+/// Waits for `addr` to come up, then asserts a request to it answers `200` with `expected`.
 #[cfg(any(feature = "http1", feature = "cert-gen"))]
-async fn free_loopback_addr() -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
-    addr
+async fn assert_serves(client: &reqwest::Client, url: &str, addr: std::net::SocketAddr, expected: &str) {
+    wait_until_listening(addr).await;
+    let res = client.get(url).send().await.expect("request");
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.text().await.expect("body"), expected);
 }
 
 #[test]
@@ -147,12 +149,7 @@ async fn test_start_http_addr() {
         let _ = server.start_http_addr(addr).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let res = reqwest::get(format!("http://{addr}/"))
-        .await
-        .expect("http request");
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.expect("body"), "ok-addr");
+    assert_serves(&reqwest::Client::new(), &format!("http://{addr}/"), addr, "ok-addr").await;
     handle.abort();
 }
 
@@ -167,12 +164,7 @@ async fn test_start_http_with_address_string() {
         let _ = server.start_http(&addr_str).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let res = reqwest::get(format!("http://{addr}/"))
-        .await
-        .expect("http request");
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.expect("body"), "ok-str");
+    assert_serves(&reqwest::Client::new(), &format!("http://{addr}/"), addr, "ok-str").await;
     handle.abort();
 }
 
@@ -189,15 +181,7 @@ async fn test_start_http_rejects_unparseable_address() {
 #[cfg(feature = "cert-gen")]
 #[tokio::test]
 async fn test_start_https_with_config_addr() {
-    use tachyon_web::tls::generate_self_signed_cert;
-
-    let cert = generate_self_signed_cert(vec!["localhost".to_string()]).unwrap();
-    let mut server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.cert_der], cert.key_der)
-        .unwrap();
-    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
+    let server_config = self_signed_config(&[b"h2", b"http/1.1"]);
     let addr = free_loopback_addr().await;
     let router = Router::new().route("/", get(|| async { "ok-https-addr" }));
     let server = Server::new(router);
@@ -207,33 +191,14 @@ async fn test_start_https_with_config_addr() {
             .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let res = client
-        .get(format!("https://{addr}/"))
-        .send()
-        .await
-        .expect("https request");
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.unwrap(), "ok-https-addr");
+    assert_serves(&tls_client(), &format!("https://{addr}/"), addr, "ok-https-addr").await;
     handle.abort();
 }
 
 #[cfg(feature = "cert-gen")]
 #[tokio::test]
 async fn test_start_https_with_config_string() {
-    use tachyon_web::tls::generate_self_signed_cert;
-
-    let cert = generate_self_signed_cert(vec!["localhost".to_string()]).unwrap();
-    let mut server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.cert_der], cert.key_der)
-        .unwrap();
-    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
+    let server_config = self_signed_config(&[b"h2", b"http/1.1"]);
     let addr = free_loopback_addr().await;
     let addr_str = addr.to_string();
     let router = Router::new().route("/", get(|| async { "ok-https-str" }));
@@ -244,32 +209,14 @@ async fn test_start_https_with_config_string() {
             .await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let res = client
-        .get(format!("https://{addr}/"))
-        .send()
-        .await
-        .expect("https request");
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.unwrap(), "ok-https-str");
+    assert_serves(&tls_client(), &format!("https://{addr}/"), addr, "ok-https-str").await;
     handle.abort();
 }
 
 #[cfg(feature = "cert-gen")]
 #[tokio::test]
 async fn test_start_https_with_config_rejects_unparseable_address() {
-    use tachyon_web::tls::generate_self_signed_cert;
-
-    let cert = generate_self_signed_cert(vec!["localhost".to_string()]).unwrap();
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.cert_der], cert.key_der)
-        .unwrap();
-
+    let server_config = self_signed_config(&[]);
     let server = Server::new(Router::new());
     let err = server
         .start_https_with_config("this-is-not-a-socket-addr", server_config)
@@ -281,14 +228,7 @@ async fn test_start_https_with_config_rejects_unparseable_address() {
 #[cfg(all(feature = "cert-gen", feature = "http3"))]
 #[tokio::test]
 async fn test_start_https_and_h3_with_config() {
-    use tachyon_web::tls::generate_self_signed_cert;
-
-    let cert = generate_self_signed_cert(vec!["localhost".to_string()]).unwrap();
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.cert_der], cert.key_der)
-        .unwrap();
-
+    let server_config = self_signed_config(&[]);
     let addr = free_loopback_addr().await;
     let addr_str = addr.to_string();
     let router = Router::new().route("/", get(|| async { "ok-h3-config" }));
@@ -299,13 +239,10 @@ async fn test_start_https_and_h3_with_config() {
             .await;
     });
 
-    // Give both the QUIC (UDP) and TCP TLS listeners time to come up.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let res = client
+    // Both the QUIC (UDP) and TCP TLS listeners share `addr`; waiting on the TCP one is
+    // enough here, since that's what this request goes over.
+    wait_until_listening(addr).await;
+    let res = tls_client()
         .get(format!("https://{addr}/"))
         .version(reqwest::Version::HTTP_2)
         .send()
@@ -327,12 +264,7 @@ async fn test_free_serve_function() {
         let _ = tachyon_web::serve(listener, router).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let res = reqwest::get(format!("http://{addr}/"))
-        .await
-        .expect("http request");
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.expect("body"), "ok-serve-fn");
+    assert_serves(&reqwest::Client::new(), &format!("http://{addr}/"), addr, "ok-serve-fn").await;
     handle.abort();
 }
 
@@ -353,18 +285,7 @@ async fn test_bind_rustls_https_server_serve() {
         let _ = tachyon_web::bind_rustls(addr, config).serve(router).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let res = client
-        .get(format!("https://{addr}/"))
-        .send()
-        .await
-        .expect("https request");
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.unwrap(), "ok-bind-rustls");
+    assert_serves(&tls_client(), &format!("https://{addr}/"), addr, "ok-bind-rustls").await;
     handle.abort();
 }
 
@@ -388,18 +309,12 @@ async fn test_bind_rustls_https_server_serve_with_http3_enabled() {
             .await;
     });
 
-    // Give both the QUIC (UDP) and TCP TLS listeners time to come up.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let res = client
-        .get(format!("https://{addr}/"))
-        .send()
-        .await
-        .expect("https request over the shared addr with http3 also enabled");
-    assert_eq!(res.status(), 200);
-    assert_eq!(res.text().await.unwrap(), "ok-bind-rustls-h3");
+    assert_serves(
+        &tls_client(),
+        &format!("https://{addr}/"),
+        addr,
+        "ok-bind-rustls-h3",
+    )
+    .await;
     handle.abort();
 }

@@ -183,19 +183,6 @@ where
     }
 }
 
-impl<S, T> FromRequest<S> for State<T>
-where
-    S: Sync,
-    T: FromRef<S> + Send + Sync + 'static,
-{
-    type Rejection = Infallible;
-
-    async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
-        let (mut parts, _) = req.into_parts();
-        Self::from_request_parts(&mut parts, state)
-    }
-}
-
 /// Extractor for path parameters.
 #[cfg(any(feature = "query", feature = "form"))]
 #[derive(Debug, Clone)]
@@ -205,6 +192,26 @@ struct QueryIter<'de> {
 
 struct CoercingCowDeserializer<'de> {
     val: std::borrow::Cow<'de, str>,
+}
+
+/// Query/form/path values arrive as strings, so every numeric target is deserialized by
+/// `FromStr`-parsing the raw value. Generates one `deserialize_*` method per primitive,
+/// all identical apart from the type parsed and the visitor method called.
+macro_rules! coerce_via_from_str {
+    ($( $method:ident => $visit:ident : $ty:ty ),* $(,)?) => {
+        $(
+            fn $method<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+            where
+                V: serde::de::Visitor<'de>,
+            {
+                let n = self
+                    .val
+                    .parse::<$ty>()
+                    .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                visitor.$visit(n)
+            }
+        )*
+    };
 }
 
 impl<'de> serde::de::Deserializer<'de> for CoercingCowDeserializer<'de> {
@@ -237,114 +244,17 @@ impl<'de> serde::de::Deserializer<'de> for CoercingCowDeserializer<'de> {
         self.deserialize_str(visitor)
     }
 
-    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<u8>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_u8(n)
-    }
-
-    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<u16>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_u16(n)
-    }
-
-    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<u32>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_u32(n)
-    }
-
-    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<u64>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_u64(n)
-    }
-
-    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<i8>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_i8(n)
-    }
-
-    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<i16>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_i16(n)
-    }
-
-    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<i32>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_i32(n)
-    }
-
-    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<i64>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_i64(n)
-    }
-
-    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<f32>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_f32(n)
-    }
-
-    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        let n = self
-            .val
-            .parse::<f64>()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-        visitor.visit_f64(n)
+    coerce_via_from_str! {
+        deserialize_u8 => visit_u8: u8,
+        deserialize_u16 => visit_u16: u16,
+        deserialize_u32 => visit_u32: u32,
+        deserialize_u64 => visit_u64: u64,
+        deserialize_i8 => visit_i8: i8,
+        deserialize_i16 => visit_i16: i16,
+        deserialize_i32 => visit_i32: i32,
+        deserialize_i64 => visit_i64: i64,
+        deserialize_f32 => visit_f32: f32,
+        deserialize_f64 => visit_f64: f64,
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -749,19 +659,6 @@ where
     }
 }
 
-impl<S, T> FromRequest<S> for Path<T>
-where
-    S: Sync,
-    T: DeserializeOwned + Send + Sync + 'static,
-{
-    type Rejection = Error;
-
-    async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
-        let (mut parts, _) = req.into_parts();
-        Self::from_request_parts(&mut parts, state)
-    }
-}
-
 /// Extractor for query parameters. Requires the `query` feature.
 #[cfg(feature = "query")]
 #[derive(Debug, Clone)]
@@ -787,20 +684,6 @@ where
                 status: StatusCode::BAD_REQUEST,
                 message: format!("Failed to deserialize query parameters: {e}"),
             })
-    }
-}
-
-#[cfg(feature = "query")]
-impl<S, T> FromRequest<S> for Query<T>
-where
-    S: Sync,
-    T: DeserializeOwned + Send + Sync + 'static,
-{
-    type Rejection = Error;
-
-    async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
-        let (mut parts, _) = req.into_parts();
-        Self::from_request_parts(&mut parts, state)
     }
 }
 
@@ -1048,19 +931,6 @@ where
     }
 }
 
-impl<S, T> FromRequest<S> for Extension<T>
-where
-    S: Sync,
-    T: Clone + Send + Sync + 'static,
-{
-    type Rejection = Error;
-
-    async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
-        let (mut parts, _) = req.into_parts();
-        Self::from_request_parts(&mut parts, state)
-    }
-}
-
 /// Extractor for reading and managing Cookies.
 #[cfg(feature = "cookies")]
 #[derive(Debug, Clone)]
@@ -1290,22 +1160,25 @@ where
     }
 }
 
-impl<S, T> FromRequest<S> for ConnectInfo<T>
-where
-    S: Sync,
-    T: Clone + Send + Sync + 'static,
-{
-    type Rejection = Error;
-
-    async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
-        let (mut parts, _) = req.into_parts();
-        Self::from_request_parts(&mut parts, state)
-    }
-}
-
+/// Derives an extractor's [`FromRequest`] impl from its [`FromRequestParts`] one: discard the
+/// body, run the parts extractor, forward its rejection type unchanged. Every extractor that
+/// only reads request metadata (headers, method, URI, extensions, state) works this way, so
+/// each would otherwise repeat the same five-line body verbatim.
+///
+/// The second form is for generic extractors (`State<T>`, `Path<T>`, …), whose forwarded impl
+/// has to restate the same `T` bounds its `FromRequestParts` impl carries.
 macro_rules! impl_from_request_via_parts {
     ($ty:ty) => {
-        impl<S: Sync> FromRequest<S> for $ty {
+        impl_from_request_via_parts!(@imp $ty, [], []);
+    };
+    ($ty:ty, T: $($bound:tt)+) => {
+        impl_from_request_via_parts!(@imp $ty, [T], [T: $($bound)+]);
+    };
+    (@imp $ty:ty, [$($generic:ident)?], [$($bounds:tt)*]) => {
+        impl<S: Sync, $($generic)?> FromRequest<S> for $ty
+        where
+            $($bounds)*
+        {
             type Rejection = <Self as FromRequestParts<S>>::Rejection;
 
             async fn from_request(
@@ -1330,6 +1203,13 @@ impl_from_request_via_parts!(Host);
 impl_from_request_via_parts!(OriginalUri);
 #[cfg(feature = "matched-path")]
 impl_from_request_via_parts!(MatchedPath);
+
+impl_from_request_via_parts!(State<T>, T: FromRef<S> + Send + Sync + 'static);
+impl_from_request_via_parts!(Path<T>, T: DeserializeOwned + Send + Sync + 'static);
+#[cfg(feature = "query")]
+impl_from_request_via_parts!(Query<T>, T: DeserializeOwned + Send + Sync + 'static);
+impl_from_request_via_parts!(Extension<T>, T: Clone + Send + Sync + 'static);
+impl_from_request_via_parts!(ConnectInfo<T>, T: Clone + Send + Sync + 'static);
 
 #[cfg(test)]
 mod tests {
@@ -1498,12 +1378,8 @@ mod tests {
             foo: String,
         }
 
-        // Invalid content type. Method must be POST (or any non-GET/HEAD) — otherwise
-        // `Form::from_request` silently delegates to the query-string path instead of ever
-        // reaching the Content-Type check below, which is exactly the bug this test used to
-        // have (all three sub-cases here defaulted to GET and accidentally exercised the
-        // wrong branch entirely; the `is_err()` assertions still passed, just for the wrong
-        // reason — a missing required field via an empty query string).
+        // The method must be POST (or any non-GET/HEAD): `Form::from_request` delegates
+        // GET/HEAD to the query-string path without ever reaching the Content-Type check.
         let req = Request::builder()
             .method("POST")
             .header(hyper::header::CONTENT_TYPE, "text/plain")
@@ -1750,10 +1626,8 @@ mod tests {
 
     #[test]
     fn test_path_ignored_any_top_level_target() {
-        // `serde::de::IgnoredAny` is a real, public serde type whose `Deserialize` impl
-        // calls `deserialize_ignored_any` directly on the top-level deserializer, so this
-        // exercises `PathDeserializer::deserialize_ignored_any` through the public `Path<T>`
-        // API without any artificial scaffolding.
+        // `IgnoredAny`'s `Deserialize` impl calls `deserialize_ignored_any` directly on the
+        // top-level deserializer.
         let mut parts = make_path_parts(vec![("a", "1"), ("b", "2")]);
         let result = Path::<serde::de::IgnoredAny>::from_request_parts(&mut parts, &());
         assert!(result.is_ok());

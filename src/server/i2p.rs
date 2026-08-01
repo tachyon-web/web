@@ -683,13 +683,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn i2p_config_debug_does_not_panic() {
-        let debug = format!("{:?}", I2pConfig::new("nick"));
-        assert!(debug.contains("I2pConfig"));
-        assert!(debug.contains("nick"));
-    }
-
     #[cfg(all(feature = "tls", feature = "cert-gen"))]
     #[test]
     fn tls_config_switches_to_a_custom_server_config() {

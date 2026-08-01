@@ -15,13 +15,6 @@
 //! cargo test --features i2p --test it -- --ignored
 //! ```
 
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args
-)]
-
 use tachyon_i2p::I2pRouter;
 use tachyon_web::Router;
 use tachyon_web::server::i2p::I2pConfig;

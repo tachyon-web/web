@@ -296,7 +296,7 @@ impl PerMessageDeflate {
             }
             // A peer can end its deflate stream (`BFINAL`) mid-payload, or send a block the
             // inflater can make no further progress on. Either way `decompress_vec` stops
-            // consuming input while reporting success, and the old unconditional `continue`
+            // consuming input while reporting success, and an unconditional `continue`
             // spun forever — doubling `out`'s capacity on every pass (`out.len()`, which the
             // `max_size` check guards, stays put) until the process ran out of memory. Any
             // non-`Ok` status means no more progress is coming, so stop.
@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(d.decompress(&compressed, None).unwrap(), payload);
     }
 
-    /// Garbage that inflates to nothing (and so never consumes its input) used to spin
+    /// Garbage that inflates to nothing (and so never consumes its input) would otherwise spin
     /// `decompress` forever, doubling the output buffer's *capacity* on every pass — `out.len()`
     /// stays at 0, so the `max_size` check never fired. It must terminate with an error.
     #[test]

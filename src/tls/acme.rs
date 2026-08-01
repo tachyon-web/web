@@ -718,17 +718,14 @@ impl AcmeManager {
 ///
 /// # Why this exists instead of a general X.509-parsing crate
 ///
-/// The only certificate this module ever parses is one this process itself wrote to
+/// The only certificate this module parses is one this process itself wrote to
 /// `<cache_dir>/domain.crt` after a successful ACME order (see
-/// [`AcmeManager::provision_cert`]) — never arbitrary, unauthenticated network input.
-/// Pulling in a full X.509/ASN.1 parsing stack (`x509-parser`, plus its own
-/// `der-parser`/`asn1-rs`/`nom`/`oid-registry`/`num-bigint` dependency tree — over a
-/// dozen extra crates) just to read one timestamp field out of our own
-/// previously-issued certificate was disproportionate. This walks the handful of DER
-/// TLVs needed to reach `TBSCertificate.validity.notAfter` and nothing else; SAN
-/// parsing (a genuinely more involved structure) is instead delegated to
-/// [`cert_matches_domains`] via `rustls-webpki`'s public, already-linked-through-`rustls`
-/// `EndEntityCert::valid_dns_names()`.
+/// [`AcmeManager::provision_cert`]) — never arbitrary network input. Reading one timestamp
+/// out of it doesn't justify a full X.509/ASN.1 stack (`x509-parser` and its
+/// `der-parser`/`asn1-rs`/`nom`/`oid-registry`/`num-bigint` tree), so this walks only the DER
+/// TLVs needed to reach `TBSCertificate.validity.notAfter`. SAN parsing, a more involved
+/// structure, is delegated to [`cert_matches_domains`] via `rustls-webpki`'s
+/// `EndEntityCert::valid_dns_names()`, already linked through `rustls`.
 ///
 /// X.509 certificates are always definite-length DER (never indefinite-length BER),
 /// so this only needs to handle short- and long-form DER lengths — no indefinite

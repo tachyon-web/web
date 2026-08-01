@@ -66,29 +66,23 @@ const fn method_index(m: &Method) -> Option<usize> {
 #[derive(Clone)]
 pub struct MethodRouter<S> {
     handlers: [Option<middleware::MethodHandler<S>>; METHOD_COUNT],
-    /// Path-parameter names for this route, in declaration order, populated by
-    /// `Router::compile()`. Cloning an `Arc<str>` per request into `PathParams`
-    /// is a refcount bump, avoiding a fresh heap allocation for every param name
-    /// on every request (the names are fixed once the route is compiled).
+    /// Path-parameter names in declaration order, populated by `Router::compile()`. Cloning
+    /// an `Arc<str>` into `PathParams` is a refcount bump rather than a per-request
+    /// allocation.
     param_names: Arc<[Arc<str>]>,
-    /// The compiled route pattern this handler is registered under (e.g.
-    /// `/users/{id}`), populated by `Router::compile()`. Exposed to handlers via
-    /// the [`crate::routing::extract::MatchedPath`] extractor, matching Axum.
+    /// The route pattern this handler is registered under (e.g. `/users/{id}`), exposed via
+    /// the [`MatchedPath`](crate::routing::extract::MatchedPath) extractor.
     matched_path: Arc<str>,
-    /// When this route was reached through one or more `Router::nest()` calls,
-    /// the accumulated prefix to strip from the request `Uri` before dispatch —
-    /// matching Axum's nested-router URI rewriting (see `Router::nest`).
+    /// The accumulated prefix to strip from the request `Uri` before dispatch, when this
+    /// route was reached through one or more [`Router::nest`] calls.
     nest_prefix: Option<Arc<str>>,
 }
 
 impl<S> std::fmt::Debug for MethodRouter<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let methods = [
-            "GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE", "CONNECT",
-        ];
         let mut dbg = f.debug_struct("MethodRouter");
-        for (i, name) in methods.iter().enumerate() {
-            let _ = dbg.field(name, &self.handlers[i].is_some());
+        for (name, handler) in METHOD_NAMES.iter().zip(&self.handlers) {
+            let _ = dbg.field(name, &handler.is_some());
         }
         let _ = dbg.field("param_names", &self.param_names);
         let _ = dbg.field("matched_path", &self.matched_path);
@@ -114,7 +108,7 @@ where
     #[must_use]
     pub fn new() -> Self {
         Self {
-            handlers: [None, None, None, None, None, None, None, None, None],
+            handlers: [const { None }; METHOD_COUNT],
             param_names: Arc::from([]),
             matched_path: Arc::from(""),
             nest_prefix: None,
@@ -132,99 +126,9 @@ where
         self
     }
 
-    /// Add a handler for HTTP GET requests.
-    #[must_use]
-    pub fn get<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_GET, handler)
-    }
-    /// Add a handler for HTTP POST requests.
-    #[must_use]
-    pub fn post<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_POST, handler)
-    }
-    /// Add a handler for HTTP PUT requests.
-    #[must_use]
-    pub fn put<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_PUT, handler)
-    }
-    /// Add a handler for HTTP DELETE requests.
-    #[must_use]
-    pub fn delete<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_DELETE, handler)
-    }
-    /// Add a handler for HTTP OPTIONS requests.
-    #[must_use]
-    pub fn options<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_OPTIONS, handler)
-    }
-    /// Add a handler for HTTP HEAD requests.
-    #[must_use]
-    pub fn head<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_HEAD, handler)
-    }
-    /// Add a handler for HTTP PATCH requests.
-    #[must_use]
-    pub fn patch<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_PATCH, handler)
-    }
-    /// Add a handler for HTTP TRACE requests.
-    #[must_use]
-    pub fn trace<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_TRACE, handler)
-    }
-    /// Add a handler for HTTP CONNECT requests.
-    #[must_use]
-    pub fn connect<H, T>(self, handler: H) -> Self
-    where
-        H: Handler<T, S>,
-        T: 'static,
-    {
-        self.set(IDX_CONNECT, handler)
-    }
-
-    /// Returns the `Allow` header value listing all registered HTTP methods.
-    ///
-    /// Builds the string with a single pre-sized allocation (sized for the
-    /// worst case: all nine methods plus a synthesized `HEAD`) and avoids
-    /// an intermediate `Vec` — called only on 405 responses.
-    ///
-    /// Matches Axum's format: comma-joined with no space, and — since a `GET`
-    /// handler transparently answers `HEAD` requests too when no explicit
-    /// `HEAD` handler is registered (see `handle_request`'s
-    /// `falls_back_to_get` logic) — `HEAD` is listed whenever `GET` is
-    /// registered, even without an explicit `HEAD` handler.
+    /// The `Allow` header value listing every registered method, in Axum's format
+    /// (comma-joined, no spaces). `HEAD` is listed whenever `GET` is, since a `GET` handler
+    /// answers `HEAD` when no explicit one is registered.
     fn allow_header(&self) -> String {
         let mut out = String::with_capacity(56);
         let implicit_head = self.handlers[IDX_GET].is_some() && self.handlers[IDX_HEAD].is_none();
@@ -242,17 +146,12 @@ where
         out
     }
 
-    /// Merges `other`'s method handlers into `self`, matching Axum's
-    /// `Router::route` semantics where registering the same path twice with
-    /// non-overlapping methods combines into a single route — e.g.
-    /// `.route("/x", get(a)).route("/x", post(b))` yields one route that
-    /// answers both `GET` and `POST` on `/x`, rather than tachyon-web's
-    /// previous behavior of rejecting *any* repeated path outright.
+    /// Merges `other`'s method handlers into `self`: registering the same path twice with
+    /// non-overlapping methods combines into a single route, matching Axum.
     ///
     /// # Errors
-    /// Returns [`RouterError::MethodOverlap`] if `other` defines a method
-    /// already present in `self` — matching Axum, which panics with
-    /// "Overlapping method route" for the same situation.
+    /// Returns [`RouterError::MethodOverlap`] if `other` defines a method already present in
+    /// `self` — where Axum panics with "Overlapping method route".
     fn merge(mut self, mut other: Self, path: &str) -> Result<Self, RouterError> {
         for (i, (mine, theirs)) in self
             .handlers
@@ -270,12 +169,6 @@ where
                 *mine = Some(handler);
             }
         }
-        // `nest_prefix` isn't recomputed at `compile()` time (unlike
-        // `param_names`/`matched_path`), so a prefix carried by either side
-        // must survive the merge — otherwise a route registered via both
-        // `.nest()` and a plain `.route()` at the same final path would
-        // silently lose its prefix-stripping behavior depending on
-        // registration order.
         if self.nest_prefix.is_none() {
             self.nest_prefix = other.nest_prefix;
         }
@@ -346,7 +239,7 @@ where
         S: Clone + Send + Sync + 'static,
     {
         let mut new_handlers: [Option<middleware::MethodHandler<S2>>; METHOD_COUNT] =
-            [None, None, None, None, None, None, None, None, None];
+            [const { None }; METHOD_COUNT];
         for (i, opt_handler) in self.handlers.iter().enumerate() {
             if let Some(handler) = opt_handler {
                 let mut compiled_h = handler.clone();
@@ -367,117 +260,68 @@ where
     }
 }
 
-// ─── MethodRouter shortcuts ───────────────────────────────────────────────────
+// ─── Per-method builders and shortcuts ────────────────────────────────────────
 
-/// Helper to construct a GET-only route.
-pub fn get<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().get(handler)
+/// Generates the nine per-verb `MethodRouter` builder methods (`.get()`, `.post()`, …)
+/// and their matching free-function shortcuts (`get(h)`, `post(h)`, …) — one pair per
+/// HTTP method, all structurally identical apart from which slot of `handlers` they fill.
+macro_rules! method_routes {
+    ($( ($name:ident, $idx:ident, $verb:literal) ),+ $(,)?) => {
+        impl<S> MethodRouter<S>
+        where
+            S: Clone + Send + Sync + 'static,
+        {
+            $(
+                #[doc = concat!("Add a handler for HTTP ", $verb, " requests.")]
+                #[must_use]
+                pub fn $name<H, T>(self, handler: H) -> Self
+                where
+                    H: Handler<T, S>,
+                    T: 'static,
+                {
+                    self.set($idx, handler)
+                }
+            )+
+        }
+
+        $(
+            #[doc = concat!("Helper to construct a ", $verb, "-only route.")]
+            pub fn $name<H, T, S>(handler: H) -> MethodRouter<S>
+            where
+                H: Handler<T, S>,
+                T: 'static,
+                S: Clone + Send + Sync + 'static,
+            {
+                MethodRouter::new().$name(handler)
+            }
+        )+
+
+        /// Helper to construct a route that dispatches to `handler` for **every** HTTP
+        /// method (`GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`, `HEAD`, `PATCH`, `TRACE`,
+        /// `CONNECT`). Matches `axum::routing::any`.
+        pub fn any<H, T, S>(handler: H) -> MethodRouter<S>
+        where
+            H: Handler<T, S>,
+            T: 'static,
+            S: Clone + Send + Sync + 'static,
+        {
+            let router = MethodRouter::new();
+            $( let router = router.$name(handler.clone()); )+
+            router
+        }
+    };
 }
 
-/// Helper to construct a POST-only route.
-pub fn post<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().post(handler)
-}
-
-/// Helper to construct a PUT-only route.
-pub fn put<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().put(handler)
-}
-
-/// Helper to construct a DELETE-only route.
-pub fn delete<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().delete(handler)
-}
-
-/// Helper to construct a PATCH-only route.
-pub fn patch<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().patch(handler)
-}
-
-/// Helper to construct an OPTIONS-only route.
-pub fn options<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().options(handler)
-}
-
-/// Helper to construct a HEAD-only route.
-pub fn head<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().head(handler)
-}
-
-/// Helper to construct a TRACE-only route.
-pub fn trace<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().trace(handler)
-}
-
-/// Helper to construct a CONNECT-only route.
-pub fn connect<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new().connect(handler)
-}
-
-/// Helper to construct a route that dispatches to `handler` for **every** HTTP
-/// method (`GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`, `HEAD`, `PATCH`, `TRACE`,
-/// `CONNECT`). Matches `axum::routing::any`.
-pub fn any<H, T, S>(handler: H) -> MethodRouter<S>
-where
-    H: Handler<T, S>,
-    T: 'static,
-    S: Clone + Send + Sync + 'static,
-{
-    MethodRouter::new()
-        .get(handler.clone())
-        .post(handler.clone())
-        .put(handler.clone())
-        .delete(handler.clone())
-        .options(handler.clone())
-        .head(handler.clone())
-        .patch(handler.clone())
-        .trace(handler.clone())
-        .connect(handler)
+method_routes! {
+    (get, IDX_GET, "GET"),
+    (post, IDX_POST, "POST"),
+    (put, IDX_PUT, "PUT"),
+    (delete, IDX_DELETE, "DELETE"),
+    (options, IDX_OPTIONS, "OPTIONS"),
+    (head, IDX_HEAD, "HEAD"),
+    (patch, IDX_PATCH, "PATCH"),
+    (trace, IDX_TRACE, "TRACE"),
+    (connect, IDX_CONNECT, "CONNECT"),
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
@@ -488,17 +332,12 @@ pub struct Router<S = ()> {
     routes: Vec<(String, MethodRouter<S>)>,
     fallback: Option<BoxedHandler<S>>,
     method_not_allowed_fallback: Option<BoxedHandler<S>>,
-    state: Option<Arc<S>>,
-    /// Opt-in trailing-slash normalization (see [`Router::normalize_trailing_slash`]).
+    /// See [`Router::normalize_trailing_slash`].
     normalize_trailing_slash: bool,
-    /// Lazily populated the first time this exact `Router` is driven as a
-    /// `tower::Service` (see the `impl Service<...> for Router<S>` below) —
-    /// lets `Router` be used as a drop-in `tower::Service`/`.oneshot()`
-    /// target exactly like `axum::Router`, with no separate `.compile()`
-    /// call the caller has to remember, while still only ever building the
-    /// `matchit` tree once rather than per request. Reset to `None` by every
-    /// route-table-mutating builder method, so building/serving/mutating
-    /// out of order can't silently dispatch against a stale tree.
+    /// Populated the first time this `Router` is driven as a `tower::Service`, so `.oneshot()`
+    /// works without a separate `.compile()` call while still building the `matchit` tree only
+    /// once. Every route-table-mutating builder method resets it to `None`, so mutating after
+    /// serving can't dispatch against a stale tree.
     #[cfg(feature = "tower")]
     compiled: Option<CompiledRouter<S>>,
 }
@@ -525,6 +364,25 @@ where
     }
 }
 
+/// Wraps a bare handler (a router's `fallback`/`method_not_allowed_fallback`) in
+/// `middleware`, so `.hoop()`/`.hoop_at()` cover them the same way they cover routes.
+fn wrap_handler<S, F, Fut, Res>(handler: BoxedHandler<S>, middleware: F) -> BoxedHandler<S>
+where
+    S: Send + Sync + 'static,
+    F: Fn(Request<Body>, middleware::Next<S>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
+    Res: IntoResponse + Send + 'static,
+{
+    Arc::new(move |req, state| {
+        let next = middleware::Next {
+            handler: handler.clone(),
+            state,
+        };
+        let fut = middleware(req, next);
+        handler::ResponseFuture::Boxed(Box::pin(async move { fut.await.into_response() }))
+    })
+}
+
 /// Combines two optional per-router handlers (a `fallback` or
 /// `method_not_allowed_fallback`) for [`Router::merge`]: `None` if neither side set one,
 /// whichever side's if only one did, or a panic with `panic_msg` if both did — matching
@@ -543,7 +401,6 @@ fn merge_optional<T>(a: Option<T>, b: Option<T>, panic_msg: &'static str) -> Opt
 ///
 /// Only converts leading `:` and `*` – pure literal segments are left unchanged.
 fn normalize_route_pattern(path: &str) -> String {
-    // Fast path: no special characters at all.
     if !path.contains(':') && !path.contains('*') {
         return path.to_string();
     }
@@ -553,7 +410,6 @@ fn normalize_route_pattern(path: &str) -> String {
             if segment.starts_with(':') && segment.len() > 1 {
                 format!("{{{}}}", &segment[1..])
             } else if segment.starts_with('*') && segment.len() > 1 {
-                // matchit wildcard syntax: {*name}
                 format!("{{{segment}}}")
             } else {
                 segment.to_string()
@@ -586,7 +442,6 @@ where
             routes: Vec::new(),
             fallback: None,
             method_not_allowed_fallback: None,
-            state: None,
             normalize_trailing_slash: false,
             #[cfg(feature = "tower")]
             compiled: None,
@@ -597,17 +452,13 @@ where
     /// from the incoming request's path *before* routing, so `/foo` and
     /// `/foo/` reach the same route.
     ///
-    /// By default (matching Axum) routing is strict — `/foo` and `/foo/` are
-    /// distinct routes, and a mismatch 404s. This opts into the common
-    /// convenience behavior natively, without pulling in `tower`/`tower-http`
-    /// just for `tower_http::normalize_path::NormalizePathLayer` — this method
-    /// mirrors that layer's own semantics exactly (an in-place path
-    /// normalization applied once per request, not a redirect), just built in.
+    /// By default (matching Axum) routing is strict: `/foo` and `/foo/` are distinct routes and
+    /// a mismatch 404s. Semantics match `tower_http`'s `NormalizePathLayer` — an in-place
+    /// normalization applied once per request, not a redirect.
     ///
-    /// Only meaningful on the outermost `Router` you actually `.compile()` (or
-    /// hand to a `Server`) — like `NormalizePathLayer`, it operates on the
-    /// whole incoming request before any route matching happens, so setting it
-    /// on a router later merged/nested into another has no effect.
+    /// Only meaningful on the outermost `Router` you `.compile()` (or hand to a `Server`),
+    /// since it runs before any route matching; setting it on a router later merged or nested
+    /// into another has no effect.
     #[must_use]
     pub const fn normalize_trailing_slash(mut self) -> Self {
         self.normalize_trailing_slash = true;
@@ -682,7 +533,6 @@ where
             routes: new_routes,
             fallback: new_fallback,
             method_not_allowed_fallback: new_method_not_allowed_fallback,
-            state: None,
             normalize_trailing_slash: self.normalize_trailing_slash,
             #[cfg(feature = "tower")]
             compiled: None,
@@ -694,12 +544,8 @@ where
     /// into one route) rather than always appending a new entry.
     ///
     /// # Panics
-    /// Panics if `method_router` defines an HTTP method already registered
-    /// for `path` — matching Axum's `Router::route`, which panics with
-    /// "Overlapping method route" in the same situation. This is a
-    /// deliberate, direct port of that panic-on-programmer-error behavior
-    /// (a route conflict is a build-time bug, not a runtime condition to
-    /// recover from), not an oversight.
+    /// Panics if `method_router` defines an HTTP method already registered for `path`,
+    /// matching Axum. A route conflict is a build-time bug, not a recoverable condition.
     #[allow(clippy::panic)]
     fn push_or_merge_route(&mut self, path: String, method_router: MethodRouter<S>) {
         #[cfg(feature = "tower")]
@@ -854,17 +700,11 @@ where
     ///
     /// # Deviation from Axum: the inner router's own `fallback` is not carried over
     ///
-    /// In real Axum, nesting mounts the whole inner `Router` as a recursive sub-service, so a
-    /// request under `prefix` that the inner router's own routes don't match still reaches the
-    /// *inner* router's `fallback` before ever falling through to the outer one. Because this
-    /// implementation flattens the inner router's routes into the same top-level route table
-    /// (the design that keeps nesting as fast as a flat lookup — see above), there is no
-    /// separate inner dispatch step left for a per-nest fallback to hook into: any path under
-    /// `prefix` that isn't one of the inner router's own registered routes simply falls through
-    /// to whatever `Router::fallback` (or the default `404`) is configured on the *outermost*
-    /// router — the inner router's own `.fallback(...)`, if it set one, is never called. Use
-    /// [`Router::fallback`] on the outer router (or register an explicit catch-all route under
-    /// `prefix`) if you need a per-module 404 handler.
+    /// Axum mounts the inner `Router` as a recursive sub-service, so an unmatched path under
+    /// `prefix` reaches the *inner* fallback first. Flattening into one route table leaves no
+    /// inner dispatch step for that to hook into, so unmatched paths fall straight through to
+    /// the outermost router's [`fallback`](Self::fallback) (or the default 404). Use that, or
+    /// an explicit catch-all route under `prefix`, for a per-module 404 handler.
     #[must_use]
     pub fn nest(mut self, prefix: &str, mut router: Self) -> Self {
         let prefix = prefix.trim_end_matches('/');
@@ -879,9 +719,6 @@ where
             } else {
                 nested_path
             };
-            // Accumulate the strip prefix across multiple levels of nesting
-            // (e.g. `.nest("/api", Router::new().nest("/v1", inner))` strips
-            // `/api/v1`, not just `/v1`).
             let accumulated = method_router.nest_prefix.as_ref().map_or_else(
                 || prefix.to_string(),
                 |existing| format!("{prefix}{existing}"),
@@ -895,13 +732,10 @@ where
     /// Merge another router's routes into this router.
     ///
     /// If exactly one of the two routers has a [`fallback`](Self::fallback) (or a
-    /// [`method_not_allowed_fallback`](Self::method_not_allowed_fallback)) configured, the
-    /// merged router adopts it — matching Axum, which does the same for `Router::fallback`.
-    /// Unlike [`nest`](Self::nest) (where the inner router's fallback is deliberately never
-    /// reachable — it would only ever fire for a request the outer router's own routing
-    /// already decided was unmatched, which the outer fallback already handles), `merge`
-    /// treats both routers as peers, so silently dropping one side's fallback would silently
-    /// change which handler answers unmatched requests.
+    /// [`method_not_allowed_fallback`](Self::method_not_allowed_fallback)), the merged router
+    /// adopts it, matching Axum. Unlike [`nest`](Self::nest), `merge` treats both routers as
+    /// peers, so dropping one side's fallback would change which handler answers unmatched
+    /// requests.
     ///
     /// # Panics
     /// Panics if `other` defines a method for a path already registered in `self`, or if
@@ -1130,33 +964,14 @@ where
             *method_router = old_mr.hoop_at(position, mw);
         }
 
-        if let Some(fallback) = self.fallback.take() {
-            let mw = middleware.clone();
-            self.fallback = Some(Arc::new(move |req, state| {
-                let next = middleware::Next {
-                    handler: fallback.clone(),
-                    state,
-                };
-                let fut = mw(req, next);
-                crate::routing::handler::ResponseFuture::Boxed(Box::pin(async move {
-                    fut.await.into_response()
-                }))
-            }));
-        }
-
-        if let Some(handler) = self.method_not_allowed_fallback.take() {
-            let mw = middleware;
-            self.method_not_allowed_fallback = Some(Arc::new(move |req, state| {
-                let next = middleware::Next {
-                    handler: handler.clone(),
-                    state,
-                };
-                let fut = mw(req, next);
-                crate::routing::handler::ResponseFuture::Boxed(Box::pin(async move {
-                    fut.await.into_response()
-                }))
-            }));
-        }
+        self.fallback = self
+            .fallback
+            .take()
+            .map(|h| wrap_handler(h, middleware.clone()));
+        self.method_not_allowed_fallback = self
+            .method_not_allowed_fallback
+            .take()
+            .map(|h| wrap_handler(h, middleware));
 
         self
     }
@@ -1178,11 +993,9 @@ where
     /// Build and compile the routing tree, returning a `CompiledRouter`.
     ///
     /// # Errors
-    /// Returns `RouterError::DuplicateRoute` if the same literal path somehow
-    /// reaches `compile()` twice. In practice this can't happen through the
-    /// public API — `route()`/`nest()`/`merge()` all merge same-path entries
-    /// (panicking on overlapping methods, matching Axum) — this is an
-    /// internal invariant check, not a condition callers need to handle.
+    /// Returns [`RouterError::DuplicateRoute`] if the same literal path reaches `compile()`
+    /// twice. `route()`/`nest()`/`merge()` all merge same-path entries, so this is an internal
+    /// invariant check rather than a condition callers need to handle.
     pub fn compile(self) -> Result<CompiledRouter<S>, RouterError>
     where
         S: Default,
@@ -1200,13 +1013,11 @@ where
             matcher.insert(path, method_router)?;
         }
 
-        let state = self.state.unwrap_or_else(|| Arc::new(S::default()));
-
         Ok(CompiledRouter {
             matcher,
             fallback: self.fallback,
             method_not_allowed_fallback: self.method_not_allowed_fallback,
-            state,
+            state: Arc::new(S::default()),
             normalize_trailing_slash: self.normalize_trailing_slash,
         })
     }
@@ -1217,11 +1028,8 @@ where
 pub enum RouterError {
     /// Duplicate route registered.
     DuplicateRoute(String),
-    /// The same path was registered with the same HTTP method more than
-    /// once (via separate `.route()` calls) — matching Axum's "Overlapping
-    /// method route" panic. Registering the same path with *different*
-    /// methods across multiple `.route()` calls is fine and merges into one
-    /// route, exactly like Axum.
+    /// The same path was registered with the same HTTP method more than once. Registering the
+    /// same path with *different* methods merges into one route, matching Axum.
     MethodOverlap {
         /// The HTTP method that was registered twice.
         method: &'static str,
@@ -1279,10 +1087,9 @@ impl<S> std::fmt::Debug for CompiledRouter<S> {
     }
 }
 
-/// Parses the `{name}` / `{*name}` placeholders out of a compiled route
-/// pattern, in declaration order, matching the order `matchit` yields them
-/// in `Match::params`. Computed once per route at `compile()` time so the
-/// hot path (`resolve()`) never has to allocate a `String` for a param key.
+/// Parses the `{name}` / `{*name}` placeholders out of a route pattern, in the order
+/// `matchit` yields them in `Match::params`. Computed once per route at `compile()` time so
+/// `resolve()` never allocates a `String` for a param key.
 fn extract_param_names(path: &str) -> Arc<[Arc<str>]> {
     let mut names = Vec::new();
     let bytes = path.as_bytes();
@@ -1337,12 +1144,10 @@ pub(crate) fn percent_decode(s: &str) -> Option<std::borrow::Cow<'_, str>> {
 /// (native [`Router::nest`] and [`tower_compat::ServiceHandler`]'s
 /// `nest_service`) to match Axum's nested-router URI rewriting.
 ///
-/// The prefix is stripped directly from the request's raw (still
-/// percent-encoded) `path()` string, and the original query string is carried
-/// over untouched — this deliberately avoids reconstructing the URI from a
-/// percent-*decoded* path segment, which would let a client smuggle a `?`/`#`
-/// past routing by percent-encoding it (e.g. `/api/foo%3Fadmin=1` decoding into
-/// a synthesized `?admin=1` query the router never evaluated as one).
+/// The prefix is stripped from the raw (still percent-encoded) `path()`, and the query string
+/// is carried over untouched. Reconstructing the URI from a percent-*decoded* segment would
+/// let a client smuggle a `?`/`#` past routing (`/api/foo%3Fadmin=1` becoming a synthesized
+/// `?admin=1` query the router never evaluated).
 pub(crate) fn strip_uri_prefix(req: &mut Request<Body>, prefix: &str) {
     let path = req.uri().path();
     let stripped = path.strip_prefix(prefix).unwrap_or(path);
@@ -1351,30 +1156,14 @@ pub(crate) fn strip_uri_prefix(req: &mut Request<Body>, prefix: &str) {
     } else {
         format!("/{stripped}")
     };
-    let path_and_query = match req.uri().query() {
-        Some(q) if !q.is_empty() => format!("{new_path}?{q}"),
-        _ => new_path,
-    };
-    let mut parts = req.uri().clone().into_parts();
-    if let Ok(pq) = path_and_query.parse() {
-        parts.path_and_query = Some(pq);
-    }
-    if let Ok(new_uri) = hyper::Uri::from_parts(parts) {
-        *req.uri_mut() = new_uri;
-    }
+    set_uri_path(req, &new_path);
 }
 
-/// Strips a single trailing `/` from `req`'s `Uri` path in place (used by
-/// [`Router::normalize_trailing_slash`]), preserving the query string and
-/// never stripping the root `/` itself. Mirrors
-/// `tower_http::normalize_path::NormalizePathLayer`'s own behavior: an
-/// in-place normalization applied before routing, not a redirect.
-fn strip_trailing_slash(req: &mut Request<Body>) {
-    let path = req.uri().path();
-    if path.len() <= 1 || !path.ends_with('/') {
-        return;
-    }
-    let new_path = &path[..path.len() - 1];
+/// Replaces `req`'s URI path with `new_path`, carrying the original query string over
+/// untouched. Shared by the two in-place path rewrites the router performs
+/// ([`strip_uri_prefix`] and [`strip_trailing_slash`]); a URI that won't reparse is left
+/// as-is rather than being replaced with something malformed.
+fn set_uri_path(req: &mut Request<Body>, new_path: &str) {
     let path_and_query = match req.uri().query() {
         Some(q) if !q.is_empty() => format!("{new_path}?{q}"),
         _ => new_path.to_string(),
@@ -1388,26 +1177,30 @@ fn strip_trailing_slash(req: &mut Request<Body>) {
     }
 }
 
+/// Strips a single trailing `/` from `req`'s `Uri` path in place for
+/// [`Router::normalize_trailing_slash`], preserving the query string and never stripping the
+/// root `/` itself.
+fn strip_trailing_slash(req: &mut Request<Body>) {
+    let path = req.uri().path();
+    if path.len() <= 1 || !path.ends_with('/') {
+        return;
+    }
+    let new_path = path[..path.len() - 1].to_string();
+    set_uri_path(req, &new_path);
+}
+
 impl<S> CompiledRouter<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     /// Route an incoming request, returning the resulting HTTP response.
     ///
-    /// # Trailing-slash handling
+    /// Routes match **exactly**, as in Axum: `/foo` and `/foo/` are distinct and neither falls
+    /// back to the other unless [`Router::normalize_trailing_slash`] was set. Paths are
+    /// case-sensitive.
     ///
-    /// Tachyon follows the same semantics as Axum: routes are matched **exactly**.
-    /// `/foo` and `/foo/` are distinct routes — a request for one does **not**
-    /// fall back to a route registered under the other, unless the router opted
-    /// into [`Router::normalize_trailing_slash`], in which case a trailing `/`
-    /// is stripped from the request path before matching (in-place, not a
-    /// redirect — the same behavior as `tower_http`'s `NormalizePathLayer`). We
-    /// also do **not** perform case-folding, which would silently obscure bugs
-    /// and change observable behavior.
-    ///
-    /// This is the hot path: the `matchit` radix-tree lookup is `O(path_len)`,
-    /// challenge interception is a single prefix check, and method dispatch
-    /// is an array index — all zero-allocation on the happy path.
+    /// This is the hot path: an `O(path_len)` `matchit` lookup, one prefix check, and an array
+    /// index for method dispatch — zero-allocation on the happy path.
     #[inline]
     pub async fn handle_request(&self, req: Request<Body>) -> Response<Body> {
         let mut req = req;
@@ -1447,8 +1240,7 @@ where
             }
         };
 
-        // Insert path params into extensions before handing off to the handler.
-        // Skip the extension insert entirely on parameterless routes (common case).
+        // Skipped entirely on parameterless routes, the common case.
         if !params.is_empty() {
             let _ = req.extensions_mut().insert(PathParams(params));
         }
@@ -1462,10 +1254,8 @@ where
                 ));
         }
 
-        // If this route was reached through `Router::nest()`, strip the
-        // accumulated prefix from the `Uri` the handler sees, preserving the
-        // pre-strip path via `OriginalUri` — matching Axum's nested-router
-        // semantics (see `Router::nest`'s docs).
+        // Nested routes see a prefix-stripped `Uri`, with the full path preserved via
+        // `OriginalUri`, matching Axum.
         if let Some(prefix) = &method_router.nest_prefix {
             #[cfg(feature = "original-uri")]
             {
@@ -1524,9 +1314,6 @@ where
         let params = if m.params.is_empty() {
             Vec::new()
         } else {
-            // Param names are precomputed once at `compile()` time and cloning an
-            // `Arc<str>` is a refcount bump, not a heap allocation — only the
-            // decoded value needs to be freshly allocated per request.
             let names = &m.value.param_names;
             let mut p = Vec::with_capacity(m.params.len());
             for (name, (_, v)) in names.iter().zip(m.params.iter()) {
@@ -1593,13 +1380,6 @@ mod tests {
     // ── routing correctness ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_root_route() {
-        let router = compile_app();
-        let resp = router.handle_request(make_req("GET", "/")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
     async fn test_path_param_extraction() {
         use http_body_util::BodyExt;
         let router = compile_app();
@@ -1635,17 +1415,13 @@ mod tests {
 
     // ── trailing slash strictness (matches Axum: /foo and /foo/ are distinct) ──
 
+    /// `/foo` and `/foo/` are distinct routes in both directions, matching Axum.
     #[tokio::test]
-    async fn test_trailing_slash_not_stripped() {
+    async fn test_trailing_slash_is_significant() {
         let router = compile_app();
-        // "/user/5/" must NOT match "/user/:id" — Axum treats these as distinct routes.
         let resp = router.handle_request(make_req("GET", "/user/5/")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
 
-    #[tokio::test]
-    async fn test_trailing_slash_not_added() {
-        // register route with trailing slash, request without — must NOT match.
         let router = Router::new()
             .route("/about/", get(handle_root))
             .with_state::<()>(())
@@ -1740,54 +1516,34 @@ mod tests {
     // ── normalize_route_pattern ───────────────────────────────────────────────
 
     #[test]
-    fn test_normalize_no_change() {
-        assert_eq!(normalize_route_pattern("/static/path"), "/static/path");
-    }
-
-    #[test]
-    fn test_normalize_colon_param() {
-        assert_eq!(normalize_route_pattern("/user/:id"), "/user/{id}");
-    }
-
-    #[test]
-    fn test_normalize_wildcard() {
-        assert_eq!(normalize_route_pattern("/files/*path"), "/files/{*path}");
-    }
-
-    #[test]
-    fn test_normalize_mixed() {
-        assert_eq!(
-            normalize_route_pattern("/api/:version/files/*rest"),
-            "/api/{version}/files/{*rest}"
-        );
+    fn test_normalize_route_pattern() {
+        for (input, expected) in [
+            ("/static/path", "/static/path"),
+            ("/user/:id", "/user/{id}"),
+            ("/files/*path", "/files/{*path}"),
+            ("/api/:version/files/*rest", "/api/{version}/files/{*rest}"),
+        ] {
+            assert_eq!(normalize_route_pattern(input), expected, "input: {input}");
+        }
     }
 
     // ── nested routers ────────────────────────────────────────────────────────
 
+    /// A nested route is reachable at `prefix + path`, including when the inner path is `/`
+    /// (which mounts at the bare prefix).
     #[tokio::test]
-    async fn test_nested_router() {
-        let api = Router::new().route("/status", get(handle_root));
+    async fn test_nested_routes_are_reachable() {
         let app = Router::new()
-            .nest("/api/v1", api)
+            .nest("/api/v1", Router::new().route("/status", get(handle_root)))
+            .nest("/api", Router::new().route("/", get(handle_root)))
             .with_state::<()>(())
             .compile()
             .expect("compile");
 
-        let resp = app.handle_request(make_req("GET", "/api/v1/status")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_nested_router_root() {
-        let api = Router::new().route("/", get(handle_root));
-        let app = Router::new()
-            .nest("/api", api)
-            .with_state::<()>(())
-            .compile()
-            .expect("compile");
-
-        let resp = app.handle_request(make_req("GET", "/api")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        for path in ["/api/v1/status", "/api"] {
+            let resp = app.handle_request(make_req("GET", path)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "path: {path}");
+        }
     }
 
     // ── nest() URI stripping (Axum parity) ───────────────────────────────────
@@ -1959,115 +1715,73 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn test_extra_routing_features() {
+    /// Route patterns that `matchit` can't disambiguate (a named param and a wildcard at the
+    /// same position) must surface as a compile error, not a silent mis-route.
+    #[test]
+    fn test_conflicting_route_patterns_fail_to_compile() {
         async fn dummy() -> &'static str {
             "ok"
         }
-
-        // 1. method_index with other methods
-        assert_eq!(method_index(&Method::OPTIONS), Some(4));
-        assert_eq!(method_index(&Method::HEAD), Some(5));
-        assert_eq!(method_index(&Method::TRACE), Some(7));
-        assert_eq!(method_index(&Method::CONNECT), Some(8));
-        assert_eq!(method_index(&Method::PATCH), Some(6));
-
-        // 2. MethodRouter debug and default
-        let mr = MethodRouter::<()>::default();
-        let dbg = format!("{mr:?}");
-        assert!(dbg.contains("MethodRouter"));
-
-        // 3. MethodRouter shortcuts & helpers
-        let _mr2 = MethodRouter::<()>::new()
-            .options(dummy)
-            .head(dummy)
-            .trace(dummy)
-            .put(dummy)
-            .delete(dummy)
-            .patch(dummy);
-
-        let _mr3 = put::<_, _, ()>(dummy);
-        let _mr4 = delete::<_, _, ()>(dummy);
-        let _mr5 = patch::<_, _, ()>(dummy);
-
-        // 4. Router debug, default, and RouterError display/from
-        let r = Router::<()>::default();
-        let r_dbg = format!("{r:?}");
-        assert!(r_dbg.contains("Router"));
-
-        let compiled = r.compile().unwrap();
-        let cr_dbg = format!("{compiled:?}");
-        assert!(cr_dbg.contains("CompiledRouter"));
-
-        let dup_err = RouterError::DuplicateRoute("foo".to_string());
-        assert!(dup_err.to_string().contains("Duplicate route"));
-
-        // Trigger matchit InsertError
-        let bad_router = Router::new()
+        let err = Router::new()
             .route("/user/:id", get(dummy))
             .route("/user/*path", get(dummy))
             .with_state::<()>(())
-            .compile();
-        assert!(bad_router.is_err());
-        let insert_err = bad_router.unwrap_err();
-        assert!(insert_err.to_string().contains("Router insert error"));
+            .compile()
+            .expect_err("conflicting patterns must not compile");
+        assert!(err.to_string().contains("Router insert error"), "{err}");
+    }
 
-        // 5. serve_static
+    #[tokio::test]
+    async fn test_serve_file_dynamic_reads_on_each_request() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("index.html"), "hello static").unwrap();
-        let app_static = Router::new()
-            .serve_static(dir.path())
+        let file = dir.path().join("dynamic.txt");
+        std::fs::write(&file, "hello dynamic").unwrap();
+
+        let app = Router::new()
+            .serve_file_dynamic("/dyn", file.to_str().unwrap())
+            .serve_file_dynamic("/missing", "/nonexistent/file")
             .with_state::<()>(())
             .compile()
             .unwrap();
-        let resp = app_static.handle_request(make_req("GET", "/")).await;
+
+        let resp = app.handle_request(make_req("GET", "/dyn")).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"hello dynamic");
 
-        // 6. serve_file_dynamic
-        let file_path = dir.path().join("dynamic.txt");
-        std::fs::write(&file_path, "hello dynamic").unwrap();
-        let app_dynamic = Router::new()
-            .serve_file_dynamic("/dyn", file_path.to_str().unwrap())
+        // Content is re-read per request, so an edit is visible without a restart.
+        std::fs::write(&file, "edited").unwrap();
+        let resp = app.handle_request(make_req("GET", "/dyn")).await;
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"edited");
+
+        let resp = app.handle_request(make_req("GET", "/missing")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_merge_and_empty_prefix_nest_combine_route_tables() {
+        async fn dummy() -> &'static str {
+            "ok"
+        }
+        let app = Router::new()
+            .route("/r1", get(dummy))
+            .merge(Router::new().route("/r2", get(dummy)))
+            .nest("", Router::new().route("/nested", get(dummy)))
             .with_state::<()>(())
             .compile()
             .unwrap();
 
-        let resp_dyn = app_dynamic.handle_request(make_req("GET", "/dyn")).await;
-        assert_eq!(resp_dyn.status(), StatusCode::OK);
-
-        // serve_file_dynamic error path
-        let app_dyn_err = Router::new()
-            .serve_file_dynamic("/dyn_err", "/nonexistent/file")
-            .with_state::<()>(())
-            .compile()
-            .unwrap();
-        let resp_dyn_err = app_dyn_err
-            .handle_request(make_req("GET", "/dyn_err"))
-            .await;
-        assert_eq!(resp_dyn_err.status(), StatusCode::NOT_FOUND);
-
-        // 7. Nest empty nested_path
-        let sub = Router::new().route("/", get(dummy));
-        let nested_empty = Router::new()
-            .nest("", sub)
-            .with_state::<()>(())
-            .compile()
-            .unwrap();
-        let resp_nested = nested_empty.handle_request(make_req("GET", "/")).await;
-        assert_eq!(resp_nested.status(), StatusCode::OK);
-
-        // 8. Router merge
-        let r1 = Router::new().route("/r1", get(dummy));
-        let r2 = Router::new().route("/r2", get(dummy));
-        let merged = r1.merge(r2).with_state::<()>(()).compile().unwrap();
-        assert_eq!(
-            merged.handle_request(make_req("GET", "/r1")).await.status(),
-            StatusCode::OK
-        );
-        assert_eq!(
-            merged.handle_request(make_req("GET", "/r2")).await.status(),
-            StatusCode::OK
-        );
+        for path in ["/r1", "/r2", "/nested"] {
+            let resp = app.handle_request(make_req("GET", path)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "path: {path}");
+        }
     }
 
     #[tokio::test]
@@ -2235,25 +1949,6 @@ mod tests {
         assert!(body.is_empty(), "HEAD responses must have an empty body");
     }
 
-    // ── into_make_service() (Axum API-parity no-op) ──────────────────────────────
-
-    #[tokio::test]
-    async fn test_into_make_service_returns_usable_router() {
-        async fn handler() -> &'static str {
-            "ims"
-        }
-
-        let app = Router::new()
-            .route("/x", get(handler))
-            .into_make_service()
-            .with_state::<()>(())
-            .compile()
-            .expect("compile");
-
-        let resp = app.handle_request(make_req("GET", "/x")).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
     // ── method_not_allowed_fallback ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -2374,7 +2069,6 @@ mod tests {
             ],
             fallback: None,
             method_not_allowed_fallback: None,
-            state: None,
             normalize_trailing_slash: false,
             #[cfg(feature = "tower")]
             compiled: None,

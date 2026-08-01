@@ -1,14 +1,3 @@
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names
-)]
-
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode};
@@ -19,7 +8,35 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tachyon_web::Router;
 use tachyon_web::http::response::Body;
+use tachyon_web::routing::CompiledRouter;
 use tower::Service;
+
+/// Compiles an already-stateless router.
+fn compile(router: Router<()>) -> CompiledRouter<()> {
+    router.compile().expect("compile")
+}
+
+/// A fresh [`EchoUriService`] alongside the handle its recorded URI can be read back from.
+fn echo_service() -> (EchoUriService, Arc<Mutex<String>>) {
+    let last_uri = Arc::new(Mutex::new(String::new()));
+    (
+        EchoUriService {
+            last_uri: last_uri.clone(),
+        },
+        last_uri,
+    )
+}
+
+/// `GET uri` through `router`, returning the status and the collected body.
+async fn send_get(router: &CompiledRouter<()>, uri: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.handle_request(req).await;
+    let status = resp.status();
+    (status, body_to_string(resp.into_body()).await)
+}
 
 /// A tiny `tower::Service` that echoes back the URI it actually received
 /// (path + query), so tests can assert on exactly what `nest_service`
@@ -53,50 +70,22 @@ async fn body_to_string(body: Body) -> String {
 
 #[tokio::test]
 async fn test_nest_service_preserves_query_string() {
-    let last_uri = Arc::new(Mutex::new(String::new()));
-    let svc = EchoUriService {
-        last_uri: last_uri.clone(),
-    };
-    let router = Router::new()
-        .nest_service("/api", svc)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let (svc, last_uri) = echo_service();
+    let router = compile(Router::new().nest_service("/api", svc));
 
-    let req = Request::builder()
-        .method("GET")
-        .uri("/api/users/42?page=2&sort=asc")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let seen = last_uri.lock().unwrap().clone();
-    assert_eq!(seen, "/users/42?page=2&sort=asc");
+    let (status, _body) = send_get(&router, "/api/users/42?page=2&sort=asc").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(*last_uri.lock().unwrap(), "/users/42?page=2&sort=asc");
 }
 
 #[tokio::test]
 async fn test_nest_service_no_query_string() {
-    let last_uri = Arc::new(Mutex::new(String::new()));
-    let svc = EchoUriService {
-        last_uri: last_uri.clone(),
-    };
-    let router = Router::new()
-        .nest_service("/api", svc)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let (svc, last_uri) = echo_service();
+    let router = compile(Router::new().nest_service("/api", svc));
 
-    let req = Request::builder()
-        .method("GET")
-        .uri("/api/users/42")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let seen = last_uri.lock().unwrap().clone();
-    assert_eq!(seen, "/users/42");
+    let (status, _body) = send_get(&router, "/api/users/42").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(*last_uri.lock().unwrap(), "/users/42");
 }
 
 /// A percent-encoded `?` inside a path segment must stay part of the path
@@ -104,30 +93,14 @@ async fn test_nest_service_no_query_string() {
 /// query string the router never saw (the "confused deputy" case).
 #[tokio::test]
 async fn test_nest_service_does_not_synthesize_query_from_encoded_path() {
-    let last_uri = Arc::new(Mutex::new(String::new()));
-    let svc = EchoUriService {
-        last_uri: last_uri.clone(),
-    };
-    let router = Router::new()
-        .nest_service("/api", svc)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let (svc, last_uri) = echo_service();
+    let router = compile(Router::new().nest_service("/api", svc));
 
-    let req = Request::builder()
-        .method("GET")
-        .uri("/api/foo%3Fadmin=1")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let seen = last_uri.lock().unwrap().clone();
-    // The raw (still percent-encoded) path is stripped and forwarded as-is —
-    // no new query component is synthesized from the encoded path bytes.
-    assert_eq!(seen, "/foo%3Fadmin=1");
-
-    let body = body_to_string(resp.into_body()).await;
+    let (status, body) = send_get(&router, "/api/foo%3Fadmin=1").await;
+    assert_eq!(status, StatusCode::OK);
+    // The raw (still percent-encoded) path is stripped and forwarded as-is — no new query
+    // component is synthesized from the encoded path bytes.
+    assert_eq!(*last_uri.lock().unwrap(), "/foo%3Fadmin=1");
     assert_eq!(body, "/foo%3Fadmin=1");
 }
 
@@ -143,18 +116,9 @@ async fn test_compiled_router_oneshot() {
         "hello from oneshot"
     }
 
-    let router = Router::new()
-        .route("/", get(hello))
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let router = compile(Router::new().route("/", get(hello)));
 
-    let req = Request::builder()
-        .method("GET")
-        .uri("/")
-        .body(Body::empty())
-        .unwrap();
-
+    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_to_string(resp.into_body()).await;
@@ -214,9 +178,8 @@ impl<S> tower::Layer<S> for PassThroughLayer {
     }
 }
 
-/// A `tower::Layer` that discards whatever it's wrapping and always hands
-/// back `AlwaysFailsReady` — used to drive `.layer()`'s error branches
-/// without needing a real failing continuation.
+/// A `tower::Layer` that discards what it wraps and hands back `AlwaysFailsReady`, driving
+/// `.layer()`'s error branches without a real failing continuation.
 #[derive(Clone)]
 struct AlwaysFailsReadyLayer;
 
@@ -249,17 +212,12 @@ async fn test_layer_wraps_every_route_via_tower_layer() {
         "hello from layer"
     }
 
-    let router = Router::new()
+    let router = compile(Router::new()
         .route("/", get(hello))
-        .layer(PassThroughLayer)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+        .layer(PassThroughLayer));
 
-    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_to_string(resp.into_body()).await;
+    let (status, body) = send_get(&router, "/").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "hello from layer");
 }
 
@@ -276,27 +234,17 @@ async fn test_route_layer_does_not_wrap_the_fallback() {
         "fallback"
     }
 
-    let router = Router::new()
+    let router = compile(Router::new()
         .route("/", get(hello))
         .fallback(fallback)
-        .route_layer(PassThroughLayer)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+        .route_layer(PassThroughLayer));
 
-    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_to_string(resp.into_body()).await;
+    let (status, body) = send_get(&router, "/").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "hello from route_layer");
 
-    let miss_req = Request::builder()
-        .uri("/nowhere")
-        .body(Body::empty())
-        .unwrap();
-    let miss_resp = router.handle_request(miss_req).await;
-    assert_eq!(miss_resp.status(), StatusCode::OK);
-    let miss_body = body_to_string(miss_resp.into_body()).await;
+    let (miss_status, miss_body) = send_get(&router, "/nowhere").await;
+    assert_eq!(miss_status, StatusCode::OK);
     assert_eq!(miss_body, "fallback");
 }
 
@@ -311,16 +259,12 @@ async fn test_layer_surfaces_service_not_ready_as_500() {
         "unreachable"
     }
 
-    let router = Router::new()
+    let router = compile(Router::new()
         .route("/", get(hello))
-        .layer(AlwaysFailsReadyLayer)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+        .layer(AlwaysFailsReadyLayer));
 
-    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _body) = send_get(&router, "/").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 /// A `tower::Layer` whose wrapped service's `call` future errors must also
@@ -334,12 +278,9 @@ async fn test_layer_surfaces_service_call_failure_as_500() {
         "unreachable"
     }
 
-    let router = Router::new()
+    let router = compile(Router::new()
         .route("/", get(hello))
-        .layer(AlwaysFailsCallLayer)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+        .layer(AlwaysFailsCallLayer));
 
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
     let resp = router.handle_request(req).await;
@@ -352,13 +293,8 @@ async fn test_layer_surfaces_service_call_failure_as_500() {
 /// `from_tower_layer` also has.
 #[tokio::test]
 async fn test_route_service_rejects_oversized_body() {
-    let last_uri = Arc::new(Mutex::new(String::new()));
-    let svc = EchoUriService { last_uri };
-    let router = Router::new()
-        .route_service("/echo", svc)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let (svc, _last_uri) = echo_service();
+    let router = compile(Router::new().route_service("/echo", svc));
 
     let oversized = vec![0u8; 2 * 1024 * 1024 + 1];
     let req = Request::builder()
@@ -375,15 +311,11 @@ async fn test_route_service_rejects_oversized_body() {
 /// `service.ready().await` err branch).
 #[tokio::test]
 async fn test_route_service_surfaces_service_not_ready_as_500() {
-    let router = Router::new()
-        .route_service("/svc", AlwaysFailsReady)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let router = compile(Router::new()
+        .route_service("/svc", AlwaysFailsReady));
 
-    let req = Request::builder().uri("/svc").body(Body::empty()).unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _body) = send_get(&router, "/svc").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 /// A raw `tower::Service` mounted via `route_service` whose `call` future
@@ -391,15 +323,11 @@ async fn test_route_service_surfaces_service_not_ready_as_500() {
 /// `ready.call(req).await` err branch).
 #[tokio::test]
 async fn test_route_service_surfaces_service_call_failure_as_500() {
-    let router = Router::new()
-        .route_service("/svc", AlwaysFailsCall)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let router = compile(Router::new()
+        .route_service("/svc", AlwaysFailsCall));
 
-    let req = Request::builder().uri("/svc").body(Body::empty()).unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, _body) = send_get(&router, "/svc").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 /// `Router::fallback_service` must route any request that doesn't match a
@@ -413,36 +341,18 @@ async fn test_fallback_service_routes_unmatched_requests() {
         "hello"
     }
 
-    let last_uri = Arc::new(Mutex::new(String::new()));
-    let svc = EchoUriService {
-        last_uri: last_uri.clone(),
-    };
-
-    let router = Router::new()
-        .route("/", get(hello))
-        .fallback_service(svc)
-        .with_state::<()>(())
-        .compile()
-        .expect("compile");
+    let (svc, last_uri) = echo_service();
+    let router = compile(Router::new().route("/", get(hello)).fallback_service(svc));
 
     // A registered route is unaffected by the fallback service.
-    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_to_string(resp.into_body()).await;
+    let (status, body) = send_get(&router, "/").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "hello");
 
-    // An unmatched path falls through to the tower service, which sees (and
-    // echoes back) the untouched request URI.
-    let req = Request::builder()
-        .uri("/no/such/route?x=1")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_to_string(resp.into_body()).await;
+    // An unmatched path falls through to the tower service, which sees (and echoes back)
+    // the untouched request URI.
+    let (status, body) = send_get(&router, "/no/such/route?x=1").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "/no/such/route?x=1");
-
-    let seen = last_uri.lock().unwrap().clone();
-    assert_eq!(seen, "/no/such/route?x=1");
+    assert_eq!(*last_uri.lock().unwrap(), "/no/such/route?x=1");
 }

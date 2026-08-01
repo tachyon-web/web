@@ -159,47 +159,41 @@ impl IntoResponse for StatusCode {
     }
 }
 
+pub(crate) const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
+const TEXT_HTML: &str = "text/html; charset=utf-8";
+const OCTET_STREAM: &str = "application/octet-stream";
+
+/// A `200 OK` response carrying `bytes` under a fixed `Content-Type` — the shape every
+/// body-only [`IntoResponse`] impl below produces.
+pub(crate) fn with_content_type(bytes: Bytes, content_type: &'static str) -> Response<Body> {
+    let mut res = Response::new(Body::full(bytes));
+    let _ = res
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    res
+}
+
 impl IntoResponse for String {
     fn into_response(self) -> Response<Body> {
-        let mut res = Response::new(Body::full(Bytes::from(self)));
-        let _ = res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        );
-        res
+        with_content_type(Bytes::from(self), TEXT_PLAIN)
     }
 }
 
 impl IntoResponse for &'static str {
     fn into_response(self) -> Response<Body> {
-        let mut res = Response::new(Body::full(Bytes::from_static(self.as_bytes())));
-        let _ = res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        );
-        res
+        with_content_type(Bytes::from_static(self.as_bytes()), TEXT_PLAIN)
     }
 }
 
 impl IntoResponse for Vec<u8> {
     fn into_response(self) -> Response<Body> {
-        let mut res = Response::new(Body::full(Bytes::from(self)));
-        let _ = res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        res
+        with_content_type(Bytes::from(self), OCTET_STREAM)
     }
 }
 
 impl IntoResponse for &'static [u8] {
     fn into_response(self) -> Response<Body> {
-        let mut res = Response::new(Body::full(Bytes::from_static(self)));
-        let _ = res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        res
+        with_content_type(Bytes::from_static(self), OCTET_STREAM)
     }
 }
 
@@ -212,12 +206,7 @@ where
     T: Into<Bytes>,
 {
     fn into_response(self) -> Response<Body> {
-        let mut res = Response::new(Body::full(self.0.into()));
-        let _ = res.headers_mut().insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        );
-        res
+        with_content_type(self.0.into(), TEXT_HTML)
     }
 }
 
@@ -254,70 +243,54 @@ where
     T: Serialize,
 {
     fn into_response(self) -> Response<Body> {
-        // `try_borrow_mut` (rather than `borrow_mut`) so that a `Serialize` impl
-        // which re-enters this function on the same thread (e.g. by serializing a
-        // nested `Json<_>` internally) falls back to a fresh, non-shared buffer
-        // instead of panicking on an already-borrowed `RefCell` — a panic path the
-        // crate's `deny(clippy::panic/unwrap_used/expect_used)` lints can't catch
-        // since it originates inside `RefCell` itself, not an explicit unwrap.
-        #[allow(clippy::single_match_else)]
-        let result = JSON_WRITE_BUF.with(|buf| match buf.try_borrow_mut() {
-            Ok(mut b) => {
-                // `b` is always empty on entry (every exit path below leaves it that
-                // way), so the written frame is exactly `[0, b.len())`.
-                let res = match serde_json::to_writer(BytesMutWriter(&mut b), &self.0) {
-                    // `split_to` hands the written bytes to the caller as a `Bytes`
-                    // that shares the same underlying allocation — no memcpy — while
-                    // `b` keeps the (empty) view over its remaining spare tail
-                    // capacity, ready to be written into again next call with no
-                    // fresh allocation in the common case.
-                    Ok(()) => {
-                        let len = b.len();
-                        Ok(b.split_to(len).freeze())
-                    }
-                    Err(err) => {
-                        // Discard whatever partial bytes a failed serialize left behind.
-                        b.clear();
-                        Err(err)
-                    }
-                };
-                // A single oversized payload shouldn't permanently inflate this
-                // thread's buffer — same cap the old `Vec`-based version enforced.
-                if b.capacity() > 65536 {
-                    *b = bytes::BytesMut::with_capacity(1024);
-                }
-                res
-            }
-            Err(_) => {
-                let mut b = Vec::with_capacity(1024);
-                match serde_json::to_writer(&mut b, &self.0) {
-                    Ok(()) => Ok(Bytes::from(b)),
-                    Err(err) => Err(err),
-                }
-            }
-        });
-
-        match result {
-            Ok(bytes) => {
-                let mut res = Response::new(Body::full(bytes));
-                let _ = res
-                    .headers_mut()
-                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                res
-            }
-            Err(err) => {
-                let mut res = Response::new(Body::full(Bytes::from(format!(
-                    "Failed to serialize JSON: {err}"
-                ))));
-                *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                let _ = res.headers_mut().insert(
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("text/plain; charset=utf-8"),
-                );
-                res
-            }
+        match serialize_json(&self.0) {
+            Ok(bytes) => with_content_type(bytes, "application/json"),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize JSON: {err}"),
+            )
+                .into_response(),
         }
     }
+}
+
+/// Serializes `value` into the calling thread's reusable JSON buffer.
+///
+/// `try_borrow_mut` (rather than `borrow_mut`) so that a `Serialize` impl which re-enters
+/// this function on the same thread (e.g. by serializing a nested `Json<_>` internally)
+/// falls back to a fresh, non-shared buffer instead of panicking on an already-borrowed
+/// `RefCell` — a panic path the crate's `deny(clippy::panic/unwrap_used/expect_used)` lints
+/// can't catch, since it originates inside `RefCell` itself rather than an explicit unwrap.
+#[cfg(feature = "json")]
+fn serialize_json<T: Serialize>(value: &T) -> Result<Bytes, serde_json::Error> {
+    JSON_WRITE_BUF.with(|buf| {
+        let Ok(mut b) = buf.try_borrow_mut() else {
+            let mut fallback = Vec::with_capacity(1024);
+            serde_json::to_writer(&mut fallback, value)?;
+            return Ok(Bytes::from(fallback));
+        };
+        // `b` is always empty on entry (every exit path below leaves it that way), so the
+        // written frame is exactly `[0, b.len())`. `split_to` then hands those bytes to the
+        // caller as a `Bytes` sharing the same allocation — no memcpy — while `b` keeps the
+        // (empty) view over its spare tail capacity, ready to be written into again next
+        // call with no fresh allocation in the common case.
+        let result = match serde_json::to_writer(BytesMutWriter(&mut b), value) {
+            Ok(()) => {
+                let len = b.len();
+                Ok(b.split_to(len).freeze())
+            }
+            Err(err) => {
+                // Discard whatever partial bytes a failed serialize left behind.
+                b.clear();
+                Err(err)
+            }
+        };
+        // A single oversized payload shouldn't permanently inflate this thread's buffer.
+        if b.capacity() > 65536 {
+            *b = bytes::BytesMut::with_capacity(1024);
+        }
+        result
+    })
 }
 
 impl<R> IntoResponse for (StatusCode, R)

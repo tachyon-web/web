@@ -46,14 +46,8 @@ impl<S> AllowStd<S> {
     pub(super) fn new(inner: S) -> Self {
         Self {
             inner,
-            read_waker_proxy: Arc::new(WakerProxy {
-                read_waker: task::AtomicWaker::new(),
-                write_waker: task::AtomicWaker::new(),
-            }),
-            write_waker_proxy: Arc::new(WakerProxy {
-                read_waker: task::AtomicWaker::new(),
-                write_waker: task::AtomicWaker::new(),
-            }),
+            read_waker_proxy: Arc::default(),
+            write_waker_proxy: Arc::default(),
         }
     }
 

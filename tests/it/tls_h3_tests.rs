@@ -1,20 +1,9 @@
-#![allow(
-    missing_docs,
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::uninlined_format_args,
-    clippy::items_after_statements,
-    clippy::use_self,
-    clippy::semicolon_if_nothing_returned,
-    clippy::similar_names
-)]
-
+use crate::common::{free_loopback_addr, wait_until_listening};
 use reqwest::{Client, Version};
 use std::time::Duration;
 use tachyon_web::http::response::Html;
 use tachyon_web::tls::generate_self_signed_cert;
 use tachyon_web::{Router, Server, get};
-use tokio::net::TcpListener;
 
 #[derive(Clone, Default)]
 struct AppState {}
@@ -33,29 +22,28 @@ async fn test_server_https_and_h3() {
     let certs =
         generate_self_signed_cert(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
 
-    // Find a free port before starting the unified server
-    let https_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind https");
-    let https_port = https_listener.local_addr().expect("local addr").port();
-    drop(https_listener); // free the port to reuse it in start_all
-
-    let http_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
-    let http_port = http_listener.local_addr().expect("local addr").port();
-    drop(http_listener);
-
-    let addr = format!("127.0.0.1:{}", https_port);
-    let redirect_addr = format!("127.0.0.1:{}", http_port);
+    // `start_all` binds these itself, so hand it free ports rather than live listeners.
+    let https_addr = free_loopback_addr().await;
+    let http_addr = free_loopback_addr().await;
+    let (https_port, http_port) = (https_addr.port(), http_addr.port());
 
     let server = Server::new(app);
     let _server_handle = tokio::spawn(async move {
         // Start HTTP/3, HTTP/2, and HTTP/1.1 effortlessly
         server
-            .start_all(&addr, Some(&redirect_addr), certs.cert_pem, certs.key_pem)
+            .start_all(
+                &https_addr.to_string(),
+                Some(&http_addr.to_string()),
+                certs.cert_pem,
+                certs.key_pem,
+            )
             .await
             .expect("start_all failed");
     });
 
-    // Wait for the servers to initialize
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Poll for both listeners rather than guessing a fixed startup delay.
+    wait_until_listening(https_addr).await;
+    wait_until_listening(http_addr).await;
 
     // Test HTTPS (HTTP/2) route
     let client = Client::builder()

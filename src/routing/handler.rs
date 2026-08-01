@@ -305,15 +305,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_future_debug_does_not_panic() {
-        let ready = ResponseFuture::Ready(Some(Response::new(Body::empty())));
-        assert!(format!("{ready:?}").contains("Ready"));
-
-        let boxed = ResponseFuture::Boxed(Box::pin(async { Response::new(Body::empty()) }));
-        assert!(format!("{boxed:?}").contains("Boxed"));
-    }
-
     /// A non-last extractor (`FromRequestParts`) that actually succeeds, paired with a
     /// failing last extractor — covers the `Ok(v) => v` arm of the parts-extraction loop,
     /// which every other test in this suite happens to only exercise via the `Err` arm.

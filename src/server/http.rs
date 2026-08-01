@@ -15,23 +15,15 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 pin_project_lite::pin_project! {
-    /// Wraps an incoming request body with an absolute deadline for fully reading it.
+    /// Bounds how long a request body may take to arrive in full.
     ///
-    /// Bodies are streamed lazily now (see `hyper_handler`), so a handler that never
-    /// touches the body (e.g. an arity-0 route) would otherwise never be bounded by any
-    /// timeout — the client could send headers, declare a `Content-Length`, and simply
-    /// never send the body, holding the connection open indefinitely. This restores the
-    /// same bound `REQUEST_TIMEOUT` previously enforced by eager buffering, without
-    /// requiring anything to actually poll the body for it to apply.
+    /// Bodies stream lazily, so without this a client could send headers declaring a
+    /// `Content-Length` and then never send the body, holding the connection open
+    /// indefinitely against a handler that never reads it.
     ///
-    /// The `Sleep` itself is only allocated the first time `poll_frame` is actually
-    /// called, not eagerly per request: hyper's connection driver checks
-    /// `is_end_stream()` (forwarded straight to `inner`, below) before ever polling a
-    /// body it already knows is empty (e.g. any GET with no `Content-Length`), so an
-    /// eagerly-constructed timer would be registered and dropped unpolled on every
-    /// such request — a real timer-wheel allocation wasted on the single most common
-    /// request shape. Deferring construction to first poll costs nothing: a body that's
-    /// never polled was never at risk of stalling in the first place.
+    /// The `Sleep` is allocated on first poll rather than per request: hyper checks
+    /// `is_end_stream()` before polling a body it knows is empty, so an eager timer would be
+    /// registered and dropped unused on every bodyless GET.
     struct DeadlineBody {
         #[pin]
         inner: hyper::body::Incoming,
@@ -74,6 +66,91 @@ impl HyperBody for DeadlineBody {
     }
 }
 
+/// Applies the HTTP/1.1 connection tuning shared by every listener.
+///
+/// A macro rather than a function because the settings apply to two unrelated types with
+/// identical setters: `hyper::server::conn::http1::Builder` and `hyper_util`'s
+/// `auto::Http1Builder`.
+///
+/// `writev` is opt-in per call site — forcing vectored writes over a TLS stream, which buffers
+/// its own records, is a different tradeoff than over a bare socket.
+macro_rules! tune_http1 {
+    ($builder:expr) => {{
+        let tuned = &mut $builder;
+        let _ = tuned
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(REQUEST_TIMEOUT)
+            .keep_alive(true)
+            .max_buf_size(8192);
+    }};
+}
+
+/// Applies the HTTP/2 connection tuning shared by every listener — see [`tune_http1`] for why
+/// this is a macro.
+#[cfg(feature = "http2")]
+macro_rules! tune_http2 {
+    ($builder:expr) => {{
+        let tuned = &mut $builder;
+        let _ = tuned
+            .timer(hyper_util::rt::TokioTimer::new())
+            .initial_stream_window_size(65535)
+            .initial_connection_window_size(1024 * 1024)
+            .max_frame_size(16384)
+            .max_concurrent_streams(200)
+            .keep_alive_timeout(REQUEST_TIMEOUT);
+        // RFC 8441: let `ws::WebSocketUpgrade` accept WebSocket-over-HTTP/2 requests.
+        #[cfg(feature = "ws")]
+        let _ = tuned.enable_connect_protocol();
+    }};
+}
+
+/// Accepts one connection, applying the socket tuning shared by every transport.
+///
+/// Returns `None` after logging (and, on resource exhaustion, briefly backing off) when the
+/// accept failed, so the caller continues its loop rather than tearing the listener down over
+/// a single bad connection.
+async fn accept_tuned(
+    listener: &TcpListener,
+    log_tag: &str,
+) -> Option<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    match listener.accept().await {
+        Ok((stream, peer)) => {
+            let _ = stream.set_nodelay(true);
+            #[cfg(target_os = "linux")]
+            {
+                let _ = socket2::SockRef::from(&stream).set_tcp_quickack(true);
+            }
+            Some((stream, peer))
+        }
+        Err(e) => {
+            tracing::error!("[{log_tag}] Accept error: {e}");
+            if crate::server::is_resource_exhaustion(&e) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            None
+        }
+    }
+}
+
+/// Spawns a per-connection task on the current worker.
+///
+/// `run_worker_pool` runs one `current_thread` runtime plus `LocalSet` per core, where
+/// `spawn_local` avoids a cross-thread handoff. On a plain multi-thread runtime there's no
+/// `LocalSet`, so this falls back to `tokio::spawn`.
+fn spawn_connection<F>(fut: F)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    IS_LOCAL_WORKER.with(|flag| {
+        if flag.get() {
+            drop(tokio::task::spawn_local(fut));
+        } else {
+            drop(tokio::spawn(fut));
+        }
+    });
+}
+
 #[cfg(feature = "http2")]
 #[derive(Clone, Copy, Debug)]
 struct LocalExecutor;
@@ -85,13 +162,7 @@ where
     F::Output: Send + 'static,
 {
     fn execute(&self, fut: F) {
-        IS_LOCAL_WORKER.with(|flag| {
-            if flag.get() {
-                drop(tokio::task::spawn_local(fut));
-            } else {
-                drop(tokio::spawn(fut));
-            }
-        });
+        spawn_connection(fut);
     }
 }
 
@@ -133,36 +204,17 @@ where
             // Both enabled: `auto::Builder` sniffs each connection's first bytes
             // for the HTTP/2 client preface and falls back to HTTP/1.1 otherwise.
             let mut b = hyper_util::server::conn::auto::Builder::new(LocalExecutor);
-            let _ = b
-                .http1()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(REQUEST_TIMEOUT)
-                .keep_alive(true)
-                .max_buf_size(8192)
-                .writev(true);
-            let _ = b
-                .http2()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .initial_stream_window_size(65535)
-                .initial_connection_window_size(1024 * 1024)
-                .max_frame_size(16384)
-                .max_concurrent_streams(200)
-                .keep_alive_timeout(REQUEST_TIMEOUT);
-            // RFC 8441: let `ws::WebSocketUpgrade` accept WebSocket-over-HTTP/2 requests.
-            #[cfg(feature = "ws")]
-            let _ = b.http2().enable_connect_protocol();
+            tune_http1!(b.http1());
+            let _ = b.http1().writev(true);
+            tune_http2!(b.http2());
             b
         };
         #[cfg(all(feature = "http1", not(feature = "http2")))]
         let builder = {
             // http1 only: the low-level builder directly, no protocol-sniffing overhead.
             let mut b = hyper::server::conn::http1::Builder::new();
-            let _ = b
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(REQUEST_TIMEOUT)
-                .keep_alive(true)
-                .max_buf_size(8192)
-                .writev(true);
+            tune_http1!(b);
+            let _ = b.writev(true);
             b
         };
         #[cfg(all(feature = "http2", not(feature = "http1")))]
@@ -170,15 +222,7 @@ where
             // http2 only: h2c with no HTTP/1.1 fallback at all — a client that
             // isn't speaking HTTP/2 with prior knowledge simply fails to connect.
             let mut b = hyper::server::conn::http2::Builder::new(LocalExecutor);
-            let _ = b
-                .timer(hyper_util::rt::TokioTimer::new())
-                .initial_stream_window_size(65535)
-                .initial_connection_window_size(1024 * 1024)
-                .max_frame_size(16384)
-                .max_concurrent_streams(200)
-                .keep_alive_timeout(REQUEST_TIMEOUT);
-            #[cfg(feature = "ws")]
-            let _ = b.enable_connect_protocol();
+            tune_http2!(b);
             b
         };
 
@@ -187,23 +231,10 @@ where
                 break;
             };
 
-            let (stream, peer) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
-                    drop(permit);
-                    tracing::error!("[http] Accept error: {}", e);
-                    if crate::server::is_resource_exhaustion(&e) {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    continue;
-                }
+            let Some((stream, peer)) = accept_tuned(&listener, "http").await else {
+                drop(permit);
+                continue;
             };
-            let _ = stream.set_nodelay(true);
-            #[cfg(target_os = "linux")]
-            {
-                let sock_ref = socket2::SockRef::from(&stream);
-                let _ = sock_ref.set_tcp_quickack(true);
-            }
             let state = state.clone();
             let builder = builder.clone();
 
@@ -222,13 +253,7 @@ where
                 drop(permit);
             };
 
-            IS_LOCAL_WORKER.with(|flag| {
-                if flag.get() {
-                    drop(tokio::task::spawn_local(serve_fut));
-                } else {
-                    drop(tokio::spawn(serve_fut));
-                }
-            });
+            spawn_connection(serve_fut);
         }
         Ok(())
     }
@@ -255,23 +280,10 @@ where
                 break;
             };
 
-            let (tcp_stream, peer) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
-                    drop(permit);
-                    tracing::error!("[https] Accept error: {}", e);
-                    if crate::server::is_resource_exhaustion(&e) {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    continue;
-                }
+            let Some((tcp_stream, peer)) = accept_tuned(&listener, "https").await else {
+                drop(permit);
+                continue;
             };
-            let _ = tcp_stream.set_nodelay(true);
-            #[cfg(target_os = "linux")]
-            {
-                let sock_ref = socket2::SockRef::from(&tcp_stream);
-                let _ = sock_ref.set_tcp_quickack(true);
-            }
             let acceptor = acceptor.clone();
             let state = state.clone();
 
@@ -308,16 +320,7 @@ where
                 if is_h2 {
                     // Use low-level HTTP/2 connection builder
                     let mut builder = hyper::server::conn::http2::Builder::new(LocalExecutor);
-                    let _ = builder
-                        .timer(hyper_util::rt::TokioTimer::new())
-                        .initial_stream_window_size(65535)
-                        .initial_connection_window_size(1024 * 1024)
-                        .max_frame_size(16384)
-                        .max_concurrent_streams(200)
-                        .keep_alive_timeout(REQUEST_TIMEOUT);
-                    #[cfg(feature = "ws")]
-                    let _ = builder.enable_connect_protocol();
-
+                    tune_http2!(builder);
                     if let Err(e) = builder.serve_connection(io, svc).await {
                         tracing::debug!("[https] HTTP/2 Connection error: {}", e);
                     }
@@ -335,12 +338,7 @@ where
                 {
                     // Use low-level HTTP/1.1 connection builder (bypasses auto-negotiation overhead)
                     let mut builder = hyper::server::conn::http1::Builder::new();
-                    let _ = builder
-                        .timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(REQUEST_TIMEOUT)
-                        .keep_alive(true)
-                        .max_buf_size(8192);
-
+                    tune_http1!(builder);
                     if let Err(e) = builder.serve_connection(io, svc).with_upgrades().await {
                         tracing::debug!("[https] HTTP/1.1 Connection error: {}", e);
                     }
@@ -348,13 +346,7 @@ where
                 drop(permit);
             };
 
-            IS_LOCAL_WORKER.with(|flag| {
-                if flag.get() {
-                    drop(tokio::task::spawn_local(serve_fut));
-                } else {
-                    drop(tokio::spawn(serve_fut));
-                }
-            });
+            spawn_connection(serve_fut);
         }
         Ok(())
     }
@@ -397,26 +389,5 @@ where
         })
     };
 
-    let mut rebuild_req = Request::from_parts(parts, body);
-    #[cfg(feature = "original-uri")]
-    {
-        let orig_uri = rebuild_req.uri().clone();
-        rebuild_req
-            .extensions_mut()
-            .insert(crate::routing::extract::OriginalUri(orig_uri));
-    }
-    rebuild_req
-        .extensions_mut()
-        .insert(crate::routing::extract::ConnectInfo(peer));
-    rebuild_req
-        .extensions_mut()
-        .insert(crate::routing::extract::MaxBodySize(state.max_body_size));
-
-    let resp = state.router.handle_request(rebuild_req).await;
-
-    if let Some((min, max)) = state.response_jitter {
-        tokio::time::sleep(crate::server::jittered_delay(min, max)).await;
-    }
-
-    Ok(resp)
+    Ok(state.dispatch(Request::from_parts(parts, body), peer).await)
 }

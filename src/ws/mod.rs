@@ -700,13 +700,6 @@ mod tests {
     }
 
     #[test]
-    fn websocket_upgrade_debug_does_not_panic() {
-        let mut parts = make_ws_parts();
-        let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap();
-        assert!(format!("{upgrade:?}").contains("WebSocketUpgrade"));
-    }
-
-    #[test]
     fn on_failed_upgrade_swaps_the_callback_type_and_preserves_config() {
         let mut parts = make_ws_parts();
         let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &())

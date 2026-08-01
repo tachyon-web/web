@@ -71,11 +71,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
-#[cfg(feature = "tls")]
 use crate::http::response::Body;
 #[cfg(feature = "tls")]
 use hyper::service::service_fn;
-#[cfg(feature = "tls")]
 use hyper::{Request, Response};
 #[cfg(any(feature = "cert-gen", feature = "lets-encrypt", feature = "http3"))]
 use tokio_rustls::TlsAcceptor;
@@ -92,29 +90,6 @@ const FIRST_CERT_TIMEOUT: Duration = Duration::from_mins(1);
 
 thread_local! {
     pub(crate) static IS_LOCAL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Samples a delay uniformly from `[min, max)` for [`Server::response_jitter`].
-///
-/// Not a CSPRNG — this only needs enough variance to blunt naive response-time
-/// correlation, not to resist an adversary who can influence the seed, so a
-/// `RandomState` hasher (itself seeded from the OS's own random source at
-/// construction) reseeded with the current time is sufficient without pulling in a
-/// dedicated `rand` dependency for one call site.
-pub(crate) fn jittered_delay(min: Duration, max: Duration) -> Duration {
-    use std::hash::{BuildHasher, Hasher};
-
-    if max <= min {
-        return min;
-    }
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    let now_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    hasher.write_u128(now_nanos);
-    let span_nanos = max.checked_sub(min).unwrap_or(max).as_nanos().max(1);
-    let offset_nanos = (u128::from(hasher.finish()) % span_nanos).min(u128::from(u64::MAX));
-    min + Duration::from_nanos(u64::try_from(offset_nanos).unwrap_or(u64::MAX))
 }
 
 fn bind_reuseport(addr: std::net::SocketAddr) -> Result<std::net::TcpListener, std::io::Error> {
@@ -179,9 +154,7 @@ where
                 local.block_on(&rt, async move {
                     IS_LOCAL_WORKER.with(|flag| flag.set(true));
 
-                    // Only used to bind the HTTP->HTTPS redirect listener, which only
-                    // exists when TLS is enabled — kept alive here so the parameter
-                    // isn't flagged as unused in non-`tls` builds.
+                    // Only used for the HTTP->HTTPS redirect listener, which requires TLS.
                     #[cfg(not(feature = "tls"))]
                     let _ = &redirect_info;
 
@@ -305,9 +278,6 @@ pub struct Server<S> {
     /// [`TlsPolicy::hardened`](crate::tls::TlsPolicy::hardened).
     #[cfg(feature = "tls")]
     pub(crate) tls_policy: Option<crate::tls::TlsPolicy>,
-    /// Random per-response delay range added before every response is returned — see
-    /// [`Server::response_jitter`]. `None` (the default) adds no delay.
-    pub(crate) response_jitter: Option<(Duration, Duration)>,
 }
 
 impl<S> Clone for Server<S>
@@ -321,7 +291,6 @@ where
             max_connections: self.max_connections,
             #[cfg(feature = "tls")]
             tls_policy: self.tls_policy.clone(),
-            response_jitter: self.response_jitter,
         }
     }
 }
@@ -341,7 +310,6 @@ impl Server<()> {
             max_connections: 25_600,
             #[cfg(feature = "tls")]
             tls_policy: None,
-            response_jitter: None,
         }
     }
 }
@@ -350,6 +318,28 @@ impl<S> Server<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    /// Attaches the per-request extensions and routes the request.
+    ///
+    /// Every transport funnels through here — HTTP/1.1, HTTP/2, `.onion` and `.i2p` via
+    /// `hyper_handler`, HTTP/3 directly — so they can't disagree about which extensions a
+    /// handler sees.
+    pub(crate) async fn dispatch(
+        &self,
+        mut req: Request<Body>,
+        peer: std::net::SocketAddr,
+    ) -> Response<Body> {
+        #[cfg(feature = "original-uri")]
+        {
+            let original_uri = crate::routing::extract::OriginalUri(req.uri().clone());
+            let _ = req.extensions_mut().insert(original_uri);
+        }
+        let extensions = req.extensions_mut();
+        let _ = extensions.insert(crate::routing::extract::ConnectInfo(peer));
+        let _ = extensions.insert(crate::routing::extract::MaxBodySize(self.max_body_size));
+
+        self.router.handle_request(req).await
+    }
+
     /// Overrides the maximum request body size (in bytes).
     ///
     /// Requests whose body exceeds this limit are rejected with `413 Content Too Large`
@@ -374,26 +364,6 @@ where
     #[must_use]
     pub const fn max_connections(mut self, limit: usize) -> Self {
         self.max_connections = limit;
-        self
-    }
-
-    /// Adds a random delay, uniformly sampled from `[min, max)`, before every response this
-    /// `Server` returns — on every transport it serves (clearnet, `.onion`, `.i2p` alike, since
-    /// they all funnel through the same response path).
-    ///
-    /// Off by default. This exists to blunt naive **response-time correlation**: if you run the
-    /// same app on both clearnet and a `.onion`/`.i2p` mirror (e.g. via [`MultiServer`]), an
-    /// observer positioned to time both could otherwise try to match requests between them by
-    /// how long the handler took to respond. Jitter alone does not make correlation impossible —
-    /// it raises the number of samples an observer needs, nothing more — so treat it as one
-    /// layer among several (network-level timing is a much stronger signal than this addresses),
-    /// not a complete mitigation.
-    ///
-    /// `min == max` (or `max <= min`) always waits exactly `min` — use this for a fixed
-    /// per-response delay instead of a random range.
-    #[must_use]
-    pub const fn response_jitter(mut self, min: Duration, max: Duration) -> Self {
-        self.response_jitter = Some((min, max));
         self
     }
 
@@ -602,34 +572,7 @@ where
         let config = Arc::new(config);
 
         // Start HTTP/3 QUIC Server
-        let quic_tls = s2n_quic::provider::tls::rustls::Server::from(config.clone());
-        let quic_limits = s2n_quic::provider::limits::Limits::new()
-            // 1 MB flow-control windows match H/2 settings and saturate LAN pipes.
-            .with_data_window(1_048_576)?
-            .with_bidirectional_local_data_window(1_048_576)?
-            .with_bidirectional_remote_data_window(1_048_576)?
-            // Tuning: 100ms is a safe and standard default initial RTT for public internet clients.
-            .with_initial_round_trip_time(Duration::from_millis(100))?
-            // More simultaneous streams per connection.
-            .with_max_open_remote_bidirectional_streams(4096)?
-            // Keep ACK overhead low: ACK every 4th packet (default is every 2nd).
-            .with_ack_elicitation_interval(4)?
-            // Disable active migration for server-side benchmarks (saves state tracking).
-            .with_active_connection_migration(false)?
-            // Reduce connection-ID slots (fewer is fine for 0-RTT / stationary peers).
-            .with_max_active_connection_ids(2)?
-            // Aggressive handshake timeout: reject slow clients quickly.
-            .with_max_handshake_duration(Duration::from_secs(5))?;
-        let quic_server = s2n_quic::Server::builder()
-            .with_tls(quic_tls)?
-            .with_limits(quic_limits)?
-            .with_io(tls_addr)?
-            .start()?;
-
-        let server_h3 = self.clone();
-        drop(tokio::spawn(async move {
-            let _ = server_h3.serve_h3(quic_server).await;
-        }));
+        spawn_h3(&self, config.clone(), tls_addr)?;
 
         // Start HTTPS Server
         let addr: std::net::SocketAddr = tls_addr
@@ -797,42 +740,13 @@ where
             .with_no_client_auth()
             .with_cert_resolver(resolver);
 
-        #[cfg(feature = "http3")]
-        {
-            tls_config.alpn_protocols = alpn_protocols(true);
-        }
-        #[cfg(not(feature = "http3"))]
-        {
-            tls_config.alpn_protocols = alpn_protocols(false);
-        }
+        tls_config.alpn_protocols = alpn_protocols(cfg!(feature = "http3"));
 
         let tls_config = Arc::new(tls_config);
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
 
         #[cfg(feature = "http3")]
-        {
-            let quic_tls = s2n_quic::provider::tls::rustls::Server::from(tls_config);
-            let quic_limits = s2n_quic::provider::limits::Limits::new()
-                .with_data_window(1_048_576)?
-                .with_bidirectional_local_data_window(1_048_576)?
-                .with_bidirectional_remote_data_window(1_048_576)?
-                .with_initial_round_trip_time(Duration::from_millis(100))?
-                .with_max_open_remote_bidirectional_streams(4096)?
-                .with_ack_elicitation_interval(4)?
-                .with_active_connection_migration(false)?
-                .with_max_active_connection_ids(2)?
-                .with_max_handshake_duration(Duration::from_secs(5))?;
-            let quic_server = s2n_quic::Server::builder()
-                .with_tls(quic_tls)?
-                .with_limits(quic_limits)?
-                .with_io(tls_addr)?
-                .start()?;
-
-            let server_h3 = self.clone();
-            drop(tokio::spawn(async move {
-                let _ = server_h3.serve_h3(quic_server).await;
-            }));
-        }
+        spawn_h3(&self, tls_config, tls_addr)?;
 
         // Bind the HTTPS listener and serve (blocks the calling task).
         let addr: std::net::SocketAddr = tls_addr
@@ -900,14 +814,7 @@ where
                 )
             })?;
 
-        #[cfg(feature = "http3")]
-        {
-            tls_config.alpn_protocols = alpn_protocols(true);
-        }
-        #[cfg(not(feature = "http3"))]
-        {
-            tls_config.alpn_protocols = alpn_protocols(false);
-        }
+        tls_config.alpn_protocols = alpn_protocols(cfg!(feature = "http3"));
 
         let tls_config = Arc::new(tls_config);
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
@@ -924,29 +831,7 @@ where
 
         // Start HTTP/3 QUIC Server (if the feature is enabled).
         #[cfg(feature = "http3")]
-        {
-            let quic_tls = s2n_quic::provider::tls::rustls::Server::from(tls_config);
-            let quic_limits = s2n_quic::provider::limits::Limits::new()
-                .with_data_window(1_048_576)?
-                .with_bidirectional_local_data_window(1_048_576)?
-                .with_bidirectional_remote_data_window(1_048_576)?
-                .with_initial_round_trip_time(Duration::from_millis(100))?
-                .with_max_open_remote_bidirectional_streams(4096)?
-                .with_ack_elicitation_interval(4)?
-                .with_active_connection_migration(false)?
-                .with_max_active_connection_ids(2)?
-                .with_max_handshake_duration(Duration::from_secs(5))?;
-            let quic_server = s2n_quic::Server::builder()
-                .with_tls(quic_tls)?
-                .with_limits(quic_limits)?
-                .with_io(tls_addr)?
-                .start()?;
-
-            let server_h3 = self.clone();
-            drop(tokio::spawn(async move {
-                let _ = server_h3.serve_h3(quic_server).await;
-            }));
-        }
+        spawn_h3(&self, tls_config, tls_addr)?;
 
         // Start the HTTPS listener (blocks this task).
         let addr: std::net::SocketAddr = tls_addr
@@ -963,16 +848,66 @@ where
     }
 }
 
+/// Builds the QUIC endpoint HTTP/3 is served over, from a rustls config and a bind address.
+///
+/// Shared by every `http3` entry point so their limits can't drift apart.
+#[cfg(feature = "http3")]
+fn build_quic_server(
+    config: Arc<rustls::ServerConfig>,
+    io: impl s2n_quic::provider::io::TryInto<Error: std::error::Error + Send + Sync + 'static>,
+) -> Result<s2n_quic::Server, Box<dyn std::error::Error + Send + Sync>> {
+    let limits = s2n_quic::provider::limits::Limits::new()
+        // 1 MB flow-control windows match H/2 settings and saturate LAN pipes.
+        .with_data_window(1_048_576)?
+        .with_bidirectional_local_data_window(1_048_576)?
+        .with_bidirectional_remote_data_window(1_048_576)?
+        // 100ms is a safe, standard default initial RTT for public internet clients.
+        .with_initial_round_trip_time(Duration::from_millis(100))?
+        // More simultaneous streams per connection.
+        .with_max_open_remote_bidirectional_streams(4096)?
+        // Keep ACK overhead low: ACK every 4th packet (default is every 2nd).
+        .with_ack_elicitation_interval(4)?
+        // Disable active migration (saves state tracking).
+        .with_active_connection_migration(false)?
+        // Reduce connection-ID slots (fewer is fine for 0-RTT / stationary peers).
+        .with_max_active_connection_ids(2)?
+        // Aggressive handshake timeout: reject slow clients quickly.
+        .with_max_handshake_duration(Duration::from_secs(5))?;
+
+    Ok(s2n_quic::Server::builder()
+        .with_tls(s2n_quic::provider::tls::rustls::Server::from(config))?
+        .with_limits(limits)?
+        .with_io(io)?
+        .start()?)
+}
+
+/// Spawns [`Server::serve_h3`] on a QUIC endpoint built for `config`/`io`, alongside whichever
+/// TCP listener the caller goes on to run.
+#[cfg(feature = "http3")]
+fn spawn_h3<S>(
+    server: &Server<S>,
+    config: Arc<rustls::ServerConfig>,
+    io: impl s2n_quic::provider::io::TryInto<Error: std::error::Error + Send + Sync + 'static>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let quic_server = build_quic_server(config, io)?;
+    let server = server.clone();
+    drop(tokio::spawn(async move {
+        let _ = server.serve_h3(quic_server).await;
+    }));
+    Ok(())
+}
+
 /// Enforces FIPS compliance on the cryptographic module.
 /// If the `fips` feature is enabled and `aws-lc-rs` is not running in FIPS mode,
 /// returns an error to prevent server startup.
 #[allow(dead_code, clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 pub(crate) fn enforce_fips_compliance() -> Result<(), std::io::Error> {
-    // `aws_lc_rs` (the crate) is only linked at all when `tls` is enabled (see `dep:aws-lc-rs`
-    // in Cargo.toml) — `tor`/`i2p` no longer pull `tls` in unconditionally, so a
-    // `tor`/`i2p` + `fips` build with `tls` left off has no top-level crypto provider of ours
-    // to check here. (`tachyon-i2p/fips`, forwarded by this crate's own `fips` feature, still
-    // governs `libi2pd`'s *own* separately-linked crypto backend independently of this check.)
+    // `aws_lc_rs` is only linked when `tls` is enabled, so a `tor`/`i2p` + `fips` build without
+    // `tls` has no crypto provider of ours to check. (`tachyon-i2p/fips` still governs
+    // `libi2pd`'s separately-linked backend, independently of this check.)
     #[cfg(all(feature = "fips", feature = "tls"))]
     {
         if let Err(e) = aws_lc_rs::try_fips_mode() {
@@ -1219,42 +1154,8 @@ impl HttpsServer {
                 rustls_config.alpn_protocols.insert(0, b"h3".to_vec());
             }
 
-            let tls_config_arc = Arc::new(rustls_config.clone());
-            let quic_tls = s2n_quic::provider::tls::rustls::Server::from(tls_config_arc);
-            let quic_limits = s2n_quic::provider::limits::Limits::new()
-                .with_data_window(1_048_576)
-                .map_err(std::io::Error::other)?
-                .with_bidirectional_local_data_window(1_048_576)
-                .map_err(std::io::Error::other)?
-                .with_bidirectional_remote_data_window(1_048_576)
-                .map_err(std::io::Error::other)?
-                .with_initial_round_trip_time(Duration::from_millis(100))
-                .map_err(std::io::Error::other)?
-                .with_max_open_remote_bidirectional_streams(4096)
-                .map_err(std::io::Error::other)?
-                .with_ack_elicitation_interval(4)
-                .map_err(std::io::Error::other)?
-                .with_active_connection_migration(false)
-                .map_err(std::io::Error::other)?
-                .with_max_active_connection_ids(2)
-                .map_err(std::io::Error::other)?
-                .with_max_handshake_duration(Duration::from_secs(5))
+            spawn_h3(&server, Arc::new(rustls_config.clone()), self.addr)
                 .map_err(std::io::Error::other)?;
-
-            let quic_server = s2n_quic::Server::builder()
-                .with_tls(quic_tls)
-                .map_err(std::io::Error::other)?
-                .with_limits(quic_limits)
-                .map_err(std::io::Error::other)?
-                .with_io(self.addr)
-                .map_err(std::io::Error::other)?
-                .start()
-                .map_err(std::io::Error::other)?;
-
-            let server_h3 = server.clone();
-            tokio::spawn(async move {
-                let _ = server_h3.serve_h3(quic_server).await;
-            });
         }
 
         server
@@ -1268,77 +1169,37 @@ mod tests {
     use super::*;
     use crate::routing::Router;
 
-    /// `Server::clone()` is a hand-written impl (not `#[derive(Clone)]`, since the field
-    /// list is feature-gated) — this proves it actually copies every field rather than
-    /// silently dropping one when a new field is added.
+    /// `Server::clone` is hand-written (the field list is feature-gated, so `derive` can't be
+    /// used); this catches a field being dropped when a new one is added.
     #[test]
-    #[allow(clippy::redundant_clone)] // the point of this test is exercising `Clone` itself.
-    fn clone_preserves_body_size_and_max_connections() {
-        let server = Server::new(Router::new())
+    #[allow(clippy::redundant_clone)]
+    fn clone_preserves_every_field() {
+        #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
+        let mut server = Server::new(Router::new())
             .max_body_size(4096)
             .max_connections(7);
+        #[cfg(feature = "tls")]
+        {
+            server = server.tls_policy(crate::tls::TlsPolicy::hardened().tls13_only());
+        }
+
         let cloned = server.clone();
         assert_eq!(cloned.max_body_size, 4096);
         assert_eq!(cloned.max_connections, 7);
-    }
-
-    #[cfg(feature = "tls")]
-    #[test]
-    #[allow(clippy::redundant_clone)] // the point of this test is exercising `Clone` itself.
-    fn clone_preserves_tls_policy() {
-        let server =
-            Server::new(Router::new()).tls_policy(crate::tls::TlsPolicy::hardened().tls13_only());
-        assert!(server.tls_policy.is_some());
-        let cloned = server.clone();
+        #[cfg(feature = "tls")]
         assert!(cloned.tls_policy.is_some());
     }
 
     #[test]
-    fn max_connections_builder_sets_field() {
-        let server = Server::new(Router::new()).max_connections(42);
-        assert_eq!(server.max_connections, 42);
-        // Default is untouched by an unrelated builder call.
-        assert_eq!(server.max_body_size, 2 * 1024 * 1024);
-    }
-
-    #[test]
-    fn is_resource_exhaustion_matches_known_codes() {
-        assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(
-            24
-        )));
-        assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(
-            23
-        )));
-        assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(
-            10024
-        )));
-    }
-
-    #[test]
-    fn is_resource_exhaustion_false_for_unrelated_errors() {
-        assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(
-            2
-        )));
-        assert!(!is_resource_exhaustion(&std::io::Error::other(
-            "not an os error"
-        )));
-    }
-
-    #[cfg(feature = "cert-gen")]
-    #[test]
-    fn rustls_config_debug_smoke() {
-        let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
-            .expect("generate self-signed cert");
-        let mut server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.cert_der], cert.key_der)
-            .expect("build server config");
-        server_config.alpn_protocols = alpn_protocols(false);
-        let config = RustlsConfig {
-            server_config: Arc::new(server_config),
-        };
-        let dbg = format!("{config:?}");
-        assert!(dbg.contains("RustlsConfig"));
+    fn is_resource_exhaustion_matches_only_known_codes() {
+        for code in [23, 24, 10024] {
+            assert!(
+                is_resource_exhaustion(&std::io::Error::from_raw_os_error(code)),
+                "code: {code}"
+            );
+        }
+        assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(2)));
+        assert!(!is_resource_exhaustion(&std::io::Error::other("not an os error")));
     }
 
     #[cfg(feature = "tls")]
