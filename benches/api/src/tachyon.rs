@@ -7,8 +7,6 @@ use tachyon_web::http::response::{IntoResponse, Json};
 use tachyon_web::routing::extract::{Path, Query};
 use tachyon_web::routing::{Router, get, post};
 
-// ─── Common types ─────────────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 struct IdParam {
     id: u64,
@@ -103,8 +101,6 @@ struct Deleted {
     id: u64,
     deleted: bool,
 }
-
-// ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn health() -> impl IntoResponse {
     Json(Health {
@@ -204,8 +200,6 @@ async fn get_metrics() -> impl IntoResponse {
         points,
     })
 }
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {

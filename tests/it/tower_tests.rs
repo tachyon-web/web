@@ -212,9 +212,7 @@ async fn test_layer_wraps_every_route_via_tower_layer() {
         "hello from layer"
     }
 
-    let router = compile(Router::new()
-        .route("/", get(hello))
-        .layer(PassThroughLayer));
+    let router = compile(Router::new().route("/", get(hello)).layer(PassThroughLayer));
 
     let (status, body) = send_get(&router, "/").await;
     assert_eq!(status, StatusCode::OK);
@@ -234,10 +232,12 @@ async fn test_route_layer_does_not_wrap_the_fallback() {
         "fallback"
     }
 
-    let router = compile(Router::new()
-        .route("/", get(hello))
-        .fallback(fallback)
-        .route_layer(PassThroughLayer));
+    let router = compile(
+        Router::new()
+            .route("/", get(hello))
+            .fallback(fallback)
+            .route_layer(PassThroughLayer),
+    );
 
     let (status, body) = send_get(&router, "/").await;
     assert_eq!(status, StatusCode::OK);
@@ -259,9 +259,11 @@ async fn test_layer_surfaces_service_not_ready_as_500() {
         "unreachable"
     }
 
-    let router = compile(Router::new()
-        .route("/", get(hello))
-        .layer(AlwaysFailsReadyLayer));
+    let router = compile(
+        Router::new()
+            .route("/", get(hello))
+            .layer(AlwaysFailsReadyLayer),
+    );
 
     let (status, _body) = send_get(&router, "/").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -278,9 +280,11 @@ async fn test_layer_surfaces_service_call_failure_as_500() {
         "unreachable"
     }
 
-    let router = compile(Router::new()
-        .route("/", get(hello))
-        .layer(AlwaysFailsCallLayer));
+    let router = compile(
+        Router::new()
+            .route("/", get(hello))
+            .layer(AlwaysFailsCallLayer),
+    );
 
     let req = Request::builder().uri("/").body(Body::empty()).unwrap();
     let resp = router.handle_request(req).await;
@@ -311,8 +315,7 @@ async fn test_route_service_rejects_oversized_body() {
 /// `service.ready().await` err branch).
 #[tokio::test]
 async fn test_route_service_surfaces_service_not_ready_as_500() {
-    let router = compile(Router::new()
-        .route_service("/svc", AlwaysFailsReady));
+    let router = compile(Router::new().route_service("/svc", AlwaysFailsReady));
 
     let (status, _body) = send_get(&router, "/svc").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -323,8 +326,7 @@ async fn test_route_service_surfaces_service_not_ready_as_500() {
 /// `ready.call(req).await` err branch).
 #[tokio::test]
 async fn test_route_service_surfaces_service_call_failure_as_500() {
-    let router = compile(Router::new()
-        .route_service("/svc", AlwaysFailsCall));
+    let router = compile(Router::new().route_service("/svc", AlwaysFailsCall));
 
     let (status, _body) = send_get(&router, "/svc").await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

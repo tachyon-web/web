@@ -65,10 +65,8 @@ impl IntoResponse for Error {
                 )
             }
         };
-        let mut resp = crate::http::response::with_content_type(
-            body,
-            crate::http::response::TEXT_PLAIN,
-        );
+        let mut resp =
+            crate::http::response::with_content_type(body, crate::http::response::TEXT_PLAIN);
         *resp.status_mut() = status;
         resp
     }

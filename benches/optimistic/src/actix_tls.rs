@@ -21,7 +21,6 @@ async fn json() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Install default crypto provider for rustls
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let certs = tachyon_web::tls::generate_self_signed_cert(vec![

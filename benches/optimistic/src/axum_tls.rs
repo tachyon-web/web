@@ -28,14 +28,12 @@ async fn main() {
         .route("/", get(plaintext))
         .route("/json", get(json));
 
-    // Generate certificates using Tachyon's helper
     let certs = tachyon_web::tls::generate_self_signed_cert(vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
     ])
     .unwrap();
 
-    // Configure rustls via axum-server
     let config = RustlsConfig::from_pem(certs.cert_pem.into_bytes(), certs.key_pem.into_bytes())
         .await
         .unwrap();

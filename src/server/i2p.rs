@@ -5,7 +5,7 @@
 //! external `i2pd`/Java-I2P process, no SAM/BOB bridge — with the same `serve_*` ergonomics as
 //! [`Server::serve_tor`](crate::server::Server::serve_tor).
 //!
-//! # ⚠️ This feature does not honor `tachyon-web`'s `forbid(unsafe_code)` guarantee
+//! # This feature does not honor `tachyon-web`'s `forbid(unsafe_code)` guarantee
 //!
 //! `tachyon-web` itself has `#![forbid(unsafe_code)]` at its crate root, same as always. But
 //! `libi2pd` is a C++ library with no stable C ABI, so reaching it at all requires an FFI

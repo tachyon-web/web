@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
-// ─── Common types ─────────────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 struct IdParam {
     id: u64,
@@ -105,8 +103,6 @@ struct Deleted {
     deleted: bool,
 }
 
-// ─── Handlers ─────────────────────────────────────────────────────────────────
-
 async fn health() -> Json<Health> {
     Json(Health {
         status: "ok",
@@ -200,8 +196,6 @@ async fn get_metrics() -> Json<Metrics> {
         points,
     })
 }
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {

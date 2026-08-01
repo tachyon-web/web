@@ -27,11 +27,9 @@ async fn main() {
         .route("/", get(plaintext))
         .route("/json", get(json));
 
-    // Generate certificates using Tachyon's helper
     let certs =
         generate_self_signed_cert(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
 
-    // Configure rustls using Tachyon's TLS Config
     let config = tachyon_web::RustlsConfig::from_pem(
         certs.cert_pem.into_bytes(),
         certs.key_pem.into_bytes(),

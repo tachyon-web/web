@@ -305,7 +305,6 @@ where
     }
 }
 
-// ─── IntoResponseParts ─────────────────────────────────────────────────────────
 //
 // Generalizes response-tuple composition beyond a fixed whitelist of shapes.
 // Any type implementing `IntoResponseParts` (headers, cookies, extensions, or a

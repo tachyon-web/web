@@ -1,7 +1,4 @@
-//! Comprehensive integration tests covering correctness, security, and edge cases.
-//!
-//! These tests spin up real in-process HTTP servers and exercise the framework
-//! through a full network stack using `reqwest`.
+//! End-to-end tests: real in-process servers, driven over the network with `reqwest`.
 
 use crate::common::TestServer;
 use bytes::Bytes;
@@ -18,18 +15,13 @@ async fn spawn_server(router: Router<()>) -> TestServer {
     TestServer::spawn(router).await
 }
 
-// ─── Basic routing ────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_get_root() {
     async fn handler() -> &'static str {
         "hello"
     }
     let server = spawn_server(Router::new().route("/", get(handler))).await;
-    let res = server.get("/")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/").send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(res.text().await.unwrap(), "hello");
 }
@@ -40,10 +32,7 @@ async fn test_method_not_allowed_returns_405_with_allow() {
         "ok"
     }
     let server = spawn_server(Router::new().route("/only-get", get(handler))).await;
-    let res = server.post("/only-get")
-        .send()
-        .await
-        .unwrap();
+    let res = server.post("/only-get").send().await.unwrap();
     assert_eq!(res.status(), 405);
     let allow = res.headers().get("allow").expect("Allow header");
     assert!(allow.to_str().unwrap().contains("GET"));
@@ -55,10 +44,7 @@ async fn test_not_found_returns_404() {
         "ok"
     }
     let server = spawn_server(Router::new().route("/exists", get(handler))).await;
-    let res = server.get("/nope")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/nope").send().await.unwrap();
     assert_eq!(res.status(), 404);
 }
 
@@ -94,8 +80,6 @@ async fn test_all_http_methods() {
     }
 }
 
-// ─── Path parameters ──────────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize, Serialize)]
 struct UserParams {
     id: u32,
@@ -108,10 +92,7 @@ async fn test_path_params_deserialized() {
         Json(p)
     }
     let server = spawn_server(Router::new().route("/user/:id/:name", get(handler))).await;
-    let res = server.get("/user/42/alice")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/user/42/alice").send().await.unwrap();
     assert_eq!(res.status(), 200);
     let user: UserParams = res.json().await.unwrap();
     assert_eq!(user.id, 42);
@@ -125,14 +106,9 @@ async fn test_path_param_type_mismatch_returns_400() {
     }
     let server = spawn_server(Router::new().route("/user/:id/:name", get(handler))).await;
     // "abc" can't parse as u32
-    let res = server.get("/user/abc/bob")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/user/abc/bob").send().await.unwrap();
     assert_eq!(res.status(), 400);
 }
-
-// ─── Query parameters ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
@@ -146,10 +122,7 @@ async fn test_query_extraction() {
         format!("q={} page={}", q.q, q.page.unwrap_or(1))
     }
     let server = spawn_server(Router::new().route("/search", get(handler))).await;
-    let res = server.get("/search?q=rust&page=3")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/search?q=rust&page=3").send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(res.text().await.unwrap(), "q=rust page=3");
 }
@@ -162,12 +135,14 @@ async fn test_query_decoding() {
     let server = spawn_server(Router::new().route("/search", get(handler))).await;
 
     for (query, expected) in [("q=hello+world", "hello world"), ("q=foo%20bar", "foo bar")] {
-        let res = server.get(&format!("/search?{query}")).send().await.unwrap();
+        let res = server
+            .get(&format!("/search?{query}"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(res.text().await.unwrap(), expected, "query: {query}");
     }
 }
-
-// ─── JSON extractor ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Payload {
@@ -180,7 +155,8 @@ async fn test_json_extractor_ok() {
         Json(p)
     }
     let server = spawn_server(Router::new().route("/echo", post(handler))).await;
-    let res = server.post("/echo")
+    let res = server
+        .post("/echo")
         .json(&Payload {
             value: "test".into(),
         })
@@ -213,11 +189,13 @@ async fn test_json_extractor_rejection_statuses() {
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), expected, "content-type: {content_type}, body: {body}");
+        assert_eq!(
+            res.status(),
+            expected,
+            "content-type: {content_type}, body: {body}"
+        );
     }
 }
-
-// ─── Form extractor ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FormData {
@@ -231,7 +209,8 @@ async fn test_form_extractor_ok() {
         Json(f)
     }
     let server = spawn_server(Router::new().route("/form", post(handler))).await;
-    let res = server.post("/form")
+    let res = server
+        .post("/form")
         .form(&[("username", "alice"), ("age", "30")])
         .send()
         .await
@@ -248,7 +227,8 @@ async fn test_form_extractor_wrong_content_type_415() {
         Json(f)
     }
     let server = spawn_server(Router::new().route("/form", post(handler))).await;
-    let res = server.post("/form")
+    let res = server
+        .post("/form")
         .header("content-type", "application/json")
         .body("username=alice&age=30")
         .send()
@@ -256,8 +236,6 @@ async fn test_form_extractor_wrong_content_type_415() {
         .unwrap();
     assert_eq!(res.status(), 415);
 }
-
-// ─── State extractor ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 struct AppState {
@@ -279,18 +257,13 @@ async fn test_state_extractor() {
     assert_eq!(res.text().await.unwrap(), "howdy");
 }
 
-// ─── Response types ───────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_html_response_content_type() {
     async fn handler() -> Html<&'static str> {
         Html("<h1>hi</h1>")
     }
     let server = spawn_server(Router::new().route("/", get(handler))).await;
-    let res = server.get("/")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/").send().await.unwrap();
     let ct = res.headers().get("content-type").unwrap().to_str().unwrap();
     assert!(ct.contains("text/html"), "ct: {ct}");
 }
@@ -301,10 +274,7 @@ async fn test_status_code_response() {
         StatusCode::CREATED
     }
     let server = spawn_server(Router::new().route("/create", post(handler))).await;
-    let res = server.post("/create")
-        .send()
-        .await
-        .unwrap();
+    let res = server.post("/create").send().await.unwrap();
     assert_eq!(res.status(), 201);
 }
 
@@ -314,15 +284,10 @@ async fn test_tuple_status_response() {
         (StatusCode::ACCEPTED, "accepted")
     }
     let server = spawn_server(Router::new().route("/acc", post(handler))).await;
-    let res = server.post("/acc")
-        .send()
-        .await
-        .unwrap();
+    let res = server.post("/acc").send().await.unwrap();
     assert_eq!(res.status(), 202);
     assert_eq!(res.text().await.unwrap(), "accepted");
 }
-
-// ─── Body size limits ─────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_oversized_body_returns_413() {
@@ -333,7 +298,8 @@ async fn test_oversized_body_returns_413() {
     let server = TestServer::spawn_with(app, |s| s.max_body_size(100)).await;
     // Send 200 bytes of JSON (exceeds the 100-byte limit)
     let big_value = "x".repeat(200);
-    let res = server.post("/upload")
+    let res = server
+        .post("/upload")
         .header("content-type", "application/json")
         .body(format!("{{\"value\":\"{big_value}\"}}"))
         .send()
@@ -357,7 +323,8 @@ async fn test_default_body_limit_override_is_stricter_than_server_default() {
         .with_state(());
     let server = TestServer::spawn_with(app, |s| s.max_body_size(1024 * 1024)).await;
 
-    let res = server.post("/upload")
+    let res = server
+        .post("/upload")
         .header("content-type", "application/json")
         .body("{\"value\":\"this is well under 1 MiB\"}")
         .send()
@@ -386,7 +353,8 @@ async fn test_default_body_limit_disable_allows_large_body() {
     let server = TestServer::spawn_with(app, |s| s.max_body_size(10)).await;
 
     let big_value = "x".repeat(2000);
-    let res = server.post("/upload")
+    let res = server
+        .post("/upload")
         .header("content-type", "application/json")
         .body(format!("{{\"value\":\"{big_value}\"}}"))
         .send()
@@ -398,8 +366,6 @@ async fn test_default_body_limit_disable_allows_large_body() {
         "DefaultBodyLimit::disable() must lift the server's 10-byte default"
     );
 }
-
-// ─── Nested router ───────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_nested_router_e2e() {
@@ -419,8 +385,6 @@ async fn test_nested_router_e2e() {
     assert_eq!(r2.text().await.unwrap(), "v2 ok");
 }
 
-// ─── Custom fallback ─────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_custom_fallback_e2e() {
     async fn handler() -> &'static str {
@@ -430,15 +394,10 @@ async fn test_custom_fallback_e2e() {
         .route("/exists", get(handler))
         .fallback(|_req: Request<Bytes>| async { (StatusCode::NOT_FOUND, "custom 404") });
     let server = spawn_server(app).await;
-    let res = server.get("/missing")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/missing").send().await.unwrap();
     assert_eq!(res.status(), 404);
     assert_eq!(res.text().await.unwrap(), "custom 404");
 }
-
-// ─── serve_file ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_serve_file_static() {
@@ -449,10 +408,7 @@ async fn test_serve_file_static() {
         .serve_file("/hello", fpath.to_str().unwrap())
         .expect("serve_file");
     let server = spawn_server(app).await;
-    let res = server.get("/hello")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/hello").send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(res.text().await.unwrap(), "hello from file");
 }
@@ -466,8 +422,6 @@ async fn test_serve_file_missing_returns_err() {
     );
 }
 
-// ─── Path traversal (security) ───────────────────────────────────────────────
-
 #[tokio::test]
 async fn test_static_dir_path_traversal_blocked() {
     let dir = tempfile::tempdir().unwrap();
@@ -478,19 +432,13 @@ async fn test_static_dir_path_traversal_blocked() {
         .unwrap();
     let app = Router::new().serve_dir("/files", serve);
     let server = spawn_server(app).await;
-    // Attempt directory traversal via path param
-    let res = server.get("/files/../../etc/passwd")
-        .send()
-        .await
-        .unwrap();
+    let res = server.get("/files/../../etc/passwd").send().await.unwrap();
     assert!(
         res.status() == 403 || res.status() == 404,
         "traversal must be blocked: {}",
         res.status()
     );
 }
-
-// ─── Concurrent requests ──────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn test_concurrent_requests() {
@@ -500,7 +448,6 @@ async fn test_concurrent_requests() {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter2 = counter.clone();
 
-    // We can't easily pass the Arc into a static handler so use State instead.
     #[derive(Clone)]
     struct Ctr(Arc<AtomicUsize>);
 
@@ -536,8 +483,6 @@ async fn test_concurrent_requests() {
     assert_eq!(success, 50, "all 50 concurrent requests must succeed");
     assert_eq!(counter.load(Ordering::SeqCst), 50);
 }
-
-// ─── Unit-level extractor tests (no network) ─────────────────────────────────
 
 mod extractor_unit {
     use super::*;
@@ -660,10 +605,7 @@ mod extractor_unit {
         let router = Router::new().route("/hello/:name", get(name_handler));
         let server = spawn_server(router).await;
 
-        let res = server.get("/hello/John%20Doe")
-            .send()
-            .await
-            .unwrap();
+        let res = server.get("/hello/John%20Doe").send().await.unwrap();
         assert_eq!(res.status(), 200);
         assert_eq!(res.text().await.unwrap(), "John Doe");
     }
@@ -680,16 +622,11 @@ mod extractor_unit {
         let router = Router::new().serve_dir("/files", serve);
         let server = spawn_server(router).await;
 
-        let res = server.get("/files/hello%20space.txt")
-            .send()
-            .await
-            .unwrap();
+        let res = server.get("/files/hello%20space.txt").send().await.unwrap();
         assert_eq!(res.status(), 200);
         assert_eq!(res.text().await.unwrap(), "hello space content");
     }
 }
-
-// ─── HTTP/2 over cleartext (h2c) ──────────────────────────────────────────────
 
 #[cfg(feature = "http2")]
 #[tokio::test]

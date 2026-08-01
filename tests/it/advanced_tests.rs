@@ -16,7 +16,6 @@ struct SubmitData {
     age: u8,
 }
 
-// 1. Cookies Test
 async fn handle_cookies(cookies: Cookies) -> (Cookies, Html<String>) {
     let visited = if let Some(cookie) = cookies.get("visited") {
         cookie.value().to_string()
@@ -29,12 +28,10 @@ async fn handle_cookies(cookies: Cookies) -> (Cookies, Html<String>) {
     (cookies, Html(format!("Visited before: {}", visited)))
 }
 
-// 2. Form Extractor Test
 async fn handle_form(Form(data): Form<SubmitData>) -> Json<SubmitData> {
     Json(data)
 }
 
-// 3. Streaming Body Test
 async fn handle_stream() -> hyper::Response<Body> {
     use http_body_util::StreamBody;
     use hyper::body::Frame;
@@ -66,12 +63,10 @@ async fn handle_stream() -> hyper::Response<Body> {
 
 #[tokio::test]
 async fn test_advanced_features() {
-    // Create nested API router
     let api_router = Router::new()
         .route("/form", post(handle_form))
         .route("/stream", get(handle_stream));
 
-    // Create main app router
     let app = Router::new()
         .route("/cookies", get(handle_cookies))
         .nest("/api/v1", api_router)
@@ -98,7 +93,11 @@ async fn test_advanced_features() {
     assert_eq!(submitted.age, 30);
 
     // Streaming body, on a nested route.
-    let res = server.get("/api/v1/stream").send().await.expect("get stream");
+    let res = server
+        .get("/api/v1/stream")
+        .send()
+        .await
+        .expect("get stream");
     assert_eq!(res.text().await.unwrap(), "Chunk 1\nChunk 2\n");
 }
 
@@ -207,8 +206,7 @@ async fn test_eager_polling_safety_and_allocations() {
     use tachyon_web::http::Request;
     use tachyon_web::routing::handler::{Handler, ResponseFuture};
 
-    // 1. Dynamic route (arity 0 async fn with no awaits)
-    // Should return dynamic values on every call, and should NOT allocate a Box (ResponseFuture::Ready).
+    // Arity-0 async fn with no awaits: fresh value per call, no box (ResponseFuture::Ready).
     async fn get_time() -> String {
         format!(
             "time: {:?}",
@@ -228,7 +226,7 @@ async fn test_eager_polling_safety_and_allocations() {
     let response1 = res_fut1.await;
     let body1 = response_to_string(response1).await;
 
-    // Sleep for 1ms to ensure timestamp changes
+    // Timestamps must differ between the two calls.
     tokio::time::sleep(Duration::from_millis(1)).await;
 
     let req2 = Request::builder().body(Body::empty()).unwrap();
@@ -242,8 +240,7 @@ async fn test_eager_polling_safety_and_allocations() {
         "Dynamic time handler must return different values on different requests"
     );
 
-    // 2. Yielding route (arity 0 async fn with actual await)
-    // Should resolve correctly, and MUST return ResponseFuture::Boxed.
+    // Arity-0 async fn that genuinely awaits: falls back to ResponseFuture::Boxed.
     async fn wait_a_bit() -> &'static str {
         tokio::time::sleep(Duration::from_millis(5)).await;
         "done"
@@ -259,8 +256,7 @@ async fn test_eager_polling_safety_and_allocations() {
     let body3 = response_to_string(response3).await;
     assert_eq!(body3, "done");
 
-    // 3. Synchronous route (arity 0 fn)
-    // Should resolve to ResponseFuture::Ready directly.
+    // Arity-0 sync fn: ResponseFuture::Ready.
     fn sync_handler() -> &'static str {
         "sync-ok"
     }
@@ -275,7 +271,6 @@ async fn test_eager_polling_safety_and_allocations() {
     let body4 = response_to_string(response4).await;
     assert_eq!(body4, "sync-ok");
 
-    // 4. Synchronous route with parameter extraction (arity 1 fn)
     // The last extractor is `FromRequest`, which is async (it may need to await the
     // body streaming in), so any handler with at least one argument goes through
     // `ResponseFuture::Boxed` — only arity-0 handlers can take the `Ready` fast path.
@@ -295,7 +290,6 @@ async fn test_eager_polling_safety_and_allocations() {
     assert_eq!(body5, "state: app-state-value");
 }
 
-// Helper function to read body from response
 async fn response_to_string(res: hyper::Response<tachyon_web::http::response::Body>) -> String {
     use http_body_util::BodyExt;
     let body_bytes = res.into_body().collect().await.unwrap().to_bytes();

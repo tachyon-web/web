@@ -1,3 +1,5 @@
+//! Middleware primitives: the [`Next`] continuation and [`MiddlewarePosition`].
+
 use crate::http::response::Body;
 use crate::routing::handler::BoxedHandler;
 use hyper::{Request, Response};

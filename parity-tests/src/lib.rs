@@ -1,13 +1,9 @@
-//! Shared harness for golden-response parity tests between real `axum` and
-//! `tachyon-web`.
+//! Shared harness for golden-response parity tests against real `axum`.
 //!
-//! The core idea: build the *same* route/handler twice — once wired into a
-//! real `axum::Router`, once into a `tachyon_web::Router` — drive both
-//! through their actual `tower::Service` implementation with an identical
-//! request, and diff status/headers/body. This is a black-box behavioral
-//! check, not a compile-only shape check: if tachyon-web's routing,
-//! extractors, or response handling ever silently diverge from Axum for a
-//! feature this suite covers, one of these tests fails.
+//! Each test builds the same route twice — once into an `axum::Router`, once into a
+//! `tachyon_web::Router` — drives both through their `tower::Service` impl with an identical
+//! request, and diffs status, headers and body. Black-box, so a silent behavioral divergence
+//! fails a test rather than merely a shape change.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};

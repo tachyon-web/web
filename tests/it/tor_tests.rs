@@ -17,8 +17,6 @@
 use tachyon_web::Router;
 use tachyon_web::server::tor::OnionConfig;
 
-// ─── OnionConfig builder contract ──────────────────────────────────────────────
-
 /// `OnionConfig::new` defaults to a self-signed certificate only when `cert-gen` is compiled
 /// in — there is no certificate to generate otherwise, so it defaults to plaintext. The three
 /// tests below asserted the `cert-gen` default unconditionally and so failed on a plain
@@ -77,8 +75,6 @@ fn onion_config_builder_methods_chain_in_any_order() {
     assert!(config.redirect_http_enabled());
     assert!(!config.vanguards_enabled());
 }
-
-// ─── Full round-trip (ignored by default — needs live Tor network egress) ─────
 
 /// Publishes a real onion service serving a tiny [`Router`], connects to it over a real Tor
 /// circuit using a second bootstrapped [`arti_client::TorClient`], and asserts the response

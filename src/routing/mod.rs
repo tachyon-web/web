@@ -1,12 +1,4 @@
-//! Axum-compatible Routing and Handler traits.
-//!
-//! The routing module provides the core mechanism for matching incoming HTTP requests to
-//! asynchronous handlers. It embraces an **Axum-like API**, allowing you to build highly
-//! readable and modular applications using `Router` and `MethodRouter`.
-//!
-//! By chaining methods like `.route("/", get(handler))` and `.with_state(state)`, you can
-//! effortlessly create scalable web endpoints that automatically extract parameters, state,
-//! and payloads with zero-allocation abstractions.
+//! Axum-compatible routing: [`Router`], [`MethodRouter`], and the per-verb builders.
 
 use bytes::Bytes;
 use hyper::{Method, Request, Response, StatusCode};
@@ -15,19 +7,14 @@ use std::sync::Arc;
 
 pub mod extract;
 pub mod handler;
-/// Middleware primitives like the `Next` continuation struct.
 pub mod middleware;
-/// Module for serving static directories with compile-time-like performance.
 pub mod static_dir;
-/// Optional `tower::Service`/`tower::Layer` interop, gated behind the `tower` feature.
 #[cfg(feature = "tower")]
 pub mod tower_compat;
 
 use crate::http::response::{Body, IntoResponse};
 use crate::routing::extract::PathParams;
 pub use handler::{BoxedFuture, BoxedHandler, Handler};
-
-// ─── Method array indices ─────────────────────────────────────────────────────
 
 const IDX_GET: usize = 0;
 const IDX_POST: usize = 1;
@@ -59,8 +46,6 @@ const fn method_index(m: &Method) -> Option<usize> {
         _ => None,
     }
 }
-
-// ─── MethodRouter ─────────────────────────────────────────────────────────────
 
 /// Router that dispatches requests to different handlers based on the HTTP method.
 #[derive(Clone)]
@@ -260,8 +245,6 @@ where
     }
 }
 
-// ─── Per-method builders and shortcuts ────────────────────────────────────────
-
 /// Generates the nine per-verb `MethodRouter` builder methods (`.get()`, `.post()`, …)
 /// and their matching free-function shortcuts (`get(h)`, `post(h)`, …) — one pair per
 /// HTTP method, all structurally identical apart from which slot of `handlers` they fill.
@@ -296,9 +279,7 @@ macro_rules! method_routes {
             }
         )+
 
-        /// Helper to construct a route that dispatches to `handler` for **every** HTTP
-        /// method (`GET`, `POST`, `PUT`, `DELETE`, `OPTIONS`, `HEAD`, `PATCH`, `TRACE`,
-        /// `CONNECT`). Matches `axum::routing::any`.
+        /// A route dispatching every HTTP method to `handler`, matching `axum::routing::any`.
         pub fn any<H, T, S>(handler: H) -> MethodRouter<S>
         where
             H: Handler<T, S>,
@@ -323,8 +304,6 @@ method_routes! {
     (trace, IDX_TRACE, "TRACE"),
     (connect, IDX_CONNECT, "CONNECT"),
 }
-
-// ─── Router ──────────────────────────────────────────────────────────────────
 
 /// Axum-like routing table using `matchit` under the hood.
 #[derive(Clone)]
@@ -689,7 +668,7 @@ where
 
     /// Nest another router under a given path prefix.
     ///
-    /// Seamlessly merges all routes from the sub-router into this router.
+    /// Merges all routes from the sub-router into this router.
     ///
     /// Matches Axum: handlers inside the nested router see a request `Uri` with
     /// `prefix` stripped (e.g. a request to `/api/users/1` nested under `/api`
@@ -1063,8 +1042,6 @@ impl From<matchit::InsertError> for RouterError {
     }
 }
 
-// ─── CompiledRouter ───────────────────────────────────────────────────────────
-
 /// A compiled routing table ready to serve requests.
 #[derive(Clone)]
 pub struct CompiledRouter<S> {
@@ -1330,8 +1307,6 @@ where
 /// Type alias for matched route results to keep signatures clean.
 pub type RouteResolution<'a, S> = (&'a MethodRouter<S>, Vec<(Arc<str>, String)>);
 
-// ─── Unit tests ───────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1377,8 +1352,6 @@ mod tests {
             .expect("compile router")
     }
 
-    // ── routing correctness ──────────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_path_param_extraction() {
         use http_body_util::BodyExt;
@@ -1413,8 +1386,6 @@ mod tests {
         assert!(!allow_str.contains("PATCH"), "Allow: {allow_str}");
     }
 
-    // ── trailing slash strictness (matches Axum: /foo and /foo/ are distinct) ──
-
     /// `/foo` and `/foo/` are distinct routes in both directions, matching Axum.
     #[tokio::test]
     async fn test_trailing_slash_is_significant() {
@@ -1431,8 +1402,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // ── case sensitivity ──────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_case_sensitive_routing() {
         // Paths must match exactly — no silent case-folding.
@@ -1440,8 +1409,6 @@ mod tests {
         let resp = router.handle_request(make_req("GET", "/User/1")).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
-
-    // ── fallback ──────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_custom_fallback() {
@@ -1454,8 +1421,6 @@ mod tests {
         let resp = router.handle_request(make_req("GET", "/missing")).await;
         assert_eq!(resp.status(), StatusCode::FOUND);
     }
-
-    // ── route deduplication ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_overlapping_method_route_panics() {
@@ -1513,8 +1478,6 @@ mod tests {
         assert_eq!(&post_body[..], b"posted");
     }
 
-    // ── normalize_route_pattern ───────────────────────────────────────────────
-
     #[test]
     fn test_normalize_route_pattern() {
         for (input, expected) in [
@@ -1526,8 +1489,6 @@ mod tests {
             assert_eq!(normalize_route_pattern(input), expected, "input: {input}");
         }
     }
-
-    // ── nested routers ────────────────────────────────────────────────────────
 
     /// A nested route is reachable at `prefix + path`, including when the inner path is `/`
     /// (which mounts at the bare prefix).
@@ -1545,8 +1506,6 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK, "path: {path}");
         }
     }
-
-    // ── nest() URI stripping (Axum parity) ───────────────────────────────────
 
     #[tokio::test]
     async fn test_nest_strips_prefix_from_uri() {
@@ -1642,8 +1601,6 @@ mod tests {
         assert_eq!(&body[..], b"/users/7");
     }
 
-    // ── MatchedPath ───────────────────────────────────────────────────────────
-
     #[cfg(feature = "matched-path")]
     #[tokio::test]
     async fn test_matched_path_returns_route_pattern() {
@@ -1678,8 +1635,6 @@ mod tests {
         let res = MatchedPath::from_request_parts(&mut parts, &());
         assert!(res.is_err());
     }
-
-    // ── any() / CONNECT ───────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_any_dispatches_every_method() {
@@ -1823,8 +1778,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── MethodRouter::hoop() (single-middleware shorthand) ──────────────────────
-
     #[tokio::test]
     async fn test_method_router_hoop_installs_middleware() {
         async fn handler() -> &'static str {
@@ -1853,8 +1806,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("x-mr-hoop").expect("header set"), "yes");
     }
-
-    // ── options()/head()/trace() free functions ──────────────────────────────────
 
     #[tokio::test]
     async fn test_options_head_trace_free_functions() {
@@ -1949,8 +1900,6 @@ mod tests {
         assert!(body.is_empty(), "HEAD responses must have an empty body");
     }
 
-    // ── method_not_allowed_fallback ──────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_method_not_allowed_fallback_overrides_default_405() {
         async fn get_handler() -> &'static str {
@@ -1977,8 +1926,6 @@ mod tests {
             .to_bytes();
         assert_eq!(&body[..], b"custom-405");
     }
-
-    // ── hoop()/hoop_at() wrapping the fallback & method_not_allowed_fallback ────
 
     #[tokio::test]
     async fn test_hoop_wraps_fallback_and_method_not_allowed_fallback() {
@@ -2047,8 +1994,6 @@ mod tests {
         assert_eq!(&body[..], b"custom-405");
     }
 
-    // ── RouterError::DuplicateRoute ───────────────────────────────────────────────
-
     #[test]
     fn test_compile_returns_duplicate_route_err() {
         async fn handler() -> &'static str {
@@ -2078,8 +2023,6 @@ mod tests {
         assert!(matches!(result, Err(RouterError::DuplicateRoute(ref p)) if p == "/dup"));
     }
 
-    // ── nest() query-string preservation ──────────────────────────────────────────
-
     #[tokio::test]
     async fn test_nest_strips_prefix_preserves_query_string() {
         async fn echo_full(uri: hyper::Uri) -> String {
@@ -2104,8 +2047,6 @@ mod tests {
             .to_bytes();
         assert_eq!(&body[..], b"/users/42?active=true");
     }
-
-    // ── normalize_trailing_slash ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_normalize_trailing_slash_preserves_query_string() {

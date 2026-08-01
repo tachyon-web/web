@@ -1,31 +1,13 @@
 //! # Tachyon-Web
 //!
-//! A clean, highly optimized, multi-protocol web framework for Rust.
+//! A multi-protocol web framework: HTTP/1.1, h2c, HTTP/2, HTTP/3, Tor and I2P, with
+//! built-in Let's Encrypt certificate management.
 //!
-//! `tachyon-web` follows the philosophy of an **Axum-compatible API**, but takes a simpler,
-//! more unified approach to high-performance transport protocols. Where other frameworks require
-//! complex configurations and separate crates to handle modern protocols, `tachyon-web` provides
-//! a seamless, unified experience out-of-the-box for **HTTP/1.1, HTTP/2, and HTTP/3**, as well
-//! as **automatic Let's Encrypt TLS certificate management**.
+//! The router/extractor API mirrors `axum`, so most `axum` handlers compile unmodified.
+//! The exception is Tower middleware, which Tachyon deliberately does not use; the `tower`
+//! feature provides an interop layer for the cases that need it.
 //!
-//! ## Design philosophy
-//!
-//! 1. **Axum-like simplicity**: Build a `Router`, chain `.route()` calls, and use type-safe
-//!    extractors (`Path`, `Query`, `Json`, `State`) in handler functions — the same ergonomic
-//!    patterns you already know.
-//!
-//! 2. **Drop-in replacement for Axum workloads**: Most `axum` handlers compile against
-//!    `tachyon-web` without modification. The main incompatibility is Tower middleware layers,
-//!    which Tachyon does not use — by design, to eliminate the overhead Tower introduces.
-//!
-//! 3. **Effortless TLS, HTTP/2, and HTTP/3**: Starting a TLS server is a single call.
-//!    Let's Encrypt integration is built-in — no CLI tools, no shell scripts, no cron jobs.
-//!    Certificates are automatically issued, cached to disk, and hot-reloaded on renewal.
-//!
-//! 4. **High Performance**: Built natively on `hyper` and `s2n-quic`, `tachyon-web` prioritizes
-//!    minimal allocations, lock-free hot paths, and direct socket handling.
-//!
-//! ## Quick start: Plain HTTP
+//! ## Plain HTTP
 //!
 //! ```rust,no_run
 //! use tachyon_web::{Router, Server, get};
@@ -49,12 +31,9 @@
 //!
 //! ## HTTPS with automatic Let's Encrypt certificates
 //!
-//! Call [`Server::serve_all_acme`] to get fully automatic certificate management:
-//! - Issues a certificate from Let's Encrypt on first startup.
-//! - Serves ACME HTTP-01 challenges in-process (no separate server or Certbot required).
-//! - Saves credentials and the certificate to disk — safe across restarts.
-//! - Renews automatically 30 days before expiry with exponential-backoff retries.
-//! - Hot-swaps the certificate in the TLS stack with **zero downtime**.
+//! [`Server::serve_all_acme`] issues the certificate on first startup, answers the HTTP-01
+//! challenge in-process, caches account credentials and the certificate to disk, renews 30
+//! days before expiry, and hot-swaps the result into the running TLS stack.
 //!
 //! ```rust,no_run
 //! use tachyon_web::{Router, Server, get};
@@ -99,7 +78,6 @@
 //!
 //!         let app = Router::new().route("/", get(hello));
 //!
-//!         // Generate an ephemeral self-signed cert (for development only).
 //!         let cert = tls::generate_self_signed_cert(vec!["localhost".to_string()])?;
 //!
 //!         Server::new(app)
@@ -159,15 +137,13 @@
 //! }
 //! ```
 //!
-//! **⚠️ Unlike every other feature in this crate, `i2p` pulls in a dependency that itself
-//! contains `unsafe` code — the `#![forbid(unsafe_code)]` below still holds for
-//! `tachyon-web`'s own source (it cannot be locally overridden by any feature), but it says
-//! nothing about the FFI boundary this feature links in.** `libi2pd` is a C++ library with no
-//! stable C ABI, so supporting it at all requires an `unsafe` FFI boundary — one written for
-//! this project ([`i2pd-sys`](https://docs.rs/i2pd-sys)/[`tachyon-i2p`](https://docs.rs/tachyon-i2p)),
-//! not a long-established independently-audited pure-Rust dependency the way `arti-client` is
-//! for `tor`. See [`server::i2p`] for the full disclosure before enabling this in anything
-//! security-sensitive.
+//! Unlike every other feature here, `i2p` links in `unsafe` code. The
+//! `#![forbid(unsafe_code)]` below still holds for this crate's own source — no feature can
+//! override it — but it says nothing about the FFI boundary. `libi2pd` is C++ with no stable
+//! C ABI, so the bindings ([`i2pd-sys`](https://docs.rs/i2pd-sys) /
+//! [`tachyon-i2p`](https://docs.rs/tachyon-i2p)) were written for this project rather than
+//! being an independently audited pure-Rust dependency the way `arti-client` is for `tor`.
+//! Read [`server::i2p`] before enabling it in anything security-sensitive.
 
 #![forbid(unsafe_code, elided_lifetimes_in_paths)]
 #![allow(clippy::multiple_crate_versions)]
@@ -185,8 +161,6 @@ pub mod server;
 pub mod tls;
 #[cfg(feature = "ws")]
 pub mod ws;
-
-// ─── Public re-exports ────────────────────────────────────────────────────────
 
 pub use http::error::{Error, Result};
 pub use http::response;

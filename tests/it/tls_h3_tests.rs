@@ -18,7 +18,6 @@ async fn test_server_https_and_h3() {
         .route("/", get(handle_root))
         .with_state(AppState::default());
 
-    // Generate self signed cert
     let certs =
         generate_self_signed_cert(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
 
@@ -29,7 +28,6 @@ async fn test_server_https_and_h3() {
 
     let server = Server::new(app);
     let _server_handle = tokio::spawn(async move {
-        // Start HTTP/3, HTTP/2, and HTTP/1.1 effortlessly
         server
             .start_all(
                 &https_addr.to_string(),
@@ -45,7 +43,6 @@ async fn test_server_https_and_h3() {
     wait_until_listening(https_addr).await;
     wait_until_listening(http_addr).await;
 
-    // Test HTTPS (HTTP/2) route
     let client = Client::builder()
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none()) // Don't auto-follow redirect so we can test the status code
@@ -66,8 +63,7 @@ async fn test_server_https_and_h3() {
         "<h1>Tachyon Secure Web</h1>"
     );
 
-    // Test HTTP → HTTPS redirect (308 Permanent Redirect preserves the HTTP method,
-    // which is important for POST requests; 301 would allow method changes to GET).
+    // 308 rather than 301: it preserves the request method, so a redirected POST stays a POST.
     let res_redirect = client
         .get(format!("http://127.0.0.1:{}/some/path?query=1", http_port))
         .send()

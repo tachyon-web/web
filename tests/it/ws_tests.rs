@@ -8,7 +8,9 @@ use tokio_tungstenite::tungstenite;
 /// A `WebSocketStream` connected to `server`'s `/ws` route, plus the handshake response.
 type ClientStream = tokio_tungstenite::WebSocketStream<TcpStream>;
 
-async fn ws_connect(server: &TestServer) -> (ClientStream, tungstenite::handshake::client::Response) {
+async fn ws_connect(
+    server: &TestServer,
+) -> (ClientStream, tungstenite::handshake::client::Response) {
     let addr = server.addr();
     let tcp = TcpStream::connect(addr).await.unwrap();
     tokio_tungstenite::client_async(format!("ws://{addr}/ws"), tcp)

@@ -1,3 +1,5 @@
+//! [`ServeDir`]: static file serving from a preloaded in-memory directory.
+
 use crate::http::response::{Body, IntoResponse};
 use bytes::Bytes;
 use hyper::{
@@ -160,8 +162,6 @@ fn strip_weak(tag: &str) -> &str {
     tag.strip_prefix("W/").unwrap_or(tag)
 }
 
-// ─── StaticAsset ──────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
 struct StaticAsset {
     /// Raw (identity) content.
@@ -181,8 +181,6 @@ struct StaticAsset {
     etag_header: hyper::header::HeaderValue,
     headers: hyper::HeaderMap,
 }
-
-// ─── ServeDir ─────────────────────────────────────────────────────────────────
 
 /// High-performance static file server.
 ///
@@ -206,7 +204,7 @@ struct StaticAsset {
 /// # }
 /// ```
 ///
-/// ## ⚠️ Never point this at a directory that accepts user uploads
+/// ## Never point this at a directory that accepts user uploads
 ///
 /// `ServeDir` serves whatever bytes are on disk with the MIME type derived
 /// from the file extension — it has no way to know
@@ -398,7 +396,7 @@ impl ServeDir {
             // accumulator updated as each asset is inserted, avoiding an O(n) rescan
             // of the whole cache (and thus O(n^2) behaviour) for every file crawled.
             if *current_total >= max_total_bytes {
-                tracing::warn!("RAM cache budget exhausted; remaining files served from disk");
+                tracing::warn!("ram cache budget exhausted, remaining files served from disk");
                 break;
             }
 
@@ -747,7 +745,7 @@ impl ServeDir {
         match fs::read(&canonical).await {
             Ok(content) => Ok(disk_response(&canonical, content, if_none_match)),
             Err(e) => {
-                tracing::error!(path = %canonical.display(), error = %e, "Failed to read static file");
+                tracing::error!(path = %canonical.display(), error = %e, "failed to read static file");
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -765,7 +763,7 @@ impl ServeDir {
             return Ok(not_modified());
         }
         let file = fs::File::open(canonical).await.map_err(|e| {
-            tracing::error!(path = %canonical.display(), error = %e, "Failed to open static file");
+            tracing::error!(path = %canonical.display(), error = %e, "failed to open static file");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         let body = Body::stream(FileBody {

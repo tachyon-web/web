@@ -68,7 +68,7 @@ where
                     if !err_str.contains("application error")
                         && !err_str.contains("ConnectionError")
                     {
-                        tracing::debug!("[h3] Stream accept error: {}", e);
+                        tracing::debug!("[h3] stream accept error: {}", e);
                     }
                     break;
                 }

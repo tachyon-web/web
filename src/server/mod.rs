@@ -1,7 +1,5 @@
-//! High-performance Web Server Engine supporting HTTP/1.1, HTTP/2, and HTTP/3.
-//!
-//! The `server` module provides the [`Server`] struct, which wraps a [`CompiledRouter`] and
-//! dispatches incoming network streams for all supported HTTP versions.
+//! The [`Server`] engine: wraps a [`CompiledRouter`] and dispatches incoming streams for
+//! every supported transport.
 //!
 //! # Protocol support
 //!
@@ -14,7 +12,7 @@
 //! | [`start_all`] | All of the above via PEM cert/key strings | `cert-gen` |
 //! | [`serve_all_acme`] | All of the above, certs managed by Let's Encrypt | `lets-encrypt` |
 //! | [`serve_tor`] | HTTP/1.1 (+ h2c) over a native Tor `.onion` hidden service | `tor` |
-//! | [`serve_i2p`] | HTTP/1.1 (+ h2c) over a native I2P `.b32.i2p` eepsite ([⚠️ breaks `forbid(unsafe_code)`](i2p)) | `i2p` |
+//! | [`serve_i2p`] | HTTP/1.1 (+ h2c) over a native I2P `.b32.i2p` eepsite ([breaks `forbid(unsafe_code)`](i2p)) | `i2p` |
 //!
 //! [`serve_http`]: Server::serve_http
 //! [`serve_https`]: Server::serve_https
@@ -30,7 +28,7 @@
 //!
 //! Each `serve_*` method above consumes its `Server` and blocks for that one transport's
 //! lifetime — the right building block for a single-transport deployment. To publish the same
-//! app over **several** transports at once (e.g. clearnet HTTPS *and* a `.onion` mirror *and*
+//! app over several transports at once (e.g. clearnet HTTPS *and* a `.onion` mirror *and*
 //! a `.i2p` mirror, all from one process), prefer [`MultiServer`] over hand-rolling
 //! `tokio::spawn` + `tokio::select!` around the individual `serve_*` calls yourself — it owns
 //! exactly that boilerplate:
@@ -146,7 +144,7 @@ where
                     .enable_all()
                     .build()
                 else {
-                    tracing::error!("Failed to build Tokio runtime for worker thread");
+                    tracing::error!("failed to build tokio runtime for worker thread");
                     return;
                 };
 
@@ -168,7 +166,7 @@ where
                                 });
                             }
                             Err(e) => {
-                                tracing::error!("Worker redirect bind error: {e}");
+                                tracing::error!("worker redirect bind error: {e}");
                             }
                         }
                     }
@@ -180,7 +178,7 @@ where
                             l
                         }
                         Err(e) => {
-                            tracing::error!("Worker bind error: {e}");
+                            tracing::error!("worker bind error: {e}");
                             let _ = bind_tx.send(Err(e));
                             return;
                         }
@@ -221,8 +219,6 @@ where
     std::future::pending::<()>().await;
     Ok(())
 }
-
-// ─── Server ──────────────────────────────────────────────────────────────────
 
 /// Main server configuration and runner.
 ///
@@ -421,7 +417,7 @@ where
         self.tls_policy.clone().unwrap_or_default()
     }
 
-    /// Begins publishing this app over **multiple transports at once** — see
+    /// Begins publishing this app over multiple transports at once — see
     /// [`MultiServer`] and the [module docs](self#publishing-over-more-than-one-transport-at-once).
     ///
     /// Adds a plaintext clearnet HTTP transport bound to `listener`; chain more `.with_*` calls
@@ -431,7 +427,7 @@ where
         MultiServer::new(self).with_http(listener)
     }
 
-    /// Begins publishing this app over **multiple transports at once** — see
+    /// Begins publishing this app over multiple transports at once — see
     /// [`MultiServer`] and the [module docs](self#publishing-over-more-than-one-transport-at-once).
     ///
     /// Adds a clearnet HTTPS transport bound to `listener`, terminated with `config`. Requires
@@ -441,7 +437,7 @@ where
         MultiServer::new(self).with_https(listener, config)
     }
 
-    /// Begins publishing this app over **multiple transports at once** — see
+    /// Begins publishing this app over multiple transports at once — see
     /// [`MultiServer`] and the [module docs](self#publishing-over-more-than-one-transport-at-once).
     ///
     /// Adds an HTTP/3-over-QUIC transport. Requires the `http3` feature.
@@ -450,7 +446,7 @@ where
         MultiServer::new(self).with_h3(quic_server)
     }
 
-    /// Begins publishing this app over **multiple transports at once** — see
+    /// Begins publishing this app over multiple transports at once — see
     /// [`MultiServer`] and the [module docs](self#publishing-over-more-than-one-transport-at-once).
     ///
     /// Adds a Tor `.onion` hidden-service transport. Requires the `tor` feature.
@@ -459,20 +455,19 @@ where
         MultiServer::new(self).with_onion(config)
     }
 
-    /// Begins publishing this app over **multiple transports at once** — see
+    /// Begins publishing this app over multiple transports at once — see
     /// [`MultiServer`] and the [module docs](self#publishing-over-more-than-one-transport-at-once).
     ///
     /// Adds an I2P `.b32.i2p` eepsite transport. Requires the `i2p` feature
-    /// ([⚠️ breaks `forbid(unsafe_code)`](i2p)).
+    /// ([breaks `forbid(unsafe_code)`](i2p)).
     #[cfg(feature = "i2p")]
     pub fn with_i2p(self, config: i2p::I2pConfig) -> MultiServer<S> {
         MultiServer::new(self).with_i2p(config)
     }
 
-    /// Starts a pure plaintext HTTP server on a parsed `SocketAddr`.
+    /// Starts a pure plaintext HTTP server on an already-parsed address.
     ///
     /// # Errors
-    ///
     /// Returns an error if the server fails to run.
     pub async fn start_http_addr(self, addr: std::net::SocketAddr) -> Result<(), std::io::Error> {
         run_worker_pool(self, addr, None, |server, listener| async move {
@@ -481,14 +476,10 @@ where
         .await
     }
 
-    /// Starts a pure plaintext HTTP server.
-    ///
-    /// # Arguments
-    /// - `http_addr`: The address to bind (e.g., `"0.0.0.0:80"`).
+    /// Starts a pure plaintext HTTP server on `http_addr` (e.g. `"0.0.0.0:80"`).
     ///
     /// # Errors
-    ///
-    /// Returns an error if parsing the bind address fails or the server fails to run.
+    /// Returns an error if `http_addr` does not parse or the server fails to run.
     pub async fn start_http(self, http_addr: &str) -> Result<(), std::io::Error> {
         let addr: std::net::SocketAddr = http_addr
             .parse()
@@ -496,18 +487,11 @@ where
         self.start_http_addr(addr).await
     }
 
-    /// Starts a pure HTTPS server (HTTP/1.1 and HTTP/2 over TLS) using a custom `rustls::ServerConfig`.
-    ///
-    /// This provides advanced control for users who want to configure TLS themselves,
-    /// without relying on `cert-gen` or Let's Encrypt automation.
-    ///
-    /// # Arguments
-    /// - `tls_addr`: The address to bind for TLS (e.g., `"0.0.0.0:443"`).
-    /// - `config`: A configured `rustls::ServerConfig`.
+    /// HTTPS (HTTP/1.1 + HTTP/2) on an already-parsed address, with TLS configured by the
+    /// caller rather than by `cert-gen` or the ACME automation.
     ///
     /// # Errors
-    ///
-    /// Returns an error if parsing the bind address fails or the server fails to run.
+    /// Returns an error if binding or the server itself fails.
     #[cfg(feature = "tls")]
     pub async fn start_https_with_config_addr(
         self,
@@ -522,18 +506,11 @@ where
         .await
     }
 
-    /// Starts a pure HTTPS server (HTTP/1.1 and HTTP/2 over TLS) using a custom `rustls::ServerConfig`.
-    ///
-    /// This provides advanced control for users who want to configure TLS themselves,
-    /// without relying on `cert-gen` or Let's Encrypt automation.
-    ///
-    /// # Arguments
-    /// - `tls_addr`: The address to bind for TLS (e.g., `"0.0.0.0:443"`).
-    /// - `config`: A configured `rustls::ServerConfig`.
+    /// HTTPS (HTTP/1.1 + HTTP/2) on `tls_addr` (e.g. `"0.0.0.0:443"`), with TLS configured by
+    /// the caller rather than by `cert-gen` or the ACME automation.
     ///
     /// # Errors
-    ///
-    /// Returns an error if parsing the bind address fails or the server fails to run.
+    /// Returns an error if `tls_addr` does not parse or the server fails to run.
     #[cfg(feature = "tls")]
     pub async fn start_https_with_config(
         self,
@@ -546,19 +523,11 @@ where
         self.start_https_with_config_addr(addr, config).await
     }
 
-    /// Starts HTTPS (HTTP/1.1 + HTTP/2 over TLS) and HTTP/3 (QUIC) using a custom `rustls::ServerConfig`.
-    ///
-    /// This provides advanced control for users who want to configure TLS themselves,
-    /// without relying on `cert-gen` or Let's Encrypt automation. Both listeners will bind
-    /// to the provided `tls_addr` (TCP for HTTPS and UDP for HTTP/3).
-    ///
-    /// # Arguments
-    /// - `tls_addr`: The address to bind for TCP and UDP (e.g., `"0.0.0.0:443"`).
-    /// - `config`: A configured `rustls::ServerConfig`.
+    /// HTTPS and HTTP/3 with a caller-supplied `rustls::ServerConfig`. Both listeners bind
+    /// `tls_addr` — TCP for HTTPS, UDP for QUIC. The config's ALPN list is overwritten.
     ///
     /// # Errors
-    ///
-    /// Returns an error if FIPS compliance enforcement, binding, or server initialization fails.
+    /// Returns an error if FIPS enforcement, binding, or server initialization fails.
     #[cfg(all(feature = "tls", feature = "http3"))]
     pub async fn start_https_and_h3_with_config(
         self,
@@ -567,14 +536,11 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         enforce_fips_compliance()?;
 
-        // Ensure ALPN includes HTTP/3 and standard HTTP/2 / HTTP/1.1
         config.alpn_protocols = alpn_protocols(true);
         let config = Arc::new(config);
 
-        // Start HTTP/3 QUIC Server
         spawn_h3(&self, config.clone(), tls_addr)?;
 
-        // Start HTTPS Server
         let addr: std::net::SocketAddr = tls_addr
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -589,26 +555,15 @@ where
         Ok(())
     }
 
-    /// Starts the server across **all enabled protocols simultaneously** using
-    /// pre-loaded PEM certificate and key strings.
+    /// Serves every enabled protocol from a PEM certificate chain and key: HTTPS on
+    /// `tls_addr`, HTTP/3 on the same address when the `http3` feature is on, and — if
+    /// `cleartext_addr` is `Some` — a redirect listener that still passes ACME HTTP-01
+    /// challenges through, so an external client can renew while this server runs.
     ///
-    /// This is a convenience wrapper that sets up:
-    /// - **HTTP → HTTPS redirect** on `cleartext_addr` (if provided), with ACME HTTP-01
-    ///   challenge pass-through so Let's Encrypt can validate the domain even while
-    ///   this server is running.
-    /// - **HTTP/3** (QUIC) on `tls_addr` (if the `http3` feature is enabled).
-    /// - **HTTPS** (HTTP/1.1 + HTTP/2 over TLS) on `tls_addr`, which blocks
-    ///   the current task.
-    ///
-    /// # Arguments
-    /// - `tls_addr`: The address to bind for TLS (e.g., `"0.0.0.0:443"`).
-    /// - `cleartext_addr`: Optional plaintext HTTP address for the redirect listener
-    ///   (e.g., `Some("0.0.0.0:80")`). Pass `None` if you manage HTTP elsewhere.
-    /// - `cert_pem`: PEM-encoded certificate chain (leaf + intermediates).
-    /// - `key_pem`: PEM-encoded ECDSA or RSA private key.
+    /// Blocks on the HTTPS listener; the others run as spawned tasks.
     ///
     /// # Errors
-    /// Returns an error if address binding, TLS configuration, or certificate parsing fails.
+    /// Returns an error if binding, TLS configuration, or certificate parsing fails.
     #[cfg(feature = "cert-gen")]
     pub async fn start_all(
         self,
@@ -621,34 +576,16 @@ where
             .await
     }
 
-    /// Starts the server with **automatic Let's Encrypt certificate management**.
+    /// [`start_all`] plus an [`AcmeManager`], so certificates are issued and renewed in-process.
     ///
-    /// This is the simplest way to deploy a production HTTPS server with Tachyon.
-    /// It combines [`AcmeManager`] (certificate issuance and renewal) with [`start_all`]
-    /// (multi-protocol serving) into a single call.
+    /// The `cleartext_addr` listener answers HTTP-01 challenges and `308`s everything else to
+    /// HTTPS, so port 80 must be publicly reachable for issuance to succeed. `domains` must all
+    /// resolve to this server. `cache_dir` holds the account credentials and certificate and
+    /// must be writable; reusing it across restarts is what keeps you under Let's Encrypt's
+    /// rate limits. `staging` picks the staging environment — untrusted certs, far higher rate
+    /// limits — and is what you want while testing.
     ///
-    /// # What this does
-    ///
-    /// 1. Creates an [`AcmeManager`] for the given `domains` and `email`.
-    /// 2. Starts the ACME background renewal loop.
-    /// 3. Binds an HTTP listener on `cleartext_addr` that:
-    ///    - Serves ACME HTTP-01 challenge responses (required for cert issuance).
-    ///    - Redirects all other requests to HTTPS with `308 Permanent Redirect`.
-    /// 4. Waits (up to 30s) for the first certificate to be cached or
-    ///    provisioned, then starts the TLS listener regardless of whether
-    ///    that wait timed out.
-    /// 5. Optionally starts HTTP/3 QUIC listener (if the `http3` feature is enabled).
-    ///
-    /// # Arguments
-    /// - `tls_addr`: Address to bind for HTTPS (e.g., `"0.0.0.0:443"`).
-    /// - `cleartext_addr`: Address to bind for HTTP and ACME challenges (e.g., `"0.0.0.0:80"`).
-    ///   **Port 80 must be publicly reachable** for Let's Encrypt HTTP-01 challenges to work.
-    /// - `domains`: Domain names to include in the certificate (must all resolve to this server).
-    /// - `email`: Contact email for Let's Encrypt account registration and expiry notices.
-    /// - `cache_dir`: Directory to store credentials and the certificate on disk.
-    ///   Must be writable. Survives server restarts — this prevents hitting rate limits.
-    /// - `staging`: If `true`, uses the Let's Encrypt **staging** environment.
-    ///   Recommended for testing; staging issues untrusted certs but has much higher rate limits.
+    /// Waits up to a minute for the first certificate, then binds the TLS listener regardless.
     ///
     /// # Example
     ///
@@ -679,10 +616,8 @@ where
     /// ```
     ///
     /// # Errors
-    /// Returns an error if:
-    /// - The HTTP or HTTPS addresses cannot be bound.
-    /// - The ACME account cannot be created or loaded.
-    /// - Certificate provisioning fails (after exhausting retries).
+    /// Returns an error if either address cannot be bound, the ACME account cannot be created
+    /// or loaded, or provisioning fails after exhausting its retries.
     ///
     /// [`AcmeManager`]: crate::tls::acme::AcmeManager
     /// [`start_all`]: Server::start_all
@@ -919,8 +854,6 @@ pub(crate) fn enforce_fips_compliance() -> Result<(), std::io::Error> {
     Ok(())
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 /// Builds the ALPN protocol list for a TLS `ServerConfig`, in preference order,
 /// matching whichever of `http3`/`http2`/`http1` are actually compiled in — so
 /// TLS never advertises a protocol the connection-handling code (gated on the
@@ -952,15 +885,11 @@ pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(23 | 24 | 10024))
 }
 
-/// Runs a plain HTTP listener that serves two functions:
+/// Plain HTTP listener that answers `/.well-known/acme-challenge/<token>` from the global
+/// challenge store and `308`s everything else to the equivalent HTTPS URL.
 ///
-/// 1. **ACME HTTP-01 challenges**: Any request to `/.well-known/acme-challenge/<token>`
-///    is answered with the key authorization string from the global challenge store.
-///    This allows Let's Encrypt to validate domain ownership.
-///
-/// 2. **HTTPS redirect**: All other requests receive a `308 Permanent Redirect` to the
-///    equivalent HTTPS URL. `308` (Permanent Redirect) is preferred over `301` (Moved Permanently)
-///    because `308` preserves the request method, which is important for `POST` requests.
+/// `308` rather than `301` because it preserves the request method, so redirected `POST`s stay
+/// `POST`s.
 #[cfg(feature = "tls")]
 pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_port: u16) {
     let builder =
@@ -970,7 +899,7 @@ pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_por
         let (stream, _peer) = match listener.accept().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("[http-redirect] Accept error: {e}");
+                tracing::error!("[http-redirect] accept error: {e}");
                 if is_resource_exhaustion(&e) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
@@ -1198,8 +1127,12 @@ mod tests {
                 "code: {code}"
             );
         }
-        assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(2)));
-        assert!(!is_resource_exhaustion(&std::io::Error::other("not an os error")));
+        assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(
+            2
+        )));
+        assert!(!is_resource_exhaustion(&std::io::Error::other(
+            "not an os error"
+        )));
     }
 
     #[cfg(feature = "tls")]

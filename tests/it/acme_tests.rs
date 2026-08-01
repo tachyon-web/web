@@ -1,13 +1,4 @@
-//! Tests for the ACME / Let's Encrypt integration.
-//!
-//! These tests cover:
-//! - Challenge store correctness (register, lookup, unregister).
-//! - Concurrent challenge registration / retrieval safety.
-//! - ACME HTTP-01 challenge interception in the `CompiledRouter`.
-//! - `AcmeResolver` certificate hot-swap.
-//! - `AcmeManager` cache loading (valid cert, expired cert, missing cert).
-//! - End-to-end HTTP challenge serving via an in-process HTTP server.
-//! - Challenge isolation: tokens from separate issuances don't collide.
+//! ACME / Let's Encrypt integration.
 
 use bytes::Bytes;
 use hyper::{Request, StatusCode};
@@ -17,26 +8,16 @@ use tachyon_web::tls::acme::{
     AcmeError, AcmeManager, AcmeResolver, get_challenge, register_challenge, unregister_challenge,
 };
 
-// ─── 1. Challenge store: basic register / lookup / unregister ─────────────────
-
 #[tokio::test]
 async fn test_challenge_register_and_retrieve() {
     let token = "basic-token-aaa".to_string();
     let auth = "basic-auth-bbb".to_string();
 
     register_challenge(token.clone(), auth.clone());
-    assert_eq!(
-        get_challenge(&token),
-        Some(auth),
-        "registered challenge must be retrievable"
-    );
+    assert_eq!(get_challenge(&token), Some(auth),);
 
     unregister_challenge(&token);
-    assert_eq!(
-        get_challenge(&token),
-        None,
-        "unregistered challenge must return None"
-    );
+    assert_eq!(get_challenge(&token), None);
 }
 
 #[tokio::test]
@@ -56,16 +37,9 @@ async fn test_challenge_overwrite() {
 
 #[tokio::test]
 async fn test_challenge_unregister_nonexistent_is_noop() {
-    // Should not panic or error.
     unregister_challenge("this-token-does-not-exist");
+    assert_eq!(get_challenge("this-token-does-not-exist"), None);
 }
-
-#[tokio::test]
-async fn test_challenge_lookup_nonexistent_returns_none() {
-    assert_eq!(get_challenge("not-a-real-token"), None);
-}
-
-// ─── 2. Challenge store: isolation between different tokens ───────────────────
 
 #[tokio::test]
 async fn test_challenge_isolation() {
@@ -93,8 +67,6 @@ async fn test_challenge_isolation() {
 
     unregister_challenge(&token_b);
 }
-
-// ─── 3. Challenge store: concurrent access ───────────────────────────────────
 
 #[tokio::test]
 async fn test_concurrent_challenge_operations() {
@@ -129,8 +101,6 @@ async fn test_concurrent_challenge_operations() {
     );
 }
 
-// ─── 4. Router: ACME challenge interception ───────────────────────────────────
-
 #[tokio::test]
 async fn test_router_intercepts_acme_challenge() {
     let token = "router-intercept-tok".to_string();
@@ -148,26 +118,17 @@ async fn test_router_intercepts_acme_challenge() {
 
     let resp = router.handle_request(req).await;
 
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "challenge path must return 200"
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.headers()
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|h| h.to_str().ok()),
         Some("text/plain"),
-        "challenge response must have text/plain content type"
     );
 
     use http_body_util::BodyExt;
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(
-        body_bytes,
-        Bytes::from(auth),
-        "challenge body must equal the registered key authorization"
-    );
+    assert_eq!(body_bytes, Bytes::from(auth));
 
     unregister_challenge(&token);
 }
@@ -182,12 +143,7 @@ async fn test_router_challenge_not_registered_falls_through_to_404() {
         .unwrap();
 
     let resp = router.handle_request(req).await;
-    // No challenge registered → should fall through to normal routing → 404.
-    assert_eq!(
-        resp.status(),
-        StatusCode::NOT_FOUND,
-        "unregistered challenge token must return 404"
-    );
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -208,8 +164,6 @@ async fn test_router_normal_routes_not_affected_by_acme() {
     let resp = router.handle_request(req).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
-
-// ─── 5. ACME challenge served via in-process HTTP server ─────────────────────
 
 #[tokio::test]
 async fn test_acme_challenge_served_over_http() {
@@ -254,8 +208,6 @@ async fn test_acme_challenge_served_over_http() {
     unregister_challenge(&token);
 }
 
-// ─── 6. AcmeResolver: hot-swap and initial state ─────────────────────────────
-
 #[test]
 fn test_acme_resolver_starts_without_cert() {
     let resolver = AcmeResolver::new();
@@ -271,7 +223,6 @@ fn test_acme_resolver_update_cert_makes_has_certificate_true() {
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
     use rustls::sign::CertifiedKey;
 
-    // Generate a minimal self-signed cert for testing.
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
@@ -295,22 +246,9 @@ fn test_acme_resolver_update_cert_makes_has_certificate_true() {
 }
 
 #[test]
-fn test_acme_resolver_implements_resolves_server_cert() {
-    use rustls::server::ResolvesServerCert;
-
-    // Ensures the trait is implemented (compilation test).
-    let resolver = std::sync::Arc::new(AcmeResolver::new());
-    let _: &dyn ResolvesServerCert = resolver.as_ref();
-}
-
-// ─── 7. AcmeManager: cache directory creation ────────────────────────────────
-
-#[test]
 fn test_acme_manager_creates_cache_dir() {
     let dir = tempfile::tempdir().unwrap();
     let cache = dir.path().join("nested").join("acme");
-
-    // Cache directory does not exist yet.
     assert!(!cache.exists());
 
     let _manager = AcmeManager::new(
@@ -326,54 +264,6 @@ fn test_acme_manager_creates_cache_dir() {
     );
 }
 
-// ─── 8. AcmeManager: loading a valid cached certificate ──────────────────────
-
-#[tokio::test]
-async fn test_acme_manager_loads_valid_cached_cert() {
-    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
-
-    let dir = tempfile::tempdir().unwrap();
-    let cache_dir = dir.path().to_path_buf();
-
-    // Create a self-signed cert with a 90-day validity window.
-    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-
-    // Set validity: 2025-01-01 to 2026-12-31 (well in the future).
-    let not_before = rcgen::date_time_ymd(2025, 1, 1);
-    let not_after = rcgen::date_time_ymd(2026, 12, 31);
-    params.not_before = not_before;
-    params.not_after = not_after;
-
-    let cert = params.self_signed(&key_pair).unwrap();
-
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-
-    std::fs::write(cache_dir.join("domain.crt"), &cert_pem).unwrap();
-    std::fs::write(cache_dir.join("domain.key"), &key_pem).unwrap();
-
-    let manager = AcmeManager::new(
-        &cache_dir,
-        vec!["localhost".to_string()],
-        "test@localhost".to_string(),
-        true,
-    );
-
-    // The manager should load from cache without errors.
-    let resolver = manager.resolver();
-    // Manually trigger the cache load logic.
-    let _ = manager.resolver(); // returns Arc<AcmeResolver>
-    // The resolver has no cert yet until `start()` fires — that requires a network call.
-    // We just verify the manager was created and the resolver is accessible.
-    assert!(
-        !resolver.has_certificate(),
-        "resolver has no cert before background loop fires"
-    );
-}
-
-// ─── 9. AcmeManager: missing cache returns Ok(false) ─────────────────────────
-
 #[test]
 fn test_acme_manager_resolver_is_arc() {
     let dir = tempfile::tempdir().unwrap();
@@ -387,53 +277,47 @@ fn test_acme_manager_resolver_is_arc() {
     let resolver1 = manager.resolver();
     let resolver2 = manager.resolver();
 
-    // Both should point to the same underlying allocation (same Arc address).
     assert!(
         std::sync::Arc::ptr_eq(&resolver1, &resolver2),
         "resolver() must return the same Arc instance on every call"
     );
 }
 
-// ─── 10. AcmeError: Display formatting ───────────────────────────────────────
-
 #[test]
 fn test_acme_error_display() {
-    let io_err = AcmeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
-    assert!(io_err.to_string().contains("I/O error"));
+    let cases: [(AcmeError, &str); 5] = [
+        (
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied").into(),
+            "I/O error",
+        ),
+        (
+            serde_json::from_slice::<serde_json::Value>(b"{{invalid}}")
+                .unwrap_err()
+                .into(),
+            "JSON error",
+        ),
+        (AcmeError::OrderInvalid, "rejected"),
+        (AcmeError::MissingPrivateKey, "private key"),
+        (
+            AcmeError::CertParse("invalid DER".to_string()),
+            "Certificate parse",
+        ),
+    ];
 
-    let order_invalid = AcmeError::OrderInvalid;
-    assert!(order_invalid.to_string().contains("rejected"));
+    for (err, expected) in cases {
+        let msg = err.to_string();
+        assert!(msg.contains(expected), "{msg} should mention {expected}");
+    }
 
-    let missing_key = AcmeError::MissingPrivateKey;
-    assert!(missing_key.to_string().contains("private key"));
-
-    let tls_load = AcmeError::TlsKeyLoad("bad key".to_string());
-    assert!(tls_load.to_string().contains("TLS signing key"));
-
-    let cert_parse = AcmeError::CertParse("invalid DER".to_string());
-    assert!(cert_parse.to_string().contains("Certificate parse"));
+    assert!(
+        AcmeError::TlsKeyLoad("bad key".to_string())
+            .to_string()
+            .contains("TLS signing key")
+    );
 }
-
-#[test]
-fn test_acme_error_from_io() {
-    let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-    let acme_err: AcmeError = io.into();
-    assert!(acme_err.to_string().contains("I/O error"));
-}
-
-#[test]
-fn test_acme_error_from_json() {
-    let bad_json = b"{{invalid}}";
-    let json_err = serde_json::from_slice::<serde_json::Value>(bad_json).unwrap_err();
-    let acme_err: AcmeError = json_err.into();
-    assert!(acme_err.to_string().contains("JSON error"));
-}
-
-// ─── 11. Challenge path prefix variations ─────────────────────────────────────
 
 #[tokio::test]
 async fn test_challenge_empty_token_not_served() {
-    // An empty token after stripping the prefix should not match a registered challenge.
     let router = Router::new().with_state::<()>(());
 
     let req = Request::builder()
@@ -442,7 +326,6 @@ async fn test_challenge_empty_token_not_served() {
         .unwrap();
 
     let resp = router.handle_request(req).await;
-    // Empty token ⇒ not in the map ⇒ 404.
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -450,8 +333,6 @@ async fn test_challenge_empty_token_not_served() {
 async fn test_challenge_path_prefix_not_intercepted_as_challenge() {
     use tachyon_web::get;
 
-    // A path that *starts with* the well-known prefix but then continues beyond a token
-    // should still be correctly resolved or fall through.
     async fn custom() -> &'static str {
         "custom"
     }
@@ -459,7 +340,6 @@ async fn test_challenge_path_prefix_not_intercepted_as_challenge() {
         .route("/.well-known/acme-challenge/custom", get(custom))
         .with_state::<()>(());
 
-    // Register a different token to ensure it doesn't collide.
     register_challenge("other-token".to_string(), "other-auth".to_string());
 
     let req = Request::builder()
@@ -467,8 +347,8 @@ async fn test_challenge_path_prefix_not_intercepted_as_challenge() {
         .body(Body::empty())
         .unwrap();
 
+    // "custom" isn't in the challenge store, so it falls through to the registered route.
     let resp = router.handle_request(req).await;
-    // "custom" is not in the challenge store → falls through to the registered route.
     assert_eq!(resp.status(), StatusCode::OK);
 
     unregister_challenge("other-token");

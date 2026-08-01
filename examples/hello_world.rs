@@ -1,5 +1,4 @@
-//! A complete example demonstrating basic routing,
-//! path/query parameter extraction, JSON payloads, and custom responses.
+//! Routing, path/query extraction, JSON payloads, custom status codes.
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -10,8 +9,6 @@ use tachyon_web::{
     response::{Html, IntoResponse},
     routing::{get, post},
 };
-
-// ─── Data Models ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
@@ -38,24 +35,18 @@ struct UserResponse {
     status: &'static str,
 }
 
-// ─── Route Handlers ───────────────────────────────────────────────────────────
-
-/// Simple index page returning HTML.
 async fn index() -> Html<&'static str> {
     Html("<h1>Welcome to Tachyon-Web!</h1><p>Check out the rest of the endpoints.</p>")
 }
 
-/// Dynamic greeting using a path parameter.
 async fn greet(Path(name): Path<String>) -> String {
     format!("Hello, {name}!")
 }
 
-/// Search endpoint demonstrating query parameters.
 async fn search(Query(query): Query<SearchQuery>) -> impl IntoResponse {
     format!("Search results for: '{}' (limit: {})", query.q, query.limit)
 }
 
-/// Create user endpoint demonstrating JSON body extraction and responses.
 async fn create_user(Json(payload): Json<CreateUserRequest>) -> impl IntoResponse {
     let user = UserResponse {
         id: 42,
@@ -64,15 +55,11 @@ async fn create_user(Json(payload): Json<CreateUserRequest>) -> impl IntoRespons
         status: "active",
     };
 
-    // Return custom status code 201 Created alongside the JSON body.
     (StatusCode::CREATED, Json(user))
 }
 
-// ─── Main Server Entrypoint ───────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Build our Router using pure, simplified Axum-style routing
     let app = Router::new()
         .route("/", get(index))
         .route("/hello/:name", get(greet))
@@ -80,9 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/api/users", post(create_user));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-    println!("🚀 Tachyon server running at http://{addr}");
+    println!("listening on http://{addr}");
 
-    // Bind listener and run the server
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tachyon_web::serve(listener, app).await?;
 

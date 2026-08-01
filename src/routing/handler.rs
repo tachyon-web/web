@@ -1,9 +1,7 @@
-//! Handler trait and its implementations for async functions of various arities.
+//! [`Handler`] and its impls for functions of 0 to 16 extractors.
 //!
-//! This module provides the `Handler` trait, which is implemented automatically for
-//! `async fn`s with 0 to 16 extractors. The macro-generated impls are repetitive by
-//! necessity – Rust has no variadic generics yet – but are confined here to keep
-//! `routing/mod.rs` focused on routing logic.
+//! The impls are macro-generated and repetitive — no variadic generics — and live here rather
+//! than in `routing/mod.rs` for that reason.
 
 use hyper::{Request, Response};
 use std::future::Future;
@@ -64,35 +62,24 @@ pub struct AsyncHandler<T>(std::marker::PhantomData<T>);
 #[derive(Debug)]
 pub struct SyncHandler<T>(std::marker::PhantomData<T>);
 
-/// Trait for types that can handle an HTTP request.
+/// Blanket-implemented for `async fn`s (marked `AsyncHandler`) and for sync `fn`s and closures
+/// (marked `SyncHandler`).
 ///
-/// This is blanket-implemented for both `async fn`s (which are marked with `AsyncHandler`) and
-/// synchronous `fn`/closures (which are marked with `SyncHandler`).
+/// Arity-0 handlers take a fast path: a sync one returns `ResponseFuture::Ready` with no box
+/// allocation, and an async one is polled once eagerly, falling back to `ResponseFuture::Boxed`
+/// only if it actually yields. The eagerly-polled future is kept and reused rather than
+/// re-invoked, so side effects before the first `.await` still run exactly once.
 ///
-/// # Performance & Zero-Allocation Routing
-/// - **Arity-0 handlers** (no extractors) take the fast path: synchronous ones return
-///   `ResponseFuture::Ready` directly with zero box allocations; async ones are eagerly
-///   polled once (the same future instance is kept and reused if it turns out to be
-///   pending, never re-invoked, so any side effects before the first `.await` still run
-///   exactly once) and only fall back to a boxed future (`ResponseFuture::Boxed`) if they
-///   actually yield (i.e. genuinely await something).
-/// - **Handlers with ≥1 extractor** always go through `ResponseFuture::Boxed`, sync or async.
-///   This is because the last extractor implements [`FromRequest`], which is `async` (bodies
-///   may be streamed in rather than already buffered — see [`crate::routing::extract::BodyStream`]),
-///   so it can't be resolved before deciding `Ready` vs. `Boxed`.
+/// Anything with at least one extractor is always boxed: the last extractor implements
+/// [`FromRequest`], which is async because the body may still be streaming (see
+/// [`crate::routing::extract::BodyStream`]), so `Ready` vs `Boxed` can't be decided up front.
 ///
-/// # ⚠️ Thread Starvation & Blocking Warning
-/// Because Tachyon runs on a cooperative async thread pool (Tokio), blocking any worker thread
-/// with long-running synchronous code (e.g. `std::fs::read` or blocking database calls) will stall the event loop.
-/// - **DO**: Use sync handlers ONLY for instant CPU operations (e.g., formatting data, static templates, or simple state reads).
-/// - **DON'T**: Do heavy or blocking I/O synchronously inside sync handlers. Instead, use async versions or offload
-///   blocking calls to `tokio::task::spawn_blocking`.
+/// A sync handler runs on the Tokio worker that picked up the request. Blocking inside one
+/// stalls that worker — keep them to instant CPU work, and use `spawn_blocking` for I/O.
 pub trait Handler<T, S>: Clone + Send + Sync + 'static {
     /// Consume `self` and produce a future that resolves to the response.
     fn call(self, req: Request<Body>, state: Arc<S>) -> BoxedFuture;
 }
-
-// ─── arity 0 ─────────────────────────────────────────────────────────────────
 
 // Async version
 impl<F, Fut, S, Res> Handler<AsyncHandler<()>, S> for F
@@ -134,8 +121,6 @@ where
         ResponseFuture::Ready(Some(self().into_response()))
     }
 }
-
-// ─── arities 1-8 (macro-generated) ──────────────────────────────────────────
 
 macro_rules! impl_handler {
     ( $($ty:ident),* ; $last:ident ) => {

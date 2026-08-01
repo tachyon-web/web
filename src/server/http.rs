@@ -123,7 +123,7 @@ async fn accept_tuned(
             Some((stream, peer))
         }
         Err(e) => {
-            tracing::error!("[{log_tag}] Accept error: {e}");
+            tracing::error!("[{log_tag}] accept error: {e}");
             if crate::server::is_resource_exhaustion(&e) {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -248,7 +248,7 @@ where
                 #[cfg(all(feature = "http2", not(feature = "http1")))]
                 let result = builder.serve_connection(io, svc).await;
                 if let Err(e) = result {
-                    tracing::debug!("[http] Connection error: {}", e);
+                    tracing::debug!("[http] connection error: {}", e);
                 }
                 drop(permit);
             };
@@ -294,12 +294,12 @@ where
                     {
                         Ok(Ok(stream)) => stream,
                         Ok(Err(e)) => {
-                            tracing::debug!("[https] TLS handshake error: {}", e);
+                            tracing::debug!("[https] tls handshake error: {}", e);
                             drop(permit);
                             return;
                         }
                         Err(_) => {
-                            tracing::debug!("[https] TLS handshake timed out");
+                            tracing::debug!("[https] tls handshake timed out");
                             drop(permit);
                             return;
                         }
@@ -322,7 +322,7 @@ where
                     let mut builder = hyper::server::conn::http2::Builder::new(LocalExecutor);
                     tune_http2!(builder);
                     if let Err(e) = builder.serve_connection(io, svc).await {
-                        tracing::debug!("[https] HTTP/2 Connection error: {}", e);
+                        tracing::debug!("[https] http/2 connection error: {}", e);
                     }
                     drop(permit);
                     return;
@@ -340,7 +340,7 @@ where
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     tune_http1!(builder);
                     if let Err(e) = builder.serve_connection(io, svc).with_upgrades().await {
-                        tracing::debug!("[https] HTTP/1.1 Connection error: {}", e);
+                        tracing::debug!("[https] http/1.1 connection error: {}", e);
                     }
                 }
                 drop(permit);

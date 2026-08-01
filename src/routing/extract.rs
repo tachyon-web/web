@@ -153,7 +153,7 @@ impl DefaultBodyLimit {
 /// [`DefaultBodyLimit::into_middleware`]'s returned closure.
 type BoxedResponseFuture = std::pin::Pin<Box<dyn Future<Output = hyper::Response<Body>> + Send>>;
 
-/// Helper trait to obtain sub-state from app state.
+/// Derives sub-state from the app state, matching `axum::extract::FromRef`.
 pub trait FromRef<S> {
     /// Extract a reference/clone from the parent state.
     fn from_ref(state: &S) -> Self;

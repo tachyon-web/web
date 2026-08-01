@@ -19,8 +19,6 @@ use tachyon_i2p::I2pRouter;
 use tachyon_web::Router;
 use tachyon_web::server::i2p::I2pConfig;
 
-// ─── I2pConfig builder contract ────────────────────────────────────────────────
-
 #[test]
 fn i2p_config_defaults_are_plaintext_no_on_ready() {
     let config = I2pConfig::new("my-nickname");
@@ -48,8 +46,6 @@ fn i2p_config_builder_methods_chain_in_any_order() {
     assert_eq!(config.nickname(), "chained");
     assert!(config.tls_enabled());
 }
-
-// ─── Full round-trip (ignored by default — needs live I2P network egress) ─────
 
 /// Publishes a real eepsite serving a tiny [`Router`], connects to it from a second, transient
 /// destination sharing the same [`I2pRouter`], and asserts the HTTP response round-trips

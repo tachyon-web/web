@@ -1,7 +1,7 @@
-#[cfg(any(feature = "http1", feature = "cert-gen"))]
-use crate::common::{free_loopback_addr, wait_until_listening};
 #[cfg(feature = "cert-gen")]
 use crate::common::tls_client;
+#[cfg(any(feature = "http1", feature = "cert-gen"))]
+use crate::common::{free_loopback_addr, wait_until_listening};
 #[cfg(feature = "http1")]
 use bytes::Bytes;
 #[cfg(feature = "http1")]
@@ -30,7 +30,12 @@ fn self_signed_config(alpn: &[&[u8]]) -> rustls::ServerConfig {
 
 /// Waits for `addr` to come up, then asserts a request to it answers `200` with `expected`.
 #[cfg(any(feature = "http1", feature = "cert-gen"))]
-async fn assert_serves(client: &reqwest::Client, url: &str, addr: std::net::SocketAddr, expected: &str) {
+async fn assert_serves(
+    client: &reqwest::Client,
+    url: &str,
+    addr: std::net::SocketAddr,
+    expected: &str,
+) {
     wait_until_listening(addr).await;
     let res = client.get(url).send().await.expect("request");
     assert_eq!(res.status(), 200);
@@ -130,15 +135,6 @@ async fn test_server_ignores_unread_body_for_bodyless_handler() {
     server_handle.abort();
 }
 
-// ─── Convenience address/string entry points (`start_http_addr`/`start_http`/
-// `start_https_with_config_addr`/`start_https_with_config`/`start_https_and_h3_with_config`)
-// and the top-level `serve()`/`bind_rustls().serve()` helpers ──────────────────────────────
-//
-// These wrap the lower-level `serve_http`/`serve_https`/`serve_https_config` methods that the
-// rest of this file already exercises against a pre-bound `TcpListener` — the tests below only
-// need to prove the address-parsing/binding/QUIC-setup convenience layer on top actually works,
-// so they stay minimal (one request each) rather than re-testing HTTP semantics again.
-
 #[cfg(feature = "http1")]
 #[tokio::test]
 async fn test_start_http_addr() {
@@ -149,7 +145,13 @@ async fn test_start_http_addr() {
         let _ = server.start_http_addr(addr).await;
     });
 
-    assert_serves(&reqwest::Client::new(), &format!("http://{addr}/"), addr, "ok-addr").await;
+    assert_serves(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/"),
+        addr,
+        "ok-addr",
+    )
+    .await;
     handle.abort();
 }
 
@@ -164,7 +166,13 @@ async fn test_start_http_with_address_string() {
         let _ = server.start_http(&addr_str).await;
     });
 
-    assert_serves(&reqwest::Client::new(), &format!("http://{addr}/"), addr, "ok-str").await;
+    assert_serves(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/"),
+        addr,
+        "ok-str",
+    )
+    .await;
     handle.abort();
 }
 
@@ -191,7 +199,13 @@ async fn test_start_https_with_config_addr() {
             .await;
     });
 
-    assert_serves(&tls_client(), &format!("https://{addr}/"), addr, "ok-https-addr").await;
+    assert_serves(
+        &tls_client(),
+        &format!("https://{addr}/"),
+        addr,
+        "ok-https-addr",
+    )
+    .await;
     handle.abort();
 }
 
@@ -209,7 +223,13 @@ async fn test_start_https_with_config_string() {
             .await;
     });
 
-    assert_serves(&tls_client(), &format!("https://{addr}/"), addr, "ok-https-str").await;
+    assert_serves(
+        &tls_client(),
+        &format!("https://{addr}/"),
+        addr,
+        "ok-https-str",
+    )
+    .await;
     handle.abort();
 }
 
@@ -264,7 +284,13 @@ async fn test_free_serve_function() {
         let _ = tachyon_web::serve(listener, router).await;
     });
 
-    assert_serves(&reqwest::Client::new(), &format!("http://{addr}/"), addr, "ok-serve-fn").await;
+    assert_serves(
+        &reqwest::Client::new(),
+        &format!("http://{addr}/"),
+        addr,
+        "ok-serve-fn",
+    )
+    .await;
     handle.abort();
 }
 
@@ -285,7 +311,13 @@ async fn test_bind_rustls_https_server_serve() {
         let _ = tachyon_web::bind_rustls(addr, config).serve(router).await;
     });
 
-    assert_serves(&tls_client(), &format!("https://{addr}/"), addr, "ok-bind-rustls").await;
+    assert_serves(
+        &tls_client(),
+        &format!("https://{addr}/"),
+        addr,
+        "ok-bind-rustls",
+    )
+    .await;
     handle.abort();
 }
 

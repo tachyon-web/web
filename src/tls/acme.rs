@@ -1,24 +1,11 @@
-//! ACME (Automatic Certificate Management Environment) native manager for Let's Encrypt.
+//! In-process ACME client for Let's Encrypt: account setup, HTTP-01 issuance, and renewal.
 //!
-//! This module orchestrates the full TLS certificate lifecycle automatically:
-//!
-//! - **Account management**: Creates or reuses a cached Let's Encrypt account per environment
-//!   (staging vs production). Account credentials are serialized to disk so that re-running
-//!   the server never creates duplicate accounts and avoids hitting ACME registration limits.
-//!
-//! - **Certificate provisioning**: Performs the HTTP-01 challenge flow entirely in-process —
-//!   no external CLI tools required. Challenge tokens are served via the built-in HTTP redirect
-//!   listener used by [`crate::server::Server::serve_all_acme`].
-//!
-//! - **Hot-reload**: The [`AcmeResolver`] implements [`rustls::server::ResolvesServerCert`],
-//!   meaning the TLS stack picks up renewed certificates without any downtime or restart.
-//!
-//! - **Automatic renewal**: A background task wakes up every 24 hours and renews certificates
-//!   that expire within 30 days. Renewal uses exponential backoff on failure to avoid
-//!   hammering the Let's Encrypt rate-limit window.
-//!
-//! - **Rate-limit safety**: Certificates and account credentials are cached to disk. On startup
-//!   the cached cert is loaded and validated before ever contacting Let's Encrypt.
+//! Accounts are cached to disk per environment (staging vs production) so restarts reuse the
+//! same registration. Challenge tokens are answered by the HTTP listener
+//! [`crate::server::Server::serve_all_acme`] binds; no external CLI is involved. [`AcmeResolver`]
+//! implements [`rustls::server::ResolvesServerCert`], so a renewed certificate swaps in without
+//! a restart. A background task checks every 24 hours and renews inside the 30-day window,
+//! backing off exponentially on failure to stay clear of the rate limits.
 
 use std::collections::HashMap;
 use std::fs;
@@ -61,12 +48,8 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
     file.write_all(contents)
 }
 
-// ─── Global challenge store ──────────────────────────────────────────────────
-
-/// Global map of active HTTP-01 challenges: `token → key_authorization`.
-///
-/// Uses an `RwLock`-protected `HashMap` so that many concurrent HTTPS requests
-/// can read challenge responses lock-free during the brief provisioning window.
+/// Active HTTP-01 challenges, `token → key_authorization`. Read-mostly: contended only
+/// during the brief provisioning window.
 static ACTIVE_CHALLENGES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
 
 #[inline]
@@ -81,7 +64,7 @@ pub fn register_challenge(token: String, key_authorization: String) {
     if let Ok(mut map) = challenges().write() {
         let _ = map.insert(token, key_authorization);
     } else {
-        error!("[acme] Failed to acquire write lock for challenge registration");
+        error!("[acme] failed to acquire write lock for challenge registration");
     }
 }
 
@@ -104,8 +87,6 @@ pub fn get_challenge(token: &str) -> Option<String> {
         .ok()
         .and_then(|map| map.get(token).cloned())
 }
-
-// ─── AcmeResolver ────────────────────────────────────────────────────────────
 
 /// Dynamic `rustls` certificate resolver that serves the most recently provisioned
 /// certificate during every TLS handshake.
@@ -142,9 +123,9 @@ impl AcmeResolver {
         match self.current_key.write() {
             Ok(mut lock) => {
                 *lock = Some(Arc::new(certified_key));
-                info!("[acme] Certificate hot-swapped into TLS resolver");
+                info!("[acme] certificate hot-swapped into TLS resolver");
             }
-            Err(e) => error!("[acme] Failed to update certificate in resolver: {e}"),
+            Err(e) => error!("[acme] failed to update certificate in resolver: {e}"),
         }
     }
 
@@ -171,8 +152,6 @@ impl ResolvesServerCert for AcmeResolver {
         self.current_key.read().ok()?.clone()
     }
 }
-
-// ─── AcmeError ───────────────────────────────────────────────────────────────
 
 /// Errors that can occur during ACME certificate management.
 #[derive(Debug)]
@@ -233,8 +212,6 @@ impl From<serde_json::Error> for AcmeError {
     }
 }
 
-// ─── AcmeManager ─────────────────────────────────────────────────────────────
-
 /// The central orchestrator for automatic Let's Encrypt TLS certificate management.
 ///
 /// # Usage
@@ -281,8 +258,8 @@ pub struct AcmeManager {
     cache_dir: PathBuf,
     is_staging: bool,
     resolver: Arc<AcmeResolver>,
-    /// Guard to prevent concurrent provisioning runs.
-    /// Uses `tokio::sync::Mutex` so the guard is `Send` across async await points.
+    /// Serializes provisioning runs. `tokio::sync::Mutex` because the guard is held across
+    /// awaits.
     provisioning: tokio::sync::Mutex<()>,
 }
 
@@ -296,21 +273,13 @@ const BACKOFF_INITIAL: Duration = Duration::from_mins(5);
 const BACKOFF_MAX: Duration = Duration::from_hours(6);
 
 impl AcmeManager {
-    /// Creates a new `AcmeManager` and ensures the cache directory exists.
+    /// Creates an `AcmeManager`, creating `cache_dir` if it does not exist.
     ///
-    /// # Arguments
-    /// - `cache_dir`: Directory used for storing account credentials and the certificate/key pair.
-    ///   Must be writable by the process. Survives across server restarts.
-    /// - `domains`: The domain names to include in the certificate as Subject Alternative
-    ///   Names. The issued certificate has no Subject/CN set — TLS clients validate against
-    ///   the SAN list, not the (legacy, deprecated) CN field.
-    /// - `email`: Contact address sent to Let's Encrypt. Used for expiry warnings.
-    /// - `is_staging`: If `true`, targets `acme-staging-v02.api.letsencrypt.org` instead of
-    ///   production. Staging issues untrusted certificates but has much more lenient rate limits.
-    ///
-    /// # Returns
-    /// An `Arc<AcmeManager>` so it can be cheaply shared between the background renewal
-    /// task and the calling code that needs the [`resolver`][Self::resolver].
+    /// `cache_dir` holds the account credentials and the certificate/key pair and must be
+    /// writable; keeping it across restarts is what avoids re-registering. `domains` become the
+    /// certificate's SANs — no Subject/CN is set, since clients validate against SANs. Setting
+    /// `is_staging` targets `acme-staging-v02.api.letsencrypt.org`: untrusted certificates,
+    /// much looser rate limits.
     pub fn new(
         cache_dir: impl Into<PathBuf>,
         domains: Vec<String>,
@@ -320,7 +289,7 @@ impl AcmeManager {
         let cache_dir = cache_dir.into();
         if let Err(e) = fs::create_dir_all(&cache_dir) {
             error!(
-                "[acme] Failed to create cache directory {:?}: {e}",
+                "[acme] failed to create cache directory {:?}: {e}",
                 cache_dir
             );
         }
@@ -385,11 +354,11 @@ impl AcmeManager {
                     false
                 }
                 Ok(false) => {
-                    info!("[acme] No valid cached certificate — provisioning new one");
+                    info!("[acme] no valid cached certificate, provisioning a new one");
                     true
                 }
                 Err(e) => {
-                    warn!("[acme] Error loading cached certificate: {e}");
+                    warn!("[acme] error loading cached certificate: {e}");
                     true
                 }
             };
@@ -397,7 +366,7 @@ impl AcmeManager {
             if needs_provisioning {
                 match self.provision_cert().await {
                     Ok((certs, key)) => {
-                        info!("[acme] Successfully provisioned new certificate from Let's Encrypt");
+                        info!("[acme] provisioned new certificate");
                         match Self::build_certified_key(certs, key) {
                             Ok(certified_key) => {
                                 self.resolver.update_cert(certified_key);
@@ -482,7 +451,7 @@ impl AcmeManager {
     fn check_cert_expiry(certs: &[CertificateDer<'static>]) -> Option<SystemTime> {
         let first = certs.first()?;
         min_der::parse_not_after(first.as_ref())
-            .inspect_err(|e| warn!("[acme] Failed to parse cached certificate: {e}"))
+            .inspect_err(|e| warn!("[acme] failed to parse cached certificate: {e}"))
             .ok()
     }
 
@@ -564,8 +533,7 @@ impl AcmeManager {
     async fn provision_cert(
         &self,
     ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), AcmeError> {
-        // Prevent concurrent provisioning attempts. tokio::sync::Mutex is used here
-        // because std::sync::MutexGuard is not Send across .await points.
+        // Guard is held across awaits, hence tokio's Mutex.
         let _guard = self.provisioning.lock().await;
 
         let directory_url = if self.is_staging {
@@ -574,10 +542,9 @@ impl AcmeManager {
             "https://acme-v02.api.letsencrypt.org/directory"
         };
 
-        // 1. Load or create an ACME account (scoped to staging vs production).
+        // Account is scoped to staging vs production.
         let account = self.get_or_create_account(directory_url).await?;
 
-        // 2. Create a new order for all configured domains.
         let identifiers: Vec<Identifier> = self
             .domains
             .iter()
@@ -586,7 +553,6 @@ impl AcmeManager {
         let new_order = NewOrder::new(&identifiers);
         let mut order = account.new_order(&new_order).await?;
 
-        // 3. Complete all HTTP-01 authorizations.
         let mut tokens_to_unregister: Vec<String> = Vec::new();
         {
             let mut auths = order.authorizations();
@@ -609,7 +575,6 @@ impl AcmeManager {
             }
         }
 
-        // 4. Poll until the order is valid (or failed).
         let status = order
             .poll_ready(&instant_acme::RetryPolicy::default())
             .await?;
@@ -623,26 +588,21 @@ impl AcmeManager {
             return Err(AcmeError::OrderInvalid);
         }
 
-        // 5. Generate a new ECDSA P-256 key pair and CSR for the certificate.
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let cert_params = CertificateParams::new(self.domains.clone())?;
         let csr = cert_params.serialize_request(&key_pair)?;
 
-        // 6. Finalize the order by submitting the CSR.
         order.finalize_csr(csr.der().as_ref()).await?;
 
-        // 7. Download the signed certificate chain from the CA.
         let cert_chain_pem = order
             .poll_certificate(&instant_acme::RetryPolicy::default())
             .await?;
         let private_key_pem = key_pair.serialize_pem();
 
-        // 8. Persist to disk for future restarts.
         if let Err(e) = self.save_certs_and_key(&cert_chain_pem, &private_key_pem) {
-            error!("[acme] Failed to persist certificate to cache directory: {e}");
+            error!("[acme] failed to persist certificate to cache directory: {e}");
         }
 
-        // 9. Parse PEM → DER for immediate use in rustls.
         let certs: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_chain_pem.as_bytes());
         let key = crate::tls::pem::private_key(private_key_pem.as_bytes())
             .map_err(|_| AcmeError::MissingPrivateKey)?;
@@ -668,7 +628,7 @@ impl AcmeManager {
                             let builder = Account::builder()?;
                             match builder.from_credentials(creds).await {
                                 Ok(account) => {
-                                    info!("[acme] Reusing cached ACME account ({env_suffix})");
+                                    info!("[acme] reusing cached account ({env_suffix})");
                                     return Ok(account);
                                 }
                                 Err(e) => {
@@ -678,15 +638,15 @@ impl AcmeManager {
                                 }
                             }
                         }
-                        Err(e) => warn!("[acme] Failed to parse cached account credentials: {e}"),
+                        Err(e) => warn!("[acme] failed to parse cached account credentials: {e}"),
                     }
                 }
-                Err(e) => warn!("[acme] Failed to read account credentials file: {e}"),
+                Err(e) => warn!("[acme] failed to read account credentials file: {e}"),
             }
         }
 
         // Create a new ACME account.
-        info!("[acme] Registering new ACME account with Let's Encrypt ({env_suffix})");
+        info!("[acme] registering new account ({env_suffix})");
         let contact = [format!("mailto:{}", self.email)];
         let contact_refs: Vec<&str> = contact.iter().map(String::as_str).collect();
         let builder = Account::builder()?;
@@ -706,7 +666,7 @@ impl AcmeManager {
         // provisioning can still succeed; we'll just re-register next restart.
         let creds_bytes = serde_json::to_vec(&creds)?;
         if let Err(e) = write_private_file(&account_path, &creds_bytes) {
-            warn!("[acme] Failed to cache account credentials: {e}");
+            warn!("[acme] failed to cache account credentials: {e}");
         }
 
         Ok(account)

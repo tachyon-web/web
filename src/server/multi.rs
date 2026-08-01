@@ -91,7 +91,7 @@ where
     }
 
     /// Adds an I2P `.b32.i2p` eepsite transport — see [`Server::serve_i2p_config`]. Requires
-    /// the `i2p` feature ([⚠️ breaks `forbid(unsafe_code)`](super::i2p)).
+    /// the `i2p` feature ([breaks `forbid(unsafe_code)`](super::i2p)).
     #[cfg(feature = "i2p")]
     pub fn with_i2p(mut self, config: super::i2p::I2pConfig) -> Self {
         self.transports.push(Transport::I2p(config));
