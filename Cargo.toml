@@ -73,7 +73,7 @@ tor-guardmgr = { version = "0.44", default-features = false, features = ["vangua
 tor-config = { version = "0.44", default-features = false, optional = true }
 
 # Optional native .i2p eepsite support (see the `i2p` feature).
-tachyon-i2p = { version = "0.0.2", optional = true, default-features = false }
+tachyon-i2p = { version = "0.0.4", optional = true, default-features = false }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "cookies", "form"] }
@@ -88,7 +88,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 [features]
 default = [
     "json", "matched-path", "original-uri",
-    "http1", "http2", "tower-log", "form", "query", "cookies",
+    "http1", "http2", "tower-log", "form", "query",
 ]
 
 # Axum-parity features

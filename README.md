@@ -5,12 +5,12 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](#minimum-supported-rust-version)
 
-A multi-protocol web framework for Rust, built on [`hyper`](https://docs.rs/hyper) and
-[`s2n-quic`](https://docs.rs/s2n-quic): Axum's router and extractor API, per-core
+A multi-protocol web framework for Rust, built on [`hyper`](https://crates.io/crates/hyper) and
+[`s2n-quic`](https://crates.io/crates/s2n-quic): Axum's router and extractor API, per-core
 `SO_REUSEPORT` workers, and HTTP/1.1, h2c, HTTP/2, HTTP/3, Let's Encrypt, Tor and I2P all
 in one crate rather than five.
 
-## Read this before depending on it
+## ⚠️ Read this before depending on it
 
 This is `0.0.x` — there has not been a release anyone should call stable.
 
@@ -69,8 +69,8 @@ existing `tower-http` layer is worth that cost, and also implements `tower::Serv
 On performance: routing allocates nothing for the common case (arity-0 handlers, no path
 params), static files are served zero-copy from an in-memory cache, and workers are per-core
 with `SO_REUSEPORT`. `benches/` measures against Axum and Actix-Web directly. Actix is still
-ahead on the trivial-handler benchmark — roughly 340k vs 300k req/sec on the same hardware,
-see `benches/optimistic`.
+ahead on the trivial-handler benchmark — roughly 320k (Actix-Web) vs 300k (Tachyon-Web) vs 280k (Axum) 
+req/sec on the same hardware, see `benches/optimistic`.
 
 ## HTTPS
 
@@ -169,13 +169,13 @@ Flags shared with Axum keep Axum's name and default:
 | Flag | Default | Enables |
 |---|---|---|
 | `http1` | on | hyper's `http1` support |
-| `http2` | on | hyper's `http2` support. Over plain TCP this is cleartext HTTP/2 ("h2c" — `serve_http` detects the connection preface, no ALPN or TLS needed); over TLS it's negotiated via ALPN. Axum ships this off by default; Tachyon ships it on, since zero-config h2c is a deliberate difference |
+| `http2` | on | hyper's `http2` support |
 | `json` | on | the `Json` extractor/response type, and `serde_json` |
 | `matched-path` | on | capturing each request's router path, and the `MatchedPath` extractor |
 | `original-uri` | on | capturing each request's original URI, and the `OriginalUri` extractor |
 | `form` | on | the `Form` extractor |
 | `query` | on | the `Query` extractor |
-| `cookies` | on | request `Cookie` parsing and the `Cookies` extractor/`IntoResponseParts` jar (matching `axum-extra`'s `CookieJar`), and the `cookie` dependency |
+| `cookies` | | request `Cookie` parsing and the `Cookies` extractor/`IntoResponseParts` jar (matching `axum-extra`'s `CookieJar`), and the `cookie` dependency |
 | `tower-log` | on | `tower`'s own `log` feature; no effect without `tower` |
 | `ws` | | WebSocket support (RFC 6455) |
 
@@ -194,14 +194,6 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `i2p` | | I2P `.b32.i2p` support (`Server::serve_i2p`/`serve_i2p_config`) via an embedded `libi2pd`. Links `unsafe` FFI — see [Tor and I2P](#tor-and-i2p) |
 
 At least one of `http1`/`http2` must stay enabled; disabling both is a `compile_error!`.
-
-```toml
-# HTTP/1.1 + HTTP/2 + TLS, everything else off
-tachyon-web = { version = "0.0.3", default-features = false, features = ["http1", "http2", "tls"] }
-
-# smallest build: HTTP/1.1 cleartext, no extractors, no crypto dependencies
-tachyon-web = { version = "0.0.3", default-features = false, features = ["http1"] }
-```
 
 ### HTTP/2 over cleartext (h2c)
 
