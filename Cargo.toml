@@ -63,14 +63,14 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"], opti
 futures-core = { version = "0.3", default-features = false, optional = true }
 
 # Optional native .onion hidden-service support (see the `tor` feature).
-arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
-tor-hsservice = { version = "0.44", default-features = false, optional = true }
-tor-proto = { version = "0.44", default-features = false, features = ["hs-service"], optional = true }
-tor-cell = { version = "0.44", default-features = false, optional = true }
+arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
+tor-hsservice = { version = "0.45", default-features = false, optional = true }
+tor-proto = { version = "0.45", default-features = false, features = ["hs-service"], optional = true }
+tor-cell = { version = "0.45", default-features = false, optional = true }
 safelog = { version = "0.9", default-features = false, optional = true }
-tor-rtcompat = { version = "0.44", default-features = false, features = ["tokio"], optional = true }
-tor-guardmgr = { version = "0.44", default-features = false, features = ["vanguards"], optional = true }
-tor-config = { version = "0.44", default-features = false, optional = true }
+tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio"], optional = true }
+tor-guardmgr = { version = "0.45", default-features = false, features = ["vanguards"], optional = true }
+tor-config = { version = "0.45", default-features = false, optional = true }
 
 # Optional native .i2p eepsite support (see the `i2p` feature).
 tachyon-i2p = { version = "0.0.4", optional = true, default-features = false }
