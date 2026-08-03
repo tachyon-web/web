@@ -67,12 +67,28 @@ pub struct WebSocketUpgrade<F = DefaultOnFailedUpgrade> {
     kind: UpgradeKind,
     on_upgrade: hyper::upgrade::OnUpgrade,
     on_failed_upgrade: F,
-    sec_websocket_protocol: Vec<HeaderValue>,
+    sec_websocket_protocol: SubprotocolList,
     origin: Option<HeaderValue>,
-    deflate_offers: Vec<deflate::Offer>,
+    deflate_offers: deflate::OfferList,
     deflate_enabled: bool,
     deflate_config: DeflateConfig,
+    /// Reservation against
+    /// [`Server::max_websocket_connections`](crate::server::Server::max_websocket_connections),
+    /// held until the connection ends. `None` when the request didn't come through a
+    /// [`Server`](crate::server::Server) and so has no budget to draw on.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
+
+/// Client-offered subprotocols. Clients that name any usually name one or two.
+type SubprotocolList = smallvec::SmallVec<[HeaderValue; 2]>;
+
+/// The server-wide WebSocket connection budget, passed through request extensions.
+///
+/// An established WebSocket outlives the connection it was upgraded from — hyper resolves the
+/// connection future as soon as it hands off the socket — so these are invisible to
+/// `max_connections` and need a ceiling of their own.
+#[derive(Clone, Debug)]
+pub(crate) struct WebSocketLimit(pub(crate) std::sync::Arc<tokio::sync::Semaphore>);
 
 /// Which bootstrap produced this upgrade, and the bits of state each one needs to finish the
 /// handshake: HTTP/1.1 needs the client's key to derive `Sec-WebSocket-Accept`; the RFC 8441
@@ -136,6 +152,15 @@ impl<F> WebSocketUpgrade<F> {
 
     /// Enable or disable offering the `permessage-deflate` extension (RFC 7692) to the client.
     /// Enabled by default; when the client doesn't offer it, this has no effect either way.
+    ///
+    /// # Decompression is an amplification vector
+    ///
+    /// [`max_message_size`](Self::max_message_size) bounds a message *after* inflation and is
+    /// the only thing between a peer and a large allocation. DEFLATE reaches ~1000:1 on
+    /// repetitive input, so at the 64 MiB default ~64 KiB on the wire buys a 64 MiB buffer per
+    /// connection. For untrusted peers, set it to what the application needs and size
+    /// [`Server::max_websocket_connections`](crate::server::Server::max_websocket_connections)
+    /// against the product of the two.
     pub const fn deflate(mut self, enabled: bool) -> Self {
         self.deflate_enabled = enabled;
         self
@@ -208,6 +233,7 @@ impl<F> WebSocketUpgrade<F> {
             deflate_offers: self.deflate_offers,
             deflate_enabled: self.deflate_enabled,
             deflate_config: self.deflate_config,
+            permit: self.permit,
         }
     }
 
@@ -227,12 +253,16 @@ impl<F> WebSocketUpgrade<F> {
         let config = self.config;
         let on_failed_upgrade = self.on_failed_upgrade;
         let protocol = self.protocol.clone();
+        // Into the connection task, so the handshake's reservation lives exactly as long as
+        // the socket and is released on every way out, failed upgrade included.
+        let permit = self.permit;
         let agreement = self
             .deflate_enabled
             .then(|| deflate::negotiate(&self.deflate_offers, self.deflate_config))
             .flatten();
 
         tokio::spawn(async move {
+            let _permit = permit;
             let upgraded = match on_upgrade.await {
                 Ok(upgraded) => upgraded,
                 Err(err) => {
@@ -397,6 +427,7 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
                 message: "Request couldn't be upgraded: no upgrade state was present".to_string(),
             })?;
 
+        let permit = reserve_connection_slot(parts)?;
         let sec_websocket_protocol = parse_sec_websocket_protocol(&parts.headers);
         let origin = parts.headers.get(header::ORIGIN).cloned();
         let deflate_offers = deflate::parse_offers(&parts.headers);
@@ -412,6 +443,7 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
             deflate_offers,
             deflate_enabled: true,
             deflate_config: DeflateConfig::default(),
+            permit,
         })
     }
 
@@ -452,6 +484,7 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
                 message: "Request couldn't be upgraded: no upgrade state was present".to_string(),
             })?;
 
+        let permit = reserve_connection_slot(parts)?;
         let sec_websocket_protocol = parse_sec_websocket_protocol(&parts.headers);
         let origin = parts.headers.get(header::ORIGIN).cloned();
         let deflate_offers = deflate::parse_offers(&parts.headers);
@@ -467,11 +500,34 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
             deflate_offers,
             deflate_enabled: true,
             deflate_config: DeflateConfig::default(),
+            permit,
         })
     }
 }
 
-fn parse_sec_websocket_protocol(headers: &HeaderMap) -> Vec<HeaderValue> {
+/// Reserves a slot against the server's WebSocket budget, if this request carries one.
+///
+/// During handshake validation rather than after the `101`: refusing with a `503` beats
+/// completing the upgrade and leaving the peer holding a connection nothing will service.
+fn reserve_connection_slot(
+    parts: &Parts,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Error> {
+    let Some(limit) = parts.extensions.get::<WebSocketLimit>() else {
+        // No budget attached — the request didn't come through a `Server`.
+        return Ok(None);
+    };
+    limit
+        .0
+        .clone()
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| Error::Rejection {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "WebSocket connection limit reached".to_string(),
+        })
+}
+
+fn parse_sec_websocket_protocol(headers: &HeaderMap) -> SubprotocolList {
     headers
         .get_all(header::SEC_WEBSOCKET_PROTOCOL)
         .iter()
@@ -483,6 +539,9 @@ fn parse_sec_websocket_protocol(headers: &HeaderMap) -> Vec<HeaderValue> {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    // `WebSocketUpgrade` owns a semaphore permit, so binding one to inspect it trips
+    // `significant_drop_tightening`. Nothing here establishes a connection.
+    #![allow(clippy::significant_drop_tightening)]
     use super::*;
     use hyper::Request;
 

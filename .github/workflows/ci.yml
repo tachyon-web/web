@@ -6,10 +6,6 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Any new push supersedes the run already in flight for the same ref — that older run is
-# testing code nobody is looking at any more, so it is cancelled outright rather than left
-# to finish. The group key is per-ref, so `main` and each PR keep independent lanes; only a
-# run for the *same* ref gets displaced.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

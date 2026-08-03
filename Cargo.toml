@@ -49,6 +49,7 @@ socket2 = { version = "0.6", features = ["all"] }
 cookie = { version = "0.18", features = ["percent-encode"], optional = true }
 core_affinity = "0.8"
 rustc-hash = "2"
+smallvec = { version = "1", features = ["union"] }
 
 # Optional Tower interop (see the `tower` feature) — not used on the native hot path.
 tower = { version = "0.5", default-features = false, features = ["util"], optional = true }

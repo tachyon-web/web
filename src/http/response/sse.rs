@@ -55,6 +55,33 @@ pub struct Event {
     comment: Option<String>,
 }
 
+/// Strips `\r`/`\n` from a single-line SSE field, without allocating in the common case.
+fn strip_newlines(value: String) -> String {
+    if value.contains(['\r', '\n']) {
+        value.replace(['\r', '\n'], "")
+    } else {
+        value
+    }
+}
+
+/// Writes a multi-line SSE field, one `<prefix> <line>` per line.
+///
+/// SSE treats `\n`, `\r\n` and a lone `\r` as the same line break, so all three are normalized
+/// first: a stray `\r` left mid-line is one the client re-reads as a terminator, turning the
+/// remainder into a field the caller never wrote.
+fn write_multiline(buf: &mut String, prefix: &str, value: &str) {
+    let normalized;
+    let value = if value.contains('\r') {
+        normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+        normalized.as_str()
+    } else {
+        value
+    };
+    for line in value.split('\n') {
+        let _ = writeln!(buf, "{prefix} {line}");
+    }
+}
+
 impl Event {
     /// Creates an empty event — add fields with the setters below.
     #[must_use]
@@ -78,18 +105,22 @@ impl Event {
         Ok(self.data(serde_json::to_string(&data)?))
     }
 
-    /// Sets the event's `event` field (the event type/name). Must not contain
-    /// `\n` or `\r` — those aren't split across lines like `data`/`comment`.
+    /// Sets the event's `event` field (the event type/name).
+    ///
+    /// Single-line, unlike `data`/`comment`, so `\r`/`\n` are stripped: passed through, they'd
+    /// let interpolated input end the line early and inject SSE fields of its own choosing.
     #[must_use]
     pub fn event(mut self, event: impl Into<String>) -> Self {
-        self.event = Some(event.into());
+        self.event = Some(strip_newlines(event.into()));
         self
     }
 
-    /// Sets the event's `id` field. Must not contain `\n` or `\r`.
+    /// Sets the event's `id` field.
+    ///
+    /// As with [`event`](Self::event), `\r`/`\n` are stripped — see that method for why.
     #[must_use]
     pub fn id(mut self, id: impl Into<String>) -> Self {
-        self.id = Some(id.into());
+        self.id = Some(strip_newlines(id.into()));
         self
     }
 
@@ -111,17 +142,13 @@ impl Event {
     /// Serializes this event into SSE wire format, terminated by a blank line.
     fn write_to(&self, buf: &mut String) {
         if let Some(comment) = &self.comment {
-            for line in comment.split('\n') {
-                let _ = writeln!(buf, ": {line}");
-            }
+            write_multiline(buf, ":", comment);
         }
         if let Some(event) = &self.event {
             let _ = writeln!(buf, "event: {event}");
         }
         if let Some(data) = &self.data {
-            for line in data.split('\n') {
-                let _ = writeln!(buf, "data: {line}");
-            }
+            write_multiline(buf, "data:", data);
         }
         if let Some(id) = &self.id {
             let _ = writeln!(buf, "id: {id}");
@@ -366,6 +393,26 @@ mod tests {
     fn test_retry_field() {
         let s = wire_format(Event::new().retry(std::time::Duration::from_secs(5)));
         assert_eq!(s, "retry: 5000\n\n");
+    }
+
+    /// A newline in `event`/`id` must not be able to end the line and inject further fields.
+    #[test]
+    fn test_single_line_fields_strip_injected_newlines() {
+        let s = wire_format(Event::new().id("42\ndata: injected").data("real"));
+        assert_eq!(s, "data: real\nid: 42data: injected\n\n");
+
+        let s = wire_format(Event::new().event("up\r\ndata: injected"));
+        assert_eq!(s, "event: updata: injected\n\n");
+    }
+
+    /// `\n`, `\r\n` and a lone `\r` are all one line break to an SSE client.
+    #[test]
+    fn test_multiline_fields_normalize_every_line_break_form() {
+        assert_eq!(
+            wire_format(Event::new().data("a\r\nb\rc\nd")),
+            "data: a\ndata: b\ndata: c\ndata: d\n\n"
+        );
+        assert_eq!(wire_format(Event::new().comment("x\r\ny")), ": x\n: y\n\n");
     }
 
     #[test]

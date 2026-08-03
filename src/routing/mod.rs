@@ -313,6 +313,9 @@ pub struct Router<S = ()> {
     method_not_allowed_fallback: Option<BoxedHandler<S>>,
     /// See [`Router::normalize_trailing_slash`].
     normalize_trailing_slash: bool,
+    /// See [`Router::no_index`]. Applied at [`compile`](Router::compile) time, so route
+    /// registration order doesn't matter.
+    no_index: bool,
     /// Populated the first time this `Router` is driven as a `tower::Service`, so `.oneshot()`
     /// works without a separate `.compile()` call while still building the `matchit` tree only
     /// once. Every route-table-mutating builder method resets it to `None`, so mutating after
@@ -422,6 +425,7 @@ where
             fallback: None,
             method_not_allowed_fallback: None,
             normalize_trailing_slash: false,
+            no_index: false,
             #[cfg(feature = "tower")]
             compiled: None,
         }
@@ -452,6 +456,10 @@ where
     /// fallback alike), and — unless the app already registers its own `/robots.txt` route —
     /// serves a blanket `User-agent: *\nDisallow: /` there too.
     ///
+    /// Applied at [`compile`](Self::compile) time, so routes registered after this call are
+    /// covered too. [`merge`](Self::merge) carries it over from either side;
+    /// [`nest`](Self::nest) drops the inner router's setting, as it does for `fallback`.
+    ///
     /// # Example
     /// ```rust
     /// use tachyon_web::{Router, get};
@@ -461,7 +469,18 @@ where
     ///     .no_index();
     /// ```
     #[must_use]
-    pub fn no_index(mut self) -> Self {
+    pub const fn no_index(mut self) -> Self {
+        self.no_index = true;
+        self
+    }
+
+    fn apply_no_index(mut self) -> Self {
+        if !self.no_index {
+            return self;
+        }
+        // Cleared first: keeps `route()` below from recursing, and keeps a second `compile()`
+        // from stacking the middleware twice.
+        self.no_index = false;
         if !self.routes.iter().any(|(path, _)| path == "/robots.txt") {
             self = self.route(
                 "/robots.txt",
@@ -513,6 +532,7 @@ where
             fallback: new_fallback,
             method_not_allowed_fallback: new_method_not_allowed_fallback,
             normalize_trailing_slash: self.normalize_trailing_slash,
+            no_index: self.no_index,
             #[cfg(feature = "tower")]
             compiled: None,
         }
@@ -592,7 +612,10 @@ where
 
     /// Serve an entire static directory under a URL prefix with full configuration control.
     ///
-    /// Registers both an exact route (`prefix`) and a wildcard route (`prefix/*path`).
+    /// Registers `prefix/*path` for files, plus the bare `prefix` and `prefix/` so a
+    /// directory request reaches the [`index`](static_dir::ServeDir::index) — a `matchit`
+    /// `{*path}` never matches an empty remainder, so the wildcard alone can't serve either.
+    ///
     /// Use `serve_static()` for the common case of serving a dir at `/`. See
     /// [`static_dir::ServeDir`]'s docs for the upload-safety warning before
     /// serving a directory that can contain user-supplied files.
@@ -602,8 +625,15 @@ where
         let exact_route = if prefix.is_empty() { "/" } else { prefix };
         let wildcard_route = format!("{prefix}/*path");
 
-        self = self.route(exact_route, serve_dir.clone().into_method_router());
-        self = self.route(&wildcard_route, serve_dir.into_method_router());
+        self = self.route(exact_route, serve_dir.clone().into_method_router_at(prefix));
+        // At the root `exact_route` is already `/`; registering it again would be a duplicate.
+        if !prefix.is_empty() {
+            self = self.route(
+                &format!("{prefix}/"),
+                serve_dir.clone().into_method_router_at(prefix),
+            );
+        }
+        self = self.route(&wildcard_route, serve_dir.into_method_router_at(prefix));
         self
     }
 
@@ -739,6 +769,8 @@ where
             other.method_not_allowed_fallback.take(),
             "Cannot merge two `Router`s that both have a method_not_allowed_fallback",
         );
+        // Peers, so an opt-out either side asked for survives the merge.
+        self.no_index |= other.no_index;
         self
     }
 
@@ -979,10 +1011,11 @@ where
     where
         S: Default,
     {
+        let this = self.apply_no_index();
         let mut matcher: matchit::Router<MethodRouter<S>> = matchit::Router::new();
 
         let mut seen = std::collections::HashSet::new();
-        for (path, mut method_router) in self.routes {
+        for (path, mut method_router) in this.routes {
             if !seen.insert(path.clone()) {
                 return Err(RouterError::DuplicateRoute(path));
             }
@@ -994,10 +1027,10 @@ where
 
         Ok(CompiledRouter {
             matcher,
-            fallback: self.fallback,
-            method_not_allowed_fallback: self.method_not_allowed_fallback,
+            fallback: this.fallback,
+            method_not_allowed_fallback: this.method_not_allowed_fallback,
             state: Arc::new(S::default()),
-            normalize_trailing_slash: self.normalize_trailing_slash,
+            normalize_trailing_slash: this.normalize_trailing_slash,
         })
     }
 }
@@ -1166,6 +1199,27 @@ fn strip_trailing_slash(req: &mut Request<Body>) {
     set_uri_path(req, &new_path);
 }
 
+/// Empties a `HEAD` response body, keeping the `Content-Length` the `GET` would have reported.
+///
+/// RFC 9110 §9.3.2 wants the `GET`'s headers here, and hyper derives `Content-Length` from the
+/// body's `size_hint` — so dropping the body without pinning the length first makes every
+/// `HEAD` advertise zero. Streams have no exact length to keep; a header the handler set wins.
+fn discard_body_for_head(resp: &mut Response<Body>) {
+    let known_length = hyper::body::Body::size_hint(resp.body()).exact();
+    *resp.body_mut() = Body::empty();
+
+    if resp.headers().contains_key(hyper::header::CONTENT_LENGTH) {
+        return;
+    }
+    if let Some(len) = known_length
+        && let Ok(value) = hyper::header::HeaderValue::try_from(len.to_string())
+    {
+        let _ = resp
+            .headers_mut()
+            .insert(hyper::header::CONTENT_LENGTH, value);
+    }
+}
+
 impl<S> CompiledRouter<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -1266,7 +1320,7 @@ where
             // regardless of whether it came from an explicit HEAD handler or
             // the implicit GET fallback.
             if is_head {
-                *resp.body_mut() = Body::empty();
+                discard_body_for_head(&mut resp);
             }
             resp
         } else if let Some(fb) = &self.method_not_allowed_fallback {
@@ -1289,10 +1343,10 @@ where
     fn resolve(&self, path: &str) -> Option<RouteResolution<'_, S>> {
         let m = self.matcher.at(path).ok()?;
         let params = if m.params.is_empty() {
-            Vec::new()
+            extract::PathParamsVec::new()
         } else {
             let names = &m.value.param_names;
-            let mut p = Vec::with_capacity(m.params.len());
+            let mut p = extract::PathParamsVec::with_capacity(m.params.len());
             for (name, (_, v)) in names.iter().zip(m.params.iter()) {
                 let decoded =
                     percent_decode(v).map_or_else(|| v.to_string(), std::borrow::Cow::into_owned);
@@ -1305,7 +1359,7 @@ where
 }
 
 /// Type alias for matched route results to keep signatures clean.
-pub type RouteResolution<'a, S> = (&'a MethodRouter<S>, Vec<(Arc<str>, String)>);
+pub type RouteResolution<'a, S> = (&'a MethodRouter<S>, extract::PathParamsVec);
 
 #[cfg(test)]
 mod tests {
@@ -1720,6 +1774,109 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A `ServeDir` under a non-root prefix serves the index for both directory-request forms,
+    /// not just the files beneath it.
+    #[tokio::test]
+    async fn test_serve_dir_under_a_prefix_serves_index_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"<h1>idx</h1>").unwrap();
+        std::fs::write(dir.path().join("app.css"), b"body{}").unwrap();
+        std::fs::create_dir(dir.path().join("deep")).unwrap();
+        std::fs::write(dir.path().join("deep/index.html"), b"<h1>deep</h1>").unwrap();
+
+        let sd = static_dir::ServeDir::new(dir.path()).index("index.html");
+        let app = Router::new()
+            .serve_dir("/assets", sd)
+            .with_state::<()>(())
+            .compile()
+            .expect("compile");
+
+        for (path, expected) in [
+            ("/assets", &b"<h1>idx</h1>"[..]),
+            ("/assets/", &b"<h1>idx</h1>"[..]),
+            ("/assets/app.css", &b"body{}"[..]),
+            ("/assets/deep/", &b"<h1>deep</h1>"[..]),
+        ] {
+            let resp = app.handle_request(make_req("GET", path)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "path: {path}");
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(&body[..], expected, "path: {path}");
+        }
+    }
+
+    /// At the root the bare-prefix and trailing-slash routes collapse into one `/` entry
+    /// rather than colliding.
+    #[tokio::test]
+    async fn test_serve_dir_at_root_serves_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"<h1>root</h1>").unwrap();
+
+        let app = Router::new()
+            .serve_static(dir.path())
+            .with_state::<()>(())
+            .compile()
+            .expect("compile");
+
+        let resp = app.handle_request(make_req("GET", "/")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"<h1>root</h1>");
+    }
+
+    /// Applied at compile time, so it covers routes registered after the call too.
+    #[tokio::test]
+    async fn test_no_index_covers_routes_registered_in_either_order() {
+        async fn handler() -> &'static str {
+            "hi"
+        }
+
+        for app in [
+            Router::new().route("/before", get(handler)).no_index(),
+            Router::new().no_index().route("/before", get(handler)),
+        ] {
+            let app = app.with_state::<()>(()).compile().expect("compile");
+
+            let resp = app.handle_request(make_req("GET", "/before")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("x-robots-tag").expect("header set"),
+                "noindex, nofollow"
+            );
+
+            let resp = app.handle_request(make_req("GET", "/robots.txt")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(&body[..], b"User-agent: *\nDisallow: /\n");
+        }
+    }
+
+    /// An app that registers its own `/robots.txt` keeps it — `.no_index()` only fills the gap.
+    #[tokio::test]
+    async fn test_no_index_does_not_clobber_a_custom_robots_txt() {
+        let app = Router::new()
+            .no_index()
+            .route("/robots.txt", get(|| async { "User-agent: *\nAllow: /\n" }))
+            .with_state::<()>(())
+            .compile()
+            .expect("compile");
+
+        let resp = app.handle_request(make_req("GET", "/robots.txt")).await;
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"User-agent: *\nAllow: /\n");
+    }
+
     #[tokio::test]
     async fn test_merge_and_empty_prefix_nest_combine_route_tables() {
         async fn dummy() -> &'static str {
@@ -1900,6 +2057,65 @@ mod tests {
         assert!(body.is_empty(), "HEAD responses must have an empty body");
     }
 
+    /// RFC 9110 §9.3.2: `HEAD` reports the same `Content-Length` the `GET` would.
+    #[tokio::test]
+    async fn test_head_preserves_content_length() {
+        async fn body() -> &'static str {
+            "hello world"
+        }
+
+        let app = Router::new()
+            .route("/x", get(body))
+            .with_state::<()>(())
+            .compile()
+            .expect("compile");
+
+        let get_len =
+            hyper::body::Body::size_hint(app.handle_request(make_req("GET", "/x")).await.body())
+                .exact();
+        assert_eq!(get_len, Some(11));
+
+        let head = app.handle_request(make_req("HEAD", "/x")).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("11"),
+            "HEAD must report the length GET would have sent"
+        );
+        assert_eq!(
+            hyper::body::Body::size_hint(head.body()).exact(),
+            Some(0),
+            "HEAD must not carry a body"
+        );
+    }
+
+    /// A `Content-Length` the handler set itself is authoritative.
+    #[tokio::test]
+    async fn test_head_keeps_explicit_content_length() {
+        async fn handler() -> Response<Body> {
+            Response::builder()
+                .header(hyper::header::CONTENT_LENGTH, "999")
+                .body(Body::full(Bytes::from_static(b"short")))
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
+
+        let app = Router::new()
+            .route("/x", get(handler))
+            .with_state::<()>(())
+            .compile()
+            .expect("compile");
+
+        let head = app.handle_request(make_req("HEAD", "/x")).await;
+        assert_eq!(
+            head.headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("999")
+        );
+    }
+
     #[tokio::test]
     async fn test_method_not_allowed_fallback_overrides_default_405() {
         async fn get_handler() -> &'static str {
@@ -2015,6 +2231,7 @@ mod tests {
             fallback: None,
             method_not_allowed_fallback: None,
             normalize_trailing_slash: false,
+            no_index: false,
             #[cfg(feature = "tower")]
             compiled: None,
         };

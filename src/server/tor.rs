@@ -395,15 +395,20 @@ where
         wait_until_reachable(&service).await;
 
         let state = Arc::new(self);
+        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
         let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
         tokio::pin!(stream_requests);
 
         while let Some(stream_request) = stream_requests.next().await {
+            let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+                break;
+            };
             let state = state.clone();
             drop(tokio::spawn(async move {
                 if let Err(e) = handle_plaintext_only_stream(state, stream_request).await {
                     tracing::debug!("[tor] connection error: {e}");
                 }
+                drop(permit);
             }));
         }
 
@@ -540,10 +545,14 @@ where
             let redirect_http = config.redirect_http;
 
             let state = Arc::new(self);
+            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
             let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
             tokio::pin!(stream_requests);
 
             while let Some(stream_request) = stream_requests.next().await {
+                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+                    break;
+                };
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let onion_host = onion_host.clone();
@@ -559,6 +568,7 @@ where
                     {
                         tracing::debug!("[tor] connection error: {e}");
                     }
+                    drop(permit);
                 }));
             }
 
@@ -572,15 +582,20 @@ where
         #[cfg(not(feature = "tls"))]
         {
             let state = Arc::new(self);
+            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
             let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
             tokio::pin!(stream_requests);
 
             while let Some(stream_request) = stream_requests.next().await {
+                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+                    break;
+                };
                 let state = state.clone();
                 drop(tokio::spawn(async move {
                     if let Err(e) = handle_plaintext_only_stream(state, stream_request).await {
                         tracing::debug!("[tor] connection error: {e}");
                     }
+                    drop(permit);
                 }));
             }
 

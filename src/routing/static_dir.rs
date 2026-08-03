@@ -809,9 +809,27 @@ impl ServeDir {
     where
         S: Clone + Send + Sync + 'static,
     {
+        self.into_method_router_at("")
+    }
+
+    /// [`into_method_router`](Self::into_method_router) for a `ServeDir` mounted under
+    /// `mount_prefix` (`""` at the root).
+    ///
+    /// Only the capture-less routes need this: they fall back to the request `Uri`, which
+    /// still carries the mount point, and `GET /assets` must resolve the index rather than a
+    /// file named `assets`.
+    pub(crate) fn into_method_router_at<S>(
+        self,
+        mount_prefix: &str,
+    ) -> crate::routing::MethodRouter<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
         let self_arc = std::sync::Arc::new(self);
+        let mount_prefix: Arc<str> = Arc::from(mount_prefix);
         crate::routing::get(move |req: hyper::Request<Bytes>| {
             let this = self_arc.clone();
+            let mount_prefix = mount_prefix.clone();
 
             async move {
                 let path_ext = req
@@ -835,16 +853,15 @@ impl ServeDir {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("");
 
-                let result = match captured {
-                    Some(path) => this.serve_decoded(path, accept_enc, if_none_match).await,
-                    None => {
-                        this.handle_request_with_encoding(
-                            req.uri().path(),
-                            accept_enc,
-                            if_none_match,
-                        )
+                let result = if let Some(path) = captured {
+                    this.serve_decoded(path, accept_enc, if_none_match).await
+                } else {
+                    let uri_path = req.uri().path();
+                    let relative = uri_path
+                        .strip_prefix(mount_prefix.as_ref())
+                        .unwrap_or(uri_path);
+                    this.handle_request_with_encoding(relative, accept_enc, if_none_match)
                         .await
-                    }
                 };
                 match result {
                     Ok(resp) => resp,

@@ -394,9 +394,15 @@ fn decode_query_param(s: &str) -> std::borrow::Cow<'_, str> {
 #[derive(Debug, Clone)]
 pub struct Path<T>(pub T);
 
+/// The captured path parameters for one request, in route-declaration order.
+///
+/// Inline up to four, which covers essentially every real route, so a parameterised match
+/// costs no separate allocation beyond the extension itself.
+pub type PathParamsVec = smallvec::SmallVec<[(std::sync::Arc<str>, String); 4]>;
+
 /// Internal path parameters container stored in request extensions.
 #[derive(Debug, Clone)]
-pub struct PathParams(pub Vec<(std::sync::Arc<str>, String)>);
+pub struct PathParams(pub PathParamsVec);
 
 /// A `serde::Deserializer` over route path parameters that supports scalar,
 /// tuple, and map/struct deserialization targets, mirroring Axum's `Path`
@@ -716,7 +722,14 @@ fn is_json_content_type(content_type: &str) -> bool {
     if !ty.eq_ignore_ascii_case("application") {
         return false;
     }
-    subtype.eq_ignore_ascii_case("json") || subtype.to_ascii_lowercase().ends_with("+json")
+    // `get` rather than an index: a split landing mid-codepoint yields `None`, which is the
+    // right answer anyway since `+json` is ASCII.
+    subtype.eq_ignore_ascii_case("json")
+        || subtype
+            .len()
+            .checked_sub("+json".len())
+            .and_then(|split| subtype.get(split..))
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json"))
 }
 
 /// Extractor for JSON payloads. Requires the `json` feature.

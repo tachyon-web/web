@@ -262,9 +262,9 @@ impl WebSocket {
                 Ok(Some(Message::Text(text)))
             }
             OpData::Binary => Ok(Some(Message::Binary(bytes))),
-            OpData::Continue | OpData::Reserved(_) => {
-                unreachable!("caller only passes Text/Binary")
-            }
+            OpData::Continue | OpData::Reserved(_) => Err(Error::Internal(format!(
+                "cannot finish a WebSocket message with opcode {opcode:?}"
+            ))),
         }
     }
 
@@ -370,11 +370,16 @@ impl WebSocket {
         if !header.is_final {
             return Ok(None);
         }
-        let Fragment {
+        let Some(Fragment {
             opcode,
             compressed,
             buffer,
-        } = self.fragment.take().unwrap_or_else(|| unreachable!());
+        }) = self.fragment.take()
+        else {
+            return Err(Error::Internal(
+                "WebSocket fragment vanished mid-reassembly".to_string(),
+            ));
+        };
         self.finish_message(opcode, compressed, buffer.freeze())
     }
 

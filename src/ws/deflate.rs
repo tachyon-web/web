@@ -43,6 +43,10 @@ impl Default for DeflateConfig {
     }
 }
 
+/// Parsed `permessage-deflate` offers. Clients send one; the list exists for the ones that
+/// offer the same extension twice with different parameters.
+pub(super) type OfferList = smallvec::SmallVec<[Offer; 1]>;
+
 /// One `permessage-deflate` offer parsed out of a `Sec-WebSocket-Extensions` request header.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct Offer {
@@ -76,8 +80,8 @@ pub(super) struct Agreement {
 /// header(s), in the order they appeared. Unrecognized extensions and unrecognized/malformed
 /// parameters on an otherwise-recognized offer are skipped per-offer (per RFC 7692 §7, a server
 /// declines an individual malformed offer rather than failing the whole negotiation).
-pub(super) fn parse_offers(headers: &HeaderMap) -> Vec<Offer> {
-    let mut offers = Vec::new();
+pub(super) fn parse_offers(headers: &HeaderMap) -> OfferList {
+    let mut offers = OfferList::new();
     for header in headers.get_all(SEC_WEBSOCKET_EXTENSIONS) {
         let Ok(text) = header.to_str() else { continue };
         for extension in text.split(',') {
@@ -336,7 +340,7 @@ mod tests {
     use super::{Agreement, DeflateConfig, PerMessageDeflate, negotiate, parse_offers};
     use hyper::header::{HeaderMap, HeaderValue, SEC_WEBSOCKET_EXTENSIONS};
 
-    fn offers_from(value: &'static str) -> Vec<super::Offer> {
+    fn offers_from(value: &'static str) -> super::OfferList {
         let mut headers = HeaderMap::new();
         let _ = headers.insert(SEC_WEBSOCKET_EXTENSIONS, HeaderValue::from_static(value));
         parse_offers(&headers)

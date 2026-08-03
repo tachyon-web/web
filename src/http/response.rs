@@ -72,6 +72,11 @@ impl Body {
     /// Returns a `413` rejection if the body exceeds `limit`, or a `400` rejection
     /// if reading the body otherwise fails (e.g. a malformed chunked transfer).
     pub async fn collect_bytes(self, limit: usize) -> Result<Bytes, crate::http::error::Error> {
+        // `hyper_handler` maps every already-ended body to `Empty`, so this is the common
+        // shape for a bodyless request reaching a body-consuming extractor.
+        if matches!(self, Self::Empty) {
+            return Ok(Bytes::new());
+        }
         match http_body_util::Limited::new(self, limit).collect().await {
             Ok(collected) => Ok(collected.to_bytes()),
             Err(e) => {

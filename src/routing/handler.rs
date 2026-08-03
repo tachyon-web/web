@@ -32,12 +32,16 @@ impl std::fmt::Debug for ResponseFuture {
 impl Future for ResponseFuture {
     type Output = Response<Body>;
 
+    /// Polling a `Ready` twice is a caller bug; it degrades to a `500` rather than panicking
+    /// out of a connection task. `Pending` would hang the connection instead of failing it.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut *self {
-            Self::Ready(res) => res.take().map_or_else(
-                || unreachable!("ResponseFuture polled after completion"),
-                Poll::Ready,
-            ),
+            Self::Ready(res) => Poll::Ready(res.take().unwrap_or_else(|| {
+                tracing::error!("ResponseFuture polled after completion");
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                resp
+            })),
             Self::Boxed(fut) => fut.as_mut().poll(cx),
         }
     }

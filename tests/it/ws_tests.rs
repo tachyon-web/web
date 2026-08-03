@@ -1,3 +1,8 @@
+// A `WebSocketUpgrade` owns a semaphore permit (the WebSocket connection budget), so binding
+// a successful one to a `let` before asserting on it trips `significant_drop_tightening`.
+// These tests never establish a connection, so when the permit is released is immaterial.
+#![allow(clippy::significant_drop_tightening)]
+
 use crate::common::TestServer;
 use futures_util::{SinkExt, StreamExt};
 use tachyon_web::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -16,6 +21,17 @@ async fn ws_connect(
     tokio_tungstenite::client_async(format!("ws://{addr}/ws"), tcp)
         .await
         .unwrap()
+}
+
+/// As [`ws_connect`], but surfaces a refused upgrade instead of unwrapping it — the server
+/// answers an over-budget upgrade with a normal HTTP error response, which `client_async`
+/// reports as `tungstenite::Error::Http`.
+async fn try_ws_connect(server: &TestServer) -> Result<ClientStream, tungstenite::Error> {
+    let addr = server.addr();
+    let tcp = TcpStream::connect(addr).await.expect("tcp connect");
+    tokio_tungstenite::client_async(format!("ws://{addr}/ws"), tcp)
+        .await
+        .map(|(stream, _response)| stream)
 }
 
 async fn echo_socket(mut socket: WebSocket) {
@@ -158,6 +174,72 @@ async fn test_ws_upgrade_rejects_missing_upgrade_header() {
     let (mut parts, _) = req.into_parts();
     let result = WebSocketUpgrade::from_request_parts(&mut parts, &());
     assert!(result.is_err());
+}
+
+/// An established WebSocket outlives the HTTP connection it was upgraded from, so it escapes
+/// `max_connections` entirely (hyper resolves the connection future the moment it hands the
+/// socket to the upgrade). `max_websocket_connections` is the ceiling that actually bounds
+/// them: once it's reached the upgrade is refused with `503` *before* the handshake completes,
+/// and the slot is returned when the connection ends.
+#[tokio::test]
+async fn test_websocket_connection_limit_rejects_and_then_recovers() {
+    async fn ws_handler(
+        ws: WebSocketUpgrade,
+    ) -> hyper::Response<tachyon_web::http::response::Body> {
+        ws.on_upgrade(|mut socket: WebSocket| async move {
+            while let Some(Ok(msg)) = socket.recv().await {
+                if matches!(msg, Message::Close(_)) || socket.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    let app = Router::new().route("/ws", get(ws_handler));
+    let server = TestServer::spawn_with(app, |s| s.max_websocket_connections(1)).await;
+
+    // First upgrade takes the single slot.
+    let (mut first, _) = ws_connect(&server).await;
+    first
+        .send(tungstenite::Message::Text("ping".into()))
+        .await
+        .expect("send on first socket");
+    assert_eq!(
+        first.next().await.expect("echo").expect("echo ok"),
+        tungstenite::Message::Text("ping".into())
+    );
+
+    // Second upgrade is refused outright rather than accepted and starved.
+    let err = try_ws_connect(&server)
+        .await
+        .expect_err("second upgrade must be rejected");
+    match err {
+        tungstenite::Error::Http(resp) => assert_eq!(
+            resp.status(),
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "expected 503 once the WebSocket budget is exhausted"
+        ),
+        other => panic!("expected an HTTP rejection, got: {other:?}"),
+    }
+
+    // Closing the first connection returns its slot, so a later upgrade succeeds again.
+    first.close(None).await.expect("close first socket");
+    drop(first);
+
+    let mut attempts = 0;
+    loop {
+        match try_ws_connect(&server).await {
+            Ok(socket) => {
+                drop(socket);
+                break;
+            }
+            Err(e) => {
+                attempts += 1;
+                assert!(attempts < 50, "slot was never released: {e:?}");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -131,11 +131,7 @@ impl AcmeResolver {
 
     /// Returns `true` if a certificate has been loaded into this resolver.
     pub fn has_certificate(&self) -> bool {
-        self.current_key
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().map(|_| ()))
-            .is_some()
+        self.current_key.read().is_ok_and(|g| g.is_some())
     }
 }
 
@@ -258,6 +254,8 @@ pub struct AcmeManager {
     cache_dir: PathBuf,
     is_staging: bool,
     resolver: Arc<AcmeResolver>,
+    /// The provider signing keys are loaded through — see [`AcmeManager::with_policy`].
+    provider: Arc<rustls::crypto::CryptoProvider>,
     /// Serializes provisioning runs. `tokio::sync::Mutex` because the guard is held across
     /// awaits.
     provisioning: tokio::sync::Mutex<()>,
@@ -286,6 +284,27 @@ impl AcmeManager {
         email: String,
         is_staging: bool,
     ) -> Arc<Self> {
+        Self::with_policy(
+            cache_dir,
+            domains,
+            email,
+            is_staging,
+            &crate::tls::TlsPolicy::default(),
+        )
+    }
+
+    /// [`new`](Self::new), with the signing key loaded through `policy`'s crypto provider
+    /// instead of [`TlsPolicy::hardened`](crate::tls::TlsPolicy::hardened)'s.
+    ///
+    /// [`Server::serve_all_acme`](crate::server::Server::serve_all_acme) passes its own
+    /// effective policy, so a `fips`/custom provider covers the issued certificate too.
+    pub fn with_policy(
+        cache_dir: impl Into<PathBuf>,
+        domains: Vec<String>,
+        email: String,
+        is_staging: bool,
+        policy: &crate::tls::TlsPolicy,
+    ) -> Arc<Self> {
         let cache_dir = cache_dir.into();
         if let Err(e) = fs::create_dir_all(&cache_dir) {
             error!(
@@ -299,6 +318,7 @@ impl AcmeManager {
             cache_dir,
             is_staging,
             resolver: Arc::new(AcmeResolver::new()),
+            provider: policy.provider(),
             provisioning: tokio::sync::Mutex::new(()),
         })
     }
@@ -367,7 +387,7 @@ impl AcmeManager {
                 match self.provision_cert().await {
                     Ok((certs, key)) => {
                         info!("[acme] provisioned new certificate");
-                        match Self::build_certified_key(certs, key) {
+                        match self.build_certified_key(certs, key) {
                             Ok(certified_key) => {
                                 self.resolver.update_cert(certified_key);
                                 backoff = BACKOFF_INITIAL; // success — reset backoff
@@ -439,7 +459,7 @@ impl AcmeManager {
             time_remaining.as_secs_f64() / 86400.0
         );
 
-        let certified_key = Self::build_certified_key(certs, key)?;
+        let certified_key = self.build_certified_key(certs, key)?;
         self.resolver.update_cert(certified_key);
         Ok(true)
     }
@@ -513,12 +533,16 @@ impl AcmeManager {
     }
 
     /// Constructs a `rustls` [`CertifiedKey`] from DER-encoded certificates and a private key.
+    ///
+    /// Loaded through this manager's own provider, not a stock one: under `fips` those are
+    /// different modules, and using the wrong one silently voids the guarantee.
     fn build_certified_key(
+        &self,
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<CertifiedKey, AcmeError> {
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let signing_key = provider
+        let signing_key = self
+            .provider
             .key_provider
             .load_private_key(key)
             .map_err(|e| AcmeError::TlsKeyLoad(e.to_string()))?;
@@ -554,37 +578,12 @@ impl AcmeManager {
         let mut order = account.new_order(&new_order).await?;
 
         let mut tokens_to_unregister: Vec<String> = Vec::new();
-        {
-            let mut auths = order.authorizations();
-            while let Some(auth_res) = auths.next().await {
-                let mut auth = auth_res?;
-                let mut challenge = auth.challenge(ChallengeType::Http01).ok_or_else(|| {
-                    AcmeError::Io(std::io::Error::other(
-                        "No HTTP-01 challenge offered by CA — ensure port 80 is reachable",
-                    ))
-                })?;
-
-                let key_auth = challenge.key_authorization().as_str().to_string();
-                let token = challenge.token.clone();
-
-                register_challenge(token.clone(), key_auth);
-                tokens_to_unregister.push(token);
-
-                // Signal ACME server that it may now probe the challenge endpoint.
-                challenge.set_ready().await?;
-            }
-        }
-
-        let status = order
-            .poll_ready(&instant_acme::RetryPolicy::default())
-            .await?;
-
-        // Unregister all challenge tokens regardless of outcome.
+        let outcome = Self::run_http01_challenges(&mut order, &mut tokens_to_unregister).await;
         for token in &tokens_to_unregister {
             unregister_challenge(token);
         }
 
-        if status == OrderStatus::Invalid {
+        if outcome? == OrderStatus::Invalid {
             return Err(AcmeError::OrderInvalid);
         }
 
@@ -608,6 +607,41 @@ impl AcmeManager {
             .map_err(|_| AcmeError::MissingPrivateKey)?;
 
         Ok((certs, key))
+    }
+
+    /// Registers an HTTP-01 response per authorization, marks each ready, then waits for the
+    /// order to leave the pending state.
+    ///
+    /// Every token lands in `tokens` before the fallible work that follows it, so
+    /// [`provision_cert`][Self::provision_cert] can unregister them all however this returns.
+    async fn run_http01_challenges(
+        order: &mut instant_acme::Order,
+        tokens: &mut Vec<String>,
+    ) -> Result<OrderStatus, AcmeError> {
+        {
+            let mut auths = order.authorizations();
+            while let Some(auth_res) = auths.next().await {
+                let mut auth = auth_res?;
+                let mut challenge = auth.challenge(ChallengeType::Http01).ok_or_else(|| {
+                    AcmeError::Io(std::io::Error::other(
+                        "No HTTP-01 challenge offered by CA — ensure port 80 is reachable",
+                    ))
+                })?;
+
+                let key_auth = challenge.key_authorization().as_str().to_string();
+                let token = challenge.token.clone();
+
+                register_challenge(token.clone(), key_auth);
+                tokens.push(token);
+
+                // Signal ACME server that it may now probe the challenge endpoint.
+                challenge.set_ready().await?;
+            }
+        }
+
+        Ok(order
+            .poll_ready(&instant_acme::RetryPolicy::default())
+            .await?)
     }
 
     /// Loads existing ACME account credentials from `<cache_dir>/account-{staging|prod}.json`
@@ -713,10 +747,13 @@ mod min_der {
             let bytes = buf
                 .get(start..start + n)
                 .ok_or("truncated DER: missing length bytes")?;
+            // `checked_mul`, not `checked_shl`: a shift only reports shifting by more bits
+            // than the type has, not shifting significant bits off the top — so on 32-bit a
+            // 4-byte length would wrap to something plausible.
             let mut len = 0usize;
             for &b in bytes {
                 len = len
-                    .checked_shl(8)
+                    .checked_mul(256)
                     .and_then(|v| v.checked_add(usize::from(b)))
                     .ok_or("DER length overflow")?;
             }

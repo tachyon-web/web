@@ -81,6 +81,14 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default handshake timeout for TLS connections.
 #[cfg(feature = "tls")]
 pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Per-worker connection ceiling for the plaintext port-80 redirect listener.
+///
+/// Far below [`Server::max_connections`] on purpose: every connection here gets a bodyless
+/// `308` or a challenge token and closes, so the queue drains fast.
+#[cfg(feature = "tls")]
+pub const REDIRECT_MAX_CONNECTIONS: usize = 2048;
+/// Default for [`Server::max_websocket_connections`] — see that field for how to size it.
+pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 25_600;
 /// How long [`Server::serve_all_acme`] waits for the first certificate to be
 /// cached or provisioned before starting the TLS listener regardless.
 #[cfg(feature = "lets-encrypt")]
@@ -259,7 +267,12 @@ pub struct Server<S> {
     /// (and anything built on them, like [`serve_all_acme`]). HTTP/3
     /// ([`serve_h3`]) runs a single QUIC endpoint with its own connection
     /// semaphore, not sharded across the worker pool — for H3 traffic the
-    /// effective ceiling is `max_connections` alone.
+    /// effective ceiling is `max_connections` alone. The same is true of the
+    /// anonymity transports (`serve_tor`/`serve_onion`/`serve_i2p` and their
+    /// `_with_client`/`_with_router` variants, behind the `tor`/`i2p`
+    /// features): each runs one accept loop with its own semaphore, so
+    /// `max_connections` is the whole ceiling for that transport rather than a
+    /// per-core share.
     ///
     /// [`serve_http`]: Server::serve_http
     /// [`serve_https`]: Server::serve_https
@@ -269,6 +282,28 @@ pub struct Server<S> {
     /// Default: 25,600 — matching `actix-server`'s own per-worker
     /// `max_concurrent_connections`.
     pub max_connections: usize,
+    /// Maximum number of concurrent established WebSocket connections, process-wide.
+    ///
+    /// Upgraded connections escape [`max_connections`](Self::max_connections): hyper's
+    /// connection future completes as soon as it hands the socket to the upgrade, releasing
+    /// that permit while the WebSocket lives on in its own task. Without this ceiling a peer
+    /// can hold open an unbounded number of them.
+    ///
+    /// Process-wide rather than per-worker — one semaphore shared by every worker clone and
+    /// every transport.
+    ///
+    /// Size it by memory, not connection count: tungstenite defaults to a 128 KiB read plus
+    /// 128 KiB write buffer per socket, so the default is worth several GiB at saturation.
+    /// Lower it, or the buffers via
+    /// [`WebSocketUpgrade::read_buffer_size`](crate::ws::WebSocketUpgrade::read_buffer_size)
+    /// and [`write_buffer_size`](crate::ws::WebSocketUpgrade::write_buffer_size).
+    ///
+    /// Default: 25,600.
+    pub max_websocket_connections: usize,
+    /// Backs [`max_websocket_connections`](Self::max_websocket_connections). Shared by clone,
+    /// not rebuilt per worker — that's what makes the limit process-wide.
+    #[cfg(feature = "ws")]
+    pub(crate) websocket_permits: Arc<tokio::sync::Semaphore>,
     /// Crypto/TLS policy shared across every listener this `Server` runs — see
     /// [`Server::tls_policy`]. `None` means each listener falls back to
     /// [`TlsPolicy::hardened`](crate::tls::TlsPolicy::hardened).
@@ -285,6 +320,9 @@ where
             router: self.router.clone(),
             max_body_size: self.max_body_size,
             max_connections: self.max_connections,
+            max_websocket_connections: self.max_websocket_connections,
+            #[cfg(feature = "ws")]
+            websocket_permits: self.websocket_permits.clone(),
             #[cfg(feature = "tls")]
             tls_policy: self.tls_policy.clone(),
         }
@@ -304,6 +342,11 @@ impl Server<()> {
             router: compiled,
             max_body_size: 2 * 1024 * 1024, // 2 MiB (matches Axum's `DefaultBodyLimit` default)
             max_connections: 25_600,
+            max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
+            #[cfg(feature = "ws")]
+            websocket_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
+            )),
             #[cfg(feature = "tls")]
             tls_policy: None,
         }
@@ -332,6 +375,10 @@ where
         let extensions = req.extensions_mut();
         let _ = extensions.insert(crate::routing::extract::ConnectInfo(peer));
         let _ = extensions.insert(crate::routing::extract::MaxBodySize(self.max_body_size));
+        // Threaded through extensions because the WebSocket extractor runs inside the router,
+        // with no path back to the `Server`.
+        #[cfg(feature = "ws")]
+        let _ = extensions.insert(crate::ws::WebSocketLimit(self.websocket_permits.clone()));
 
         self.router.handle_request(req).await
     }
@@ -360,6 +407,26 @@ where
     #[must_use]
     pub const fn max_connections(mut self, limit: usize) -> Self {
         self.max_connections = limit;
+        self
+    }
+
+    /// Overrides the maximum number of concurrent established WebSocket connections
+    /// (process-wide, default 25,600) — see
+    /// [`Server::max_websocket_connections`](Self#structfield.max_websocket_connections) for
+    /// why these need a ceiling of their own, and how to size it.
+    ///
+    /// Over-budget upgrades are refused with `503 Service Unavailable` before the handshake
+    /// completes, rather than accepted and then starved.
+    // Only `const`-eligible without `ws`, where there's no semaphore to rebuild — not worth
+    // splitting the signature across features for.
+    #[cfg_attr(not(feature = "ws"), allow(clippy::missing_const_for_fn))]
+    #[must_use]
+    pub fn max_websocket_connections(mut self, limit: usize) -> Self {
+        self.max_websocket_connections = limit;
+        #[cfg(feature = "ws")]
+        {
+            self.websocket_permits = Arc::new(tokio::sync::Semaphore::new(limit));
+        }
         self
     }
 
@@ -634,7 +701,11 @@ where
         use crate::tls::acme::AcmeManager;
         enforce_fips_compliance()?;
 
-        let acme = AcmeManager::new(cache_dir, domains, email, staging);
+        // Built with this server's own policy so the ACME-issued certificate's signing key is
+        // loaded through the same crypto provider the `ServerConfig` below negotiates with —
+        // under `fips` those are distinct modules.
+        let policy = self.effective_tls_policy();
+        let acme = AcmeManager::with_policy(cache_dir, domains, email, staging, &policy);
         let resolver = acme.resolver();
 
         // Start the background renewal loop before attempting to serve.
@@ -663,7 +734,6 @@ where
 
         // Build the TLS config backed by the ACME hot-swap resolver, sharing the same
         // crypto/TLS policy as the onion/i2p listeners (see `Server::tls_policy`).
-        let policy = self.effective_tls_policy();
         let mut tls_config = rustls::ServerConfig::builder_with_provider(policy.provider())
             .with_protocol_versions(policy.versions())
             .map_err(|e| {
@@ -890,16 +960,27 @@ pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
 ///
 /// `308` rather than `301` because it preserves the request method, so redirected `POST`s stay
 /// `POST`s.
+///
+/// Concurrency is capped at [`REDIRECT_MAX_CONNECTIONS`] per worker. This listener is bound to
+/// port 80 and therefore reachable by anyone, but it answers only redirects and ACME
+/// challenges — it never reaches the router — so it uses its own fixed ceiling rather than
+/// [`Server::max_connections`], which sizes the listener that actually runs application
+/// handlers.
 #[cfg(feature = "tls")]
 pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_port: u16) {
     let builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(REDIRECT_MAX_CONNECTIONS));
 
     loop {
+        let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+            return;
+        };
         let (stream, _peer) = match listener.accept().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("[http-redirect] accept error: {e}");
+                drop(permit);
                 if is_resource_exhaustion(&e) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
@@ -961,6 +1042,7 @@ pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_por
                     }),
                 )
                 .await;
+            drop(permit);
         }));
     }
 }
@@ -969,6 +1051,16 @@ pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_por
 ///
 /// This resolves the listener's local address, automatically compiles the router,
 /// and runs the high-performance worker pool.
+///
+/// # `listener` is rebound, not adopted
+///
+/// The worker pool binds one `SO_REUSEPORT` socket per core, so `listener` is read for its
+/// local address and then **dropped** before those are created. Two consequences worth
+/// knowing about: the port is briefly unbound, so on a shared host another process can race
+/// in and take it (the resulting bind failure surfaces as an `Err` here); and a listener bound
+/// to port `0` resolves to a concrete port first, so the workers all land on the same one.
+/// Pass the address to [`Server::start_http`]/[`Server::start_http_addr`] instead if you'd
+/// rather never hold the binding twice.
 ///
 /// # Errors
 ///
@@ -1106,7 +1198,8 @@ mod tests {
         #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
         let mut server = Server::new(Router::new())
             .max_body_size(4096)
-            .max_connections(7);
+            .max_connections(7)
+            .max_websocket_connections(9);
         #[cfg(feature = "tls")]
         {
             server = server.tls_policy(crate::tls::TlsPolicy::hardened().tls13_only());
@@ -1115,6 +1208,21 @@ mod tests {
         let cloned = server.clone();
         assert_eq!(cloned.max_body_size, 4096);
         assert_eq!(cloned.max_connections, 7);
+        assert_eq!(cloned.max_websocket_connections, 9);
+        #[cfg(feature = "ws")]
+        {
+            assert_eq!(cloned.websocket_permits.available_permits(), 9);
+            let _held = server
+                .websocket_permits
+                .clone()
+                .try_acquire_owned()
+                .expect("permit available");
+            assert_eq!(
+                cloned.websocket_permits.available_permits(),
+                8,
+                "clones must draw on one shared budget"
+            );
+        }
         #[cfg(feature = "tls")]
         assert!(cloned.tls_policy.is_some());
     }

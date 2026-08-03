@@ -109,11 +109,16 @@ impl<S: Send + Sync + 'static> Service<Request<Bytes>> for NextService<S> {
         Poll::Ready(Ok(()))
     }
 
+    /// `Next` is one-shot: a `Layer` that calls this twice for one request has nothing left to
+    /// run, and gets a logged `500` rather than a panic through hyper's connection task.
     fn call(&mut self, req: Request<Bytes>) -> Self::Future {
         let next = self.next.take();
         Box::pin(async move {
             let Some(next) = next else {
-                unreachable!("NextService called more than once for the same request")
+                tracing::error!("NextService called more than once for the same request");
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                return Ok(resp);
             };
             let (parts, bytes) = req.into_parts();
             Ok(next

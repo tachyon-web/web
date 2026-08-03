@@ -90,23 +90,20 @@ where
             .headers
             .get(hyper::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
+            .and_then(|s| s.parse::<usize>().ok());
 
-        let cap = if content_length > 0 && content_length <= self.max_body_size {
-            content_length
+        if content_length.is_some_and(|len| len > self.max_body_size) {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        let limit = content_length.unwrap_or(self.max_body_size);
+        let over_limit = if content_length.is_some() {
+            StatusCode::BAD_REQUEST
         } else {
-            0
+            StatusCode::PAYLOAD_TOO_LARGE
         };
 
-        // Strictly enforce zero-trust client allocation limits (DoS prevention).
-        // Pre-allocate up to 256 KiB directly to avoid reallocations for standard payloads.
-        let initial_allocation = if cap > 0 && cap <= 256 * 1024 {
-            cap
-        } else {
-            std::cmp::min(cap, 64 * 1024)
-        };
-        let mut body_vec = Vec::with_capacity(initial_allocation);
+        let mut body_vec = Vec::with_capacity(content_length.unwrap_or(0).min(256 * 1024));
 
         let timeout_res = tokio::time::timeout(REQUEST_TIMEOUT, async {
             loop {
@@ -114,8 +111,8 @@ where
                     Ok(Some(mut chunk)) => {
                         while chunk.has_remaining() {
                             let data = chunk.chunk();
-                            if body_vec.len() + data.len() > self.max_body_size {
-                                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                            if body_vec.len() + data.len() > limit {
+                                return Err(over_limit);
                             }
                             body_vec.extend_from_slice(data);
                             let len = data.len();
@@ -125,6 +122,9 @@ where
                     Ok(None) => break,
                     Err(_) => return Err(StatusCode::BAD_REQUEST),
                 }
+            }
+            if content_length.is_some_and(|declared| body_vec.len() != declared) {
+                return Err(StatusCode::BAD_REQUEST);
             }
             Ok(())
         })
@@ -385,6 +385,86 @@ mod tests {
         assert_eq!(post_response.status(), hyper::StatusCode::OK);
         let post_body = recv_all(&mut post_stream).await;
         assert_eq!(post_body, payload);
+
+        drop(send_request);
+        driver_task.abort();
+    }
+
+    /// A body that doesn't match its declared `Content-Length` is malformed (RFC 9114 §4.1.2)
+    /// and must be rejected in *both* directions.
+    ///
+    /// Over-sending is the tighter of the two bounds: the declared length caps buffering well
+    /// below `max_body_size`, so a client can't declare one byte and then stream megabytes at
+    /// the server before the generic limit notices. Under-sending matters for a different
+    /// reason — a truncated body used to reach the handler silently, looking like a short but
+    /// perfectly well-formed request, where HTTP/1.1 and HTTP/2 both fail it at the framing
+    /// layer.
+    #[tokio::test]
+    async fn h3_content_length_mismatch_is_rejected_in_both_directions() {
+        let app = Router::new().route("/echo", post(echo));
+        // Generous body limit, so it's the declared length doing the rejecting, not `413`.
+        let (addr, cert_pem) = start_h3_server(app, Some(1024 * 1024));
+
+        let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
+
+        for (declared, actual) in [(1usize, 4096usize), (4096, 16)] {
+            let req = hyper::Request::builder()
+                .method("POST")
+                .uri("https://localhost/echo")
+                .header(hyper::header::CONTENT_LENGTH, declared)
+                .body(())
+                .expect("build POST request");
+            let mut stream = send_request
+                .send_request(req)
+                .await
+                .expect("send POST request");
+            stream
+                .send_data(Bytes::from(vec![b'x'; actual]))
+                .await
+                .expect("send POST body");
+            stream.finish().await.expect("finish POST request stream");
+
+            let response = stream.recv_response().await.expect("recv response");
+            assert_eq!(
+                response.status(),
+                hyper::StatusCode::BAD_REQUEST,
+                "declared {declared}, sent {actual}"
+            );
+        }
+
+        drop(send_request);
+        driver_task.abort();
+    }
+
+    /// The happy path the check above must not break: a body whose length matches its declared
+    /// `Content-Length` exactly still round-trips.
+    #[tokio::test]
+    async fn h3_exact_content_length_still_round_trips() {
+        let app = Router::new().route("/echo", post(echo));
+        let (addr, cert_pem) = start_h3_server(app, None);
+
+        let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
+
+        let payload = vec![b'z'; 4096];
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("https://localhost/echo")
+            .header(hyper::header::CONTENT_LENGTH, payload.len())
+            .body(())
+            .expect("build POST request");
+        let mut stream = send_request
+            .send_request(req)
+            .await
+            .expect("send POST request");
+        stream
+            .send_data(Bytes::from(payload.clone()))
+            .await
+            .expect("send POST body");
+        stream.finish().await.expect("finish POST request stream");
+
+        let response = stream.recv_response().await.expect("recv response");
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+        assert_eq!(recv_all(&mut stream).await, payload);
 
         drop(send_request);
         driver_task.abort();

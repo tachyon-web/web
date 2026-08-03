@@ -6120,6 +6120,7 @@ dependencies = [
  "safelog",
  "serde",
  "serde_json",
+ "smallvec",
  "socket2 0.6.5",
  "tachyon-i2p",
  "tempfile",

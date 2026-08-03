@@ -74,6 +74,9 @@ impl HyperBody for DeadlineBody {
 ///
 /// `writev` is opt-in per call site — forcing vectored writes over a TLS stream, which buffers
 /// its own records, is a different tradeoff than over a bare socket.
+///
+/// Gated on `http1` because every call site is, and `unused_macros` is denied.
+#[cfg(feature = "http1")]
 macro_rules! tune_http1 {
     ($builder:expr) => {{
         let tuned = &mut $builder;

@@ -409,6 +409,7 @@ where
         self,
         config: I2pConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        validate_nickname(&config.nickname)?;
         let router = I2pRouter::start(config.nickname.clone()).await?;
         self.serve_i2p_config_with_router(&router, config).await
     }
@@ -472,16 +473,16 @@ where
             };
 
             let state = Arc::new(self);
+            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
             loop {
+                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+                    return Ok(());
+                };
                 let stream = match destination.accept().await {
                     Ok(s) => s,
                     Err(e) => {
-                        // Unlike the TCP `accept()` loops (`serve_http`/`serve_https`), a
-                        // persistently failing `destination.accept()` (e.g. the underlying I2P
-                        // tunnel is down) has no OS-level resource-exhaustion signal to detect —
-                        // so back off unconditionally rather than risk a tight, CPU-spinning
-                        // retry loop if every future `accept()` keeps failing immediately.
                         tracing::debug!("[i2p] accept error: {e}");
+                        drop(permit);
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
@@ -492,6 +493,7 @@ where
                     if let Err(e) = handle_i2p_stream(state, stream, tls_acceptor).await {
                         tracing::debug!("[i2p] connection error: {e}");
                     }
+                    drop(permit);
                 }));
             }
         }
@@ -501,11 +503,16 @@ where
         #[cfg(not(feature = "tls"))]
         {
             let state = Arc::new(self);
+            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
             loop {
+                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+                    return Ok(());
+                };
                 let stream = match destination.accept().await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::debug!("[i2p] accept error: {e}");
+                        drop(permit);
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
@@ -515,6 +522,7 @@ where
                     if let Err(e) = handle_i2p_stream_plaintext(state, stream).await {
                         tracing::debug!("[i2p] connection error: {e}");
                     }
+                    drop(permit);
                 }));
             }
         }
