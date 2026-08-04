@@ -88,10 +88,13 @@ impl Body {
                         message: "Request body exceeds the maximum allowed size".to_string(),
                     })
                 } else {
-                    Err(crate::http::error::Error::Rejection {
-                        status: StatusCode::BAD_REQUEST,
-                        message: format!("Failed to read request body: {e}"),
-                    })
+                    match e.downcast::<crate::http::error::Error>() {
+                        Ok(original) => Err(*original),
+                        Err(e) => Err(crate::http::error::Error::Rejection {
+                            status: StatusCode::BAD_REQUEST,
+                            message: format!("Failed to read request body: {e}"),
+                        }),
+                    }
                 }
             }
         }
