@@ -114,15 +114,27 @@
 use hyper::header::{HeaderMap, HeaderValue, LINK};
 use std::sync::Arc;
 
-/// How many informational responses one request may send.
+/// How many informational responses one request may send, in total.
 ///
 /// [RFC 8297 §2] permits any number, but browsers act on the first and each one costs a
 /// header block on the wire. A small cap keeps a buggy handler from turning a hot path into
 /// a frame storm while leaving room for the legitimate "hint what I know now, hint the rest
 /// once the session is resolved" pattern.
 ///
+/// This is a lifetime budget for the request, not a queue depth: the transport drains hints
+/// as fast as the handler queues them, so a bound on the channel alone would let a handler
+/// looping on [`EarlyHints::send`] emit frames without limit — and, because the transport
+/// drains before it polls the handler, starve its own response in the process.
+///
 /// [RFC 8297 §2]: https://www.rfc-editor.org/rfc/rfc8297#section-2
 pub const MAX_HINTS_PER_REQUEST: usize = 4;
+
+/// How many `Link` values one hint may carry.
+///
+/// A header block big enough to exceed the peer's `SETTINGS_MAX_HEADER_LIST_SIZE` is
+/// refused wholesale, taking the hint's useful links down with the surplus, so the block is
+/// truncated here instead.
+pub const MAX_LINKS_PER_HINT: usize = 32;
 
 /// A fetch destination, the `as=` parameter of a `rel=preload` link.
 ///
@@ -513,30 +525,40 @@ impl Link {
 ///
 /// Rejects the delimiters themselves, ASCII whitespace, and every control character —
 /// including the CR and LF that would otherwise let a caller inject a header of their own.
+/// Restricted to visible ASCII: everything a URI reference may legally contain, and nothing
+/// else. `obs-text` (0x80-0xFF) is legal in a header value but never legal in a URI, so
+/// accepting it would only widen what a target built from user input can smuggle through.
 fn is_safe_target(target: &str) -> bool {
     !target.is_empty()
         && target
             .bytes()
-            .all(|b| b > 0x20 && b != b'<' && b != b'>' && b != 0x7f)
+            .all(|b| b > 0x20 && b < 0x7f && b != b'<' && b != b'>')
 }
 
 /// Whether a value can safely sit inside a `Link` parameter's quoted-string.
 ///
-/// Rejects the closing quote, the backslash that would escape it, and control characters.
+/// Rejects the closing quote, the backslash that would escape it, and everything outside
+/// visible ASCII plus space — see [`is_safe_target`] on why `obs-text` is refused.
 fn is_safe_quoted(value: &str) -> bool {
     value
         .bytes()
-        .all(|b| b >= 0x20 && b != b'"' && b != b'\\' && b != 0x7f)
+        .all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
 }
 
 /// Renders `links` into the header block of a `103` response, once.
 ///
 /// Links that fail validation are dropped with a warning rather than poisoning the whole
-/// block — one bad target should not cost the others their head start.
+/// block — one bad target should not cost the others their head start. At most
+/// [`MAX_LINKS_PER_HINT`] survive; the rest are dropped so an oversized block cannot cost
+/// the hint every link it carried.
 #[must_use]
 pub fn links_to_headers(links: impl IntoIterator<Item = Link>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     for link in links {
+        if headers.len() >= MAX_LINKS_PER_HINT {
+            tracing::warn!("early-hint truncated at {MAX_LINKS_PER_HINT} links");
+            break;
+        }
         match link.to_header_value() {
             Some(value) => {
                 let _ = headers.append(LINK, value);
@@ -630,7 +652,15 @@ pub(crate) type HintSender = tokio::sync::mpsc::Sender<HeaderMap>;
 pub struct EarlyHints {
     /// `None` on a transport that cannot emit informational responses, or when the request
     /// did not pass [`EarlyHintsConfig::permits`].
-    sender: Option<Arc<HintSender>>,
+    sender: Option<Arc<HintChannel>>,
+}
+
+/// The sender plus this request's remaining hint budget, shared by every clone of a handle.
+pub(crate) struct HintChannel {
+    sender: HintSender,
+    /// Counts sends that were accepted. Compared against [`MAX_HINTS_PER_REQUEST`] rather
+    /// than relying on the channel filling up, because the transport drains it eagerly.
+    sent: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for EarlyHints {
@@ -652,7 +682,10 @@ impl EarlyHints {
     /// Wires a handle to a transport's hint channel.
     pub(crate) fn new(sender: HintSender) -> Self {
         Self {
-            sender: Some(Arc::new(sender)),
+            sender: Some(Arc::new(HintChannel {
+                sender,
+                sent: std::sync::atomic::AtomicUsize::new(0),
+            })),
         }
     }
 
@@ -707,16 +740,23 @@ impl EarlyHints {
         Self::send_headers_via(sender, headers)
     }
 
-    fn send_headers_via(sender: &HintSender, headers: HeaderMap) -> bool {
-        // `try_send` rather than `send`: the channel is full when the budget is spent, and
-        // closed once the final response is on the wire. Both mean "drop it", not "wait".
-        match sender.try_send(headers) {
+    fn send_headers_via(channel: &HintChannel, headers: HeaderMap) -> bool {
+        use std::sync::atomic::Ordering;
+
+        if channel
+            .sent
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sent| {
+                (sent < MAX_HINTS_PER_REQUEST).then_some(sent + 1)
+            })
+            .is_err()
+        {
+            tracing::debug!("early-hint dropped: request already sent {MAX_HINTS_PER_REQUEST}");
+            return false;
+        }
+
+        match channel.sender.try_send(headers) {
             Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::debug!("early-hint dropped: request already sent {MAX_HINTS_PER_REQUEST}");
-                false
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            Err(_) => false,
         }
     }
 }
@@ -825,7 +865,10 @@ mod tests {
             "",
         ] {
             assert!(
-                Link::preload(hostile).as_script().to_header_value().is_none(),
+                Link::preload(hostile)
+                    .as_script()
+                    .to_header_value()
+                    .is_none(),
                 "accepted hostile target {hostile:?}",
             );
         }
@@ -904,12 +947,20 @@ mod tests {
         for _ in 0..super::MAX_HINTS_PER_REQUEST {
             assert!(hints.send([Link::preconnect("https://cdn.example.com")]));
         }
-        // Budget spent; the transport hasn't drained anything yet.
         assert!(!hints.send([Link::preconnect("https://cdn.example.com")]));
 
-        // Draining frees the budget again, as it would on a live connection.
+        // The budget is for the request, not for the queue: draining what the transport
+        // has already taken must not hand the handler a fresh allowance, or a handler
+        // looping on `send` would emit frames without limit.
         let _ = receiver.recv().await;
-        assert!(hints.send([Link::preconnect("https://cdn.example.com")]));
+        assert!(!hints.send([Link::preconnect("https://cdn.example.com")]));
+
+        // A clone shares the budget rather than getting one of its own.
+        assert!(
+            !hints
+                .clone()
+                .send([Link::preconnect("https://cdn.example.com")])
+        );
 
         // Once the final response is on the wire the transport drops the receiver.
         drop(receiver);

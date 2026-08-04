@@ -179,8 +179,7 @@ where
         let full_resp = if hints_permitted {
             let (mut receiver, handle) = crate::http::early_hints::channel();
             let _ = req.extensions_mut().insert(handle);
-            let dispatch = std::pin::pin!(self.dispatch(req, peer));
-            let mut dispatch = dispatch;
+            let mut dispatch = std::pin::pin!(self.dispatch(req, peer));
             loop {
                 tokio::select! {
                     biased;

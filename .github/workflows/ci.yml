@@ -18,69 +18,53 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  fmt:
-    name: rustfmt
+  checks:
+    name: fmt / clippy / msrv / parity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-      - run: cargo fmt --all --check
-
-  clippy:
-    name: clippy (default features)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v1-rust
-      - run: cargo clippy --locked -p tachyon-web --all-targets
-
-  test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
         with:
-          prefix-key: v1-rust
-      - run: cargo test --locked -p tachyon-web
+          tool: cargo-audit
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: cargo-audit
+        run: cargo audit
+      - name: clippy (default features)
+        run: cargo clippy --locked -p tachyon-web --all-targets
+      - name: axum parity
+        run: cargo test --locked -p parity-tests
+      - uses: dtolnay/rust-toolchain@1.92
+      - name: msrv (1.92)
+        run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
 
-  features:
-    name: "features: ${{ matrix.name }}"
-    runs-on: ubuntu-latest
+  build:
+    name: "${{ matrix.name }}"
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          - name: default (linux)
+            os: ubuntu-latest
+          - name: default (macos)
+            os: macos-latest
+          - name: default (windows)
+            os: windows-latest
           - name: minimal (http1 only)
             flags: --no-default-features --features http1
           - name: http2 only (h2c, no HTTP/1.1 fallback)
             flags: --no-default-features --features http2
-          - name: extractors (json, form, query, cookies)
+          - name: extractors (no default features)
             flags: --no-default-features --features http1,json,form,query,cookies,matched-path,original-uri
-          - name: websockets
-            flags: --features ws
-          - name: server-sent events
-            flags: --features sse
-          - name: tower interop
-            flags: --features tower,tower-log
-          - name: tls + self-signed certs
-            flags: --features tls,cert-gen
-          - name: acme / let's encrypt
-            flags: --features lets-encrypt
-          - name: http/3 (quic)
-            flags: --features http3
+          - name: transports + interop (ws, sse, tower, tls, acme, http/3)
+            flags: --features ws,sse,tower,tower-log,tls,cert-gen,lets-encrypt,http3
           - name: full (no tor/i2p)
             flags: --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
     steps:
@@ -93,31 +77,10 @@ jobs:
           prefix-key: v1-rust
           key: ${{ matrix.name }}
       - name: clippy
+        if: matrix.flags
         run: cargo clippy --locked -p tachyon-web --all-targets ${{ matrix.flags }}
       - name: test
         run: cargo test --locked -p tachyon-web ${{ matrix.flags }}
-
-  parity:
-    name: axum parity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust
-      - run: cargo test --locked -p parity-tests
-
-  msrv:
-    name: msrv (1.92)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.92
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust
-      - run: cargo check --locked -p tachyon-web --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3
 
   docs:
     name: rustdoc
@@ -133,14 +96,3 @@ jobs:
       - name: Install cmake (i2pd-sys builds its vendored C++ router)
         run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo doc --locked -p tachyon-web --all-features --no-deps
-
-  audit:
-    name: cargo-audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - run: cargo audit

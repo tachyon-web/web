@@ -445,19 +445,28 @@ mod tests {
         match encoding {
             #[cfg(feature = "compression-gzip")]
             Encoding::Gzip => {
-                flate2::read::GzDecoder::new(bytes).read_to_end(&mut out).unwrap();
+                flate2::read::GzDecoder::new(bytes)
+                    .read_to_end(&mut out)
+                    .unwrap();
             }
             #[cfg(feature = "compression-deflate")]
             Encoding::Deflate => {
-                flate2::read::ZlibDecoder::new(bytes).read_to_end(&mut out).unwrap();
+                flate2::read::ZlibDecoder::new(bytes)
+                    .read_to_end(&mut out)
+                    .unwrap();
             }
             #[cfg(feature = "compression-br")]
             Encoding::Brotli => {
-                brotli::Decompressor::new(bytes, 8192).read_to_end(&mut out).unwrap();
+                brotli::Decompressor::new(bytes, 8192)
+                    .read_to_end(&mut out)
+                    .unwrap();
             }
             #[cfg(feature = "compression-zstd")]
             Encoding::Zstd => {
-                zstd::stream::read::Decoder::new(bytes).unwrap().read_to_end(&mut out).unwrap();
+                zstd::stream::read::Decoder::new(bytes)
+                    .unwrap()
+                    .read_to_end(&mut out)
+                    .unwrap();
             }
             // Unreachable: the caller skips codings without a compiled-in encoder, and
             // every encoder feature also brings in its decoder.

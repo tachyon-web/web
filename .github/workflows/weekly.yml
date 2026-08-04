@@ -1,0 +1,41 @@
+name: Weekly audit check
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  audit:
+    name: cargo-audit (advisories filed since last run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  check:
+    name: check (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install CMake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: cargo check
+        run: cargo check --locked -p tachyon-web --all-features --all-targets
+      - name: clippy
+        run: cargo clippy --locked -p tachyon-web --all-features --all-targets

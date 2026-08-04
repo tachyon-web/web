@@ -120,8 +120,6 @@ const STREAM_THRESHOLD: u64 = 1024 * 1024;
 /// Chunk size used when streaming a file off disk.
 const STREAM_CHUNK: usize = 64 * 1024;
 
-/// Whether `accept_encoding` positively accepts `token`: a token match against each
-/// comma-separated coding, honoring `q=0` (a client's explicit refusal of that coding).
 /// Server preference among pre-compressed sidecars.
 ///
 /// Brotli leads here even though [`DEFAULT_PREFERENCE`] leads with zstd. That default is
@@ -155,16 +153,20 @@ fn strip_weak(tag: &str) -> &str {
     tag.strip_prefix("W/").unwrap_or(tag)
 }
 
+/// One representation of an asset: the bytes, and the entity tag that identifies *these*
+/// bytes rather than the file they were derived from.
+///
+/// The tag matters as much as the content. A content coding produces a different
+/// representation ([RFC 9110 §8.8.3]), so the gzip, Brotli and zstd sidecars of one file may
+/// not share a strong tag: a client that cached the Brotli variant and revalidates with
+/// `If-None-Match` while asking for gzip would be told `304`, and would go on using Brotli
+/// bytes labelled `Content-Encoding: gzip`. Each variant therefore carries the base tag with
+/// its coding folded in, computed once at crawl time.
+///
+/// [RFC 9110 §8.8.3]: https://www.rfc-editor.org/rfc/rfc9110#section-8.8.3
 #[derive(Clone, Debug)]
-struct StaticAsset {
-    /// Raw (identity) content.
+struct Representation {
     content: Bytes,
-    /// Pre-compressed gzip variant, if available alongside the original file.
-    content_gz: Option<Bytes>,
-    /// Pre-compressed brotli variant, if available alongside the original file.
-    content_br: Option<Bytes>,
-    /// Pre-compressed zstd variant, if available alongside the original file.
-    content_zst: Option<Bytes>,
     /// `ETag` value: hex-encoded content length plus a cheap rolling-hash fingerprint
     /// of the content's first 8 and last 4 bytes (see `make_etag`) — not a
     /// cryptographic or full-content hash, so it's sized for change-detection, not
@@ -174,19 +176,71 @@ struct StaticAsset {
     /// request path only ever needs a cheap `Bytes`-backed clone instead of re-parsing
     /// (and re-validating) `etag` on every cache hit via `HeaderValue::from_str`.
     etag_header: hyper::header::HeaderValue,
+}
+
+impl Representation {
+    /// The identity representation, whose tag is the base one every variant extends.
+    fn identity(content: Bytes) -> Self {
+        let etag = make_etag(&content);
+        let etag_header = hyper::header::HeaderValue::from_str(&etag)
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("\"0\""));
+        Self {
+            content,
+            etag,
+            etag_header,
+        }
+    }
+
+    /// A sidecar representation, tagged as the base tag plus the coding it was compressed
+    /// with — `"deadbeef"` becomes `"deadbeef-br"`.
+    fn sidecar(content: Bytes, base_etag: &str, encoding: Encoding) -> Self {
+        // The suffix goes *inside* the quotes, so the result is still a valid entity tag.
+        // `make_etag` always quotes, so the fallback is unreachable in practice.
+        let etag = base_etag.strip_suffix('"').map_or_else(
+            || format!("{base_etag}-{}", encoding.as_str()),
+            |head| format!("{head}-{}\"", encoding.as_str()),
+        );
+        let etag_header = hyper::header::HeaderValue::from_str(&etag)
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("\"0\""));
+        Self {
+            content,
+            etag,
+            etag_header,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StaticAsset {
+    /// Raw (identity) content.
+    identity: Representation,
+    /// Pre-compressed gzip variant, if available alongside the original file.
+    gz: Option<Representation>,
+    /// Pre-compressed brotli variant, if available alongside the original file.
+    br: Option<Representation>,
+    /// Pre-compressed zstd variant, if available alongside the original file.
+    zst: Option<Representation>,
     headers: hyper::HeaderMap,
 }
 
 impl StaticAsset {
     /// The pre-compressed variant for `encoding`, or `None` when no sidecar of that coding
     /// was found next to the file at crawl time. `Identity` never has a sidecar — it *is*
-    /// the file — so it returns `None` and callers fall back to `content`.
-    const fn sidecar(&self, encoding: Encoding) -> Option<&Bytes> {
+    /// the file — so it returns `None` and callers fall back to the identity representation.
+    const fn sidecar(&self, encoding: Encoding) -> Option<&Representation> {
         match encoding {
-            Encoding::Brotli => self.content_br.as_ref(),
-            Encoding::Zstd => self.content_zst.as_ref(),
-            Encoding::Gzip => self.content_gz.as_ref(),
+            Encoding::Brotli => self.br.as_ref(),
+            Encoding::Zstd => self.zst.as_ref(),
+            Encoding::Gzip => self.gz.as_ref(),
             Encoding::Identity | Encoding::Deflate => None,
+        }
+    }
+
+    /// The representation to send for `encoding`, falling back to identity.
+    const fn representation(&self, encoding: Encoding) -> &Representation {
+        match self.sidecar(encoding) {
+            Some(sidecar) => sidecar,
+            None => &self.identity,
         }
     }
 }
@@ -376,6 +430,12 @@ impl ServeDir {
                 continue;
             }
 
+            // Skip compressed sidecar files — but only when they actually *are* a sidecar
+            // of some other cached file (i.e. the uncompressed base file exists next to
+            // them). A standalone downloadable archive with no uncompressed sibling (e.g.
+            // `release.tar.gz`) has no base to be loaded as a variant of, so it must still
+            // be crawled and cached under its own key — otherwise it 404s in preloaded mode
+            // while serving fine from disk in dynamic mode.
             let path_str = path.to_string_lossy();
             if let Some(base_str) = path_str
                 .strip_suffix(".gz")
@@ -396,6 +456,9 @@ impl ServeDir {
                 continue;
             }
 
+            // Check total RAM budget before reading. `current_total` is a running
+            // accumulator updated as each asset is inserted, avoiding an O(n) rescan
+            // of the whole cache (and thus O(n^2) behaviour) for every file crawled.
             if *current_total >= max_total_bytes {
                 tracing::warn!("ram cache budget exhausted, remaining files served from disk");
                 break;
@@ -410,42 +473,45 @@ impl ServeDir {
                 Err(_) => continue,
             };
 
-            // Attempt to load pre-compressed sidecar files.
-            let gz_path = PathBuf::from(format!("{}.gz", path.display()));
-            let br_path = PathBuf::from(format!("{}.br", path.display()));
-            let zst_path = PathBuf::from(format!("{}.zst", path.display()));
-            let content_gz = fs::read(&gz_path).await.ok().map(Bytes::from);
-            let content_br = fs::read(&br_path).await.ok().map(Bytes::from);
-            let content_zst = fs::read(&zst_path).await.ok().map(Bytes::from);
+            // Compute a fast ETag from content length + first 8 bytes. Each sidecar derives
+            // its own tag from this one, so it has to exist before they are built.
+            let identity = Representation::identity(Bytes::from(content));
 
-            // Compute a fast ETag from content length + first 8 bytes.
-            let etag = make_etag(&content);
-            let etag_header = hyper::header::HeaderValue::from_str(&etag)
-                .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("\"0\""));
+            // Attempt to load pre-compressed sidecar files.
+            let sidecar = async |extension: &str, encoding: Encoding| {
+                let path = PathBuf::from(format!("{}.{extension}", path.display()));
+                let content = fs::read(&path).await.ok()?;
+                Some(Representation::sidecar(
+                    Bytes::from(content),
+                    &identity.etag,
+                    encoding,
+                ))
+            };
+            let gz = sidecar("gz", Encoding::Gzip).await;
+            let br = sidecar("br", Encoding::Brotli).await;
+            let zst = sidecar("zst", Encoding::Zstd).await;
 
             let mut headers = base_asset_headers(guess_mime_type(&path));
             // Vary: Accept-Encoding whenever we have compressed variants.
-            if content_gz.is_some() || content_br.is_some() || content_zst.is_some() {
+            if gz.is_some() || br.is_some() || zst.is_some() {
                 let _ = headers.insert(
                     VARY,
                     hyper::header::HeaderValue::from_static("Accept-Encoding"),
                 );
             }
 
-            *current_total += content.len()
-                + content_gz.as_ref().map_or(0, Bytes::len)
-                + content_br.as_ref().map_or(0, Bytes::len)
-                + content_zst.as_ref().map_or(0, Bytes::len);
+            let variant_len =
+                |variant: &Option<Representation>| variant.as_ref().map_or(0, |v| v.content.len());
+            *current_total +=
+                identity.content.len() + variant_len(&gz) + variant_len(&br) + variant_len(&zst);
 
             let _ = cache.insert(
                 relative,
                 StaticAsset {
-                    content: Bytes::from(content),
-                    content_gz,
-                    content_br,
-                    content_zst,
-                    etag,
-                    etag_header,
+                    identity,
+                    gz,
+                    br,
+                    zst,
                     headers,
                 },
             );
@@ -693,10 +759,6 @@ impl ServeDir {
     ) -> Option<Response<Body>> {
         let asset = self.memory_cache.as_ref()?.get(resolved)?;
 
-        if if_none_match_matches(if_none_match, &asset.etag) {
-            return Some(not_modified());
-        }
-
         // Only offer codings this asset actually has a sidecar for, so negotiation can't
         // settle on one that would then fall back to identity and lose to a coding the
         // client ranked lower but which was available.
@@ -707,14 +769,20 @@ impl ServeDir {
             }
         }
         let encoding = negotiate(accept_encoding, &available);
-        let body_bytes = asset
-            .sidecar(encoding)
-            .cloned()
-            .unwrap_or_else(|| asset.content.clone());
+        let representation = asset.representation(encoding);
 
-        let mut resp = Response::new(Body::full(body_bytes));
+        // Validated against the tag of the representation this request would actually be
+        // served, not the file's — a client holding the Brotli variant must not be handed a
+        // `304` when it is now asking for gzip.
+        if if_none_match_matches(if_none_match, &representation.etag) {
+            return Some(not_modified());
+        }
+
+        let mut resp = Response::new(Body::full(representation.content.clone()));
         *resp.headers_mut() = asset.headers.clone();
-        let _ = resp.headers_mut().insert(ETAG, asset.etag_header.clone());
+        let _ = resp
+            .headers_mut()
+            .insert(ETAG, representation.etag_header.clone());
         if encoding != Encoding::Identity {
             let _ = resp
                 .headers_mut()
@@ -1138,15 +1206,7 @@ mod tests {
     /// not identity.
     #[test]
     fn negotiation_is_limited_to_the_sidecars_that_exist() {
-        let asset = StaticAsset {
-            content: Bytes::from_static(b"original"),
-            content_gz: Some(Bytes::from_static(b"gzipped")),
-            content_br: None,
-            content_zst: None,
-            etag: "\"e\"".to_string(),
-            etag_header: hyper::header::HeaderValue::from_static("\"e\""),
-            headers: hyper::HeaderMap::new(),
-        };
+        let asset = gzip_only_asset();
 
         let available: Vec<Encoding> = SIDECAR_PREFERENCE
             .into_iter()
@@ -1154,6 +1214,47 @@ mod tests {
             .collect();
         assert_eq!(negotiate("br, gzip, zstd", &available), Encoding::Gzip);
         assert_eq!(negotiate("br, zstd", &available), Encoding::Identity);
+    }
+
+    fn gzip_only_asset() -> StaticAsset {
+        let identity = Representation::identity(Bytes::from_static(b"original"));
+        let gz = Representation::sidecar(
+            Bytes::from_static(b"gzipped"),
+            &identity.etag,
+            Encoding::Gzip,
+        );
+        StaticAsset {
+            identity,
+            gz: Some(gz),
+            br: None,
+            zst: None,
+            headers: hyper::HeaderMap::new(),
+        }
+    }
+
+    /// A content coding is a different representation, so it may not reuse the identity
+    /// entity tag: a client that cached the gzip variant and revalidates while asking for
+    /// identity would otherwise be told `304` and go on using gzip bytes as if they were
+    /// the file.
+    #[test]
+    fn each_representation_carries_its_own_etag() {
+        let asset = gzip_only_asset();
+        let identity = asset.representation(Encoding::Identity);
+        let gzip = asset.representation(Encoding::Gzip);
+
+        assert_ne!(identity.etag, gzip.etag);
+        assert_eq!(
+            gzip.etag,
+            format!("{}-gzip\"", &identity.etag[..identity.etag.len() - 1])
+        );
+        // Still a quoted, syntactically valid entity tag.
+        assert!(gzip.etag.starts_with('"') && gzip.etag.ends_with('"'));
+        assert_eq!(gzip.etag_header.to_str().unwrap(), gzip.etag);
+
+        // A tag from one variant must not validate another.
+        assert!(if_none_match_matches(&gzip.etag, &gzip.etag));
+        assert!(!if_none_match_matches(&gzip.etag, &identity.etag));
+        assert!(!if_none_match_matches(&identity.etag, &gzip.etag));
     }
 
     /// A large file must be served without ever holding its full contents in memory, and must

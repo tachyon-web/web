@@ -81,10 +81,15 @@ fn decode(encoding: Encoding, bytes: &[u8]) -> String {
 /// The codings this build can actually produce, so the suite exercises whatever feature set
 /// it was compiled with rather than failing on an absent codec.
 fn available() -> Vec<Encoding> {
-    [Encoding::Zstd, Encoding::Brotli, Encoding::Gzip, Encoding::Deflate]
-        .into_iter()
-        .filter(|e| e.encoder_available())
-        .collect()
+    [
+        Encoding::Zstd,
+        Encoding::Brotli,
+        Encoding::Gzip,
+        Encoding::Deflate,
+    ]
+    .into_iter()
+    .filter(|e| e.encoder_available())
+    .collect()
 }
 
 #[tokio::test]
@@ -108,11 +113,11 @@ async fn every_enabled_coding_decodes_with_its_reference_decoder() {
             "server did not apply {encoding}",
         );
         assert!(
-            response
-                .headers()
-                .get_all("vary")
-                .iter()
-                .any(|v| v.to_str().unwrap().to_ascii_lowercase().contains("accept-encoding")),
+            response.headers().get_all("vary").iter().any(|v| v
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("accept-encoding")),
             "{encoding} response is missing Vary: Accept-Encoding",
         );
 
@@ -160,7 +165,10 @@ async fn client_q_values_choose_the_coding() {
         response.headers().get("content-encoding").unwrap(),
         wanted.as_str(),
     );
-    assert_eq!(decode(wanted, &response.bytes().await.unwrap()), body_text());
+    assert_eq!(
+        decode(wanted, &response.bytes().await.unwrap()),
+        body_text()
+    );
 }
 
 /// `q=0` is a refusal. Refusing everything the server has must yield identity bytes, not a

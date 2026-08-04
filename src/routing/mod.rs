@@ -14,7 +14,22 @@ pub mod tower_compat;
 
 use crate::http::response::{Body, IntoResponse};
 use crate::routing::extract::PathParams;
+
 pub use handler::{BoxedFuture, BoxedHandler, Handler};
+
+/// Emits a pre-rendered `103 Early Hints` block for `req`, if the transport wired one up.
+///
+/// Shared by the [`MethodRouter`] and [`Router`] forms of `early_hints`, which differ only
+/// in what they are attached to.
+#[cfg(feature = "early-hints")]
+fn fire_early_hints(req: &Request<Body>, headers: hyper::HeaderMap) {
+    if let Some(hints) = req
+        .extensions()
+        .get::<crate::http::early_hints::EarlyHints>()
+    {
+        let _ = hints.send_headers(headers);
+    }
+}
 
 const IDX_GET: usize = 0;
 const IDX_POST: usize = 1;
@@ -243,12 +258,7 @@ where
         self.hoop(move |req, next| {
             let headers = headers.clone();
             async move {
-                if let Some(hints) = req
-                    .extensions()
-                    .get::<crate::http::early_hints::EarlyHints>()
-                {
-                    let _ = hints.send_headers(headers);
-                }
+                fire_early_hints(&req, headers);
                 next.run(req).await
             }
         })
@@ -1070,12 +1080,7 @@ where
         self.hoop(move |req, next| {
             let headers = headers.clone();
             async move {
-                if let Some(hints) = req
-                    .extensions()
-                    .get::<crate::http::early_hints::EarlyHints>()
-                {
-                    let _ = hints.send_headers(headers);
-                }
+                fire_early_hints(&req, headers);
                 next.run(req).await
             }
         })
@@ -1102,16 +1107,21 @@ where
     /// ```
     #[must_use]
     pub fn compression(self, compression: crate::http::compression::Compression) -> Self {
+        // One `Arc` for the whole router rather than a `Compression` clone per request: the
+        // config is read-only once built, so every request can share the same one.
+        let compression = std::sync::Arc::new(compression);
         self.hoop(move |req, next| {
-            let compression = compression.clone();
+            let compression = std::sync::Arc::clone(&compression);
             async move {
                 // Taken before `next.run` consumes the request; the response it returns is
                 // what gets negotiated against. Cloning the `HeaderValue` rather than
                 // copying out a `String` keeps this to a refcount bump on its bytes.
-                let accept_encoding =
-                    req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
+                let accept_encoding = req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
                 let response = next.run(req).await;
-                match accept_encoding.as_ref().and_then(|value| value.to_str().ok()) {
+                match accept_encoding
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok())
+                {
                     Some(accept_encoding) => compression.apply_to(accept_encoding, response).await,
                     None => response,
                 }

@@ -404,7 +404,10 @@ where
         // than copying out a `String` keeps this to a refcount bump on its backing bytes.
         let accept_encoding = req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
         let response = self.router.handle_request(req).await;
-        match accept_encoding.as_ref().and_then(|value| value.to_str().ok()) {
+        match accept_encoding
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+        {
             Some(accept_encoding) => compression.apply_to(accept_encoding, response).await,
             None => response,
         }
@@ -464,10 +467,7 @@ where
     /// [`EarlyHints`]: crate::http::early_hints::EarlyHints
     #[cfg(feature = "early-hints")]
     #[must_use]
-    pub const fn early_hints(
-        mut self,
-        config: crate::http::early_hints::EarlyHintsConfig,
-    ) -> Self {
+    pub const fn early_hints(mut self, config: crate::http::early_hints::EarlyHintsConfig) -> Self {
         self.early_hints = Some(config);
         self
     }

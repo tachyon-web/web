@@ -20,8 +20,6 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/transports.yml'
-  schedule:
-    - cron: '0 4 * * 1'
   workflow_dispatch:
 
 concurrency:
@@ -36,44 +34,10 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  tor:
-    name: tor (.onion)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust
-          key: tor
-      - run: cargo clippy --locked -p tachyon-web --all-targets --features tor,tls,cert-gen
-      - run: cargo test --locked -p tachyon-web --features tor,tls,cert-gen
-
-  i2p:
-    name: i2p (.b32.i2p)
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Install CMake
-        run: sudo apt-get update && sudo apt-get install -y cmake
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v1-rust
-          key: i2p
-      - run: cargo clippy --locked -p tachyon-web --all-targets --features i2p,tls,cert-gen
-      - run: cargo test --locked -p tachyon-web --features i2p,tls,cert-gen
-
   all-features:
     name: all features
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

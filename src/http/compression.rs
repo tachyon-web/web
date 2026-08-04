@@ -42,6 +42,26 @@
 //!   already compressed (JPEG, WOFF2, MP4, …) and `text/event-stream`, whose whole point
 //!   is per-event delivery.
 //!
+//! # BREACH
+//!
+//! Compressing a response that contains both a secret and attacker-influenced text leaks the
+//! secret. The attacker varies the text they control, watches the coded length, and keeps
+//! whatever guess compressed best — a CSRF token falls in a few thousand requests. TLS does
+//! not help; the length is visible regardless.
+//!
+//! Compression is off by default, and turning it on is the point at which to check:
+//!
+//! - Does any compressed response embed a CSRF token, session identifier, or API key
+//!   *alongside* text derived from the request (a search term, a `?q=`, a reflected name)?
+//!   Exclude those responses with [`Compression::predicate`], or move the secret to a header
+//!   or a `Set-Cookie`, neither of which is part of the body.
+//! - Over Tor or I2P, coded length is also a fingerprint: it varies with content in a way a
+//!   padded, uniform response does not, which is worth weighing against the bandwidth saved
+//!   on a link that is already slow.
+//!
+//! [`ServeDir`](crate::ServeDir) assets are static and request-independent, so they are not
+//! exposed to this.
+//!
 //! # Interaction with `ETag`
 //!
 //! A content coding produces a different representation, so it must not keep a *strong*
@@ -232,51 +252,81 @@ fn parse_quality(raw: &str) -> Option<Quality> {
     Some((int.saturating_mul(1000).saturating_add(frac)).min(Q_MAX))
 }
 
-/// The q-value a client assigned to `encoding`, resolving the `*` wildcard.
+/// Every q-value a client expressed, indexed by [`Encoding`], plus the `*` wildcard.
 ///
-/// Returns `None` when the coding is not acceptable at all — either listed with `q=0`, or
-/// unlisted with a `*;q=0` in effect. Per [RFC 9110 §12.5.3], an unlisted `identity` is
-/// acceptable unless a wildcard refuses it, while any other unlisted coding is not.
-///
-/// [RFC 9110 §12.5.3]: https://www.rfc-editor.org/rfc/rfc9110#section-12.5.3
-fn quality_of(accept_encoding: &str, encoding: Encoding) -> Option<Quality> {
-    let mut wildcard: Option<Quality> = None;
-    let mut exact: Option<Quality> = None;
+/// Parsing `Accept-Encoding` once into this and answering from it beats re-scanning the
+/// header per candidate coding: the header is attacker-controlled and can run to the
+/// connection's whole header allowance, so a pass per codec turns one large header into
+/// four large scans.
+#[derive(Default)]
+struct AcceptedEncodings {
+    /// Indexed by [`Encoding::index`]; `None` where the coding went unmentioned.
+    exact: [Option<Quality>; 5],
+    wildcard: Option<Quality>,
+}
 
-    for element in accept_encoding.split(',') {
-        let mut parts = element.split(';').map(str::trim);
-        let Some(token) = parts.next().filter(|t| !t.is_empty()) else {
-            continue;
-        };
-        let quality = parts
-            .find_map(|param| {
-                param
-                    .split_once('=')
-                    .filter(|(key, _)| key.trim().eq_ignore_ascii_case("q"))
-                    .map(|(_, value)| parse_quality(value).unwrap_or(0))
-            })
-            .unwrap_or(Q_MAX);
-
-        if token == "*" {
-            // A repeated wildcard is malformed; the last one wins, as with any duplicate.
-            wildcard = Some(quality);
-        } else if Encoding::from_token(token) == Some(encoding) {
-            exact = Some(quality);
+impl Encoding {
+    /// Dense index into [`AcceptedEncodings::exact`].
+    const fn index(self) -> usize {
+        match self {
+            Self::Identity => 0,
+            Self::Deflate => 1,
+            Self::Gzip => 2,
+            Self::Brotli => 3,
+            Self::Zstd => 4,
         }
     }
+}
 
-    let effective = match (exact, wildcard) {
-        // An explicit entry always beats the wildcard, even a lower one.
-        (Some(q), _) | (None, Some(q)) => q,
-        (None, None) => {
-            if encoding == Encoding::Identity {
-                Q_MAX
-            } else {
-                return None;
+impl AcceptedEncodings {
+    /// Parses an `Accept-Encoding` field value in a single pass.
+    fn parse(accept_encoding: &str) -> Self {
+        let mut parsed = Self::default();
+        for element in accept_encoding.split(',') {
+            let mut parts = element.split(';').map(str::trim);
+            let Some(token) = parts.next().filter(|t| !t.is_empty()) else {
+                continue;
+            };
+            let quality = parts
+                .find_map(|param| {
+                    param
+                        .split_once('=')
+                        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("q"))
+                        .map(|(_, value)| parse_quality(value).unwrap_or(0))
+                })
+                .unwrap_or(Q_MAX);
+
+            if token == "*" {
+                // A repeated wildcard is malformed; the last one wins, as with any duplicate.
+                parsed.wildcard = Some(quality);
+            } else if let Some(encoding) = Encoding::from_token(token) {
+                parsed.exact[encoding.index()] = Some(quality);
             }
         }
-    };
-    (effective > 0).then_some(effective)
+        parsed
+    }
+
+    /// The q-value the client assigned to `encoding`, resolving the `*` wildcard.
+    ///
+    /// Returns `None` when the coding is not acceptable at all — either listed with `q=0`,
+    /// or unlisted with a `*;q=0` in effect. Per [RFC 9110 §12.5.3], an unlisted `identity`
+    /// is acceptable unless a wildcard refuses it, while any other unlisted coding is not.
+    ///
+    /// [RFC 9110 §12.5.3]: https://www.rfc-editor.org/rfc/rfc9110#section-12.5.3
+    fn quality_of(&self, encoding: Encoding) -> Option<Quality> {
+        let effective = match (self.exact[encoding.index()], self.wildcard) {
+            // An explicit entry always beats the wildcard, even a lower one.
+            (Some(q), _) | (None, Some(q)) => q,
+            (None, None) => {
+                if encoding == Encoding::Identity {
+                    Q_MAX
+                } else {
+                    return None;
+                }
+            }
+        };
+        (effective > 0).then_some(effective)
+    }
 }
 
 /// Picks the best coding for a request, given the codings this server is willing to use.
@@ -311,12 +361,16 @@ fn quality_of(accept_encoding: &str, encoding: Encoding) -> Option<Quality> {
 /// ```
 #[must_use]
 pub fn negotiate(accept_encoding: &str, supported: &[Encoding]) -> Encoding {
+    if supported.is_empty() {
+        return Encoding::Identity;
+    }
+    let accepted = AcceptedEncodings::parse(accept_encoding);
     let mut best: Option<(Quality, Encoding)> = None;
     for &candidate in supported {
         if candidate == Encoding::Identity {
             continue;
         }
-        let Some(quality) = quality_of(accept_encoding, candidate) else {
+        let Some(quality) = accepted.quality_of(candidate) else {
             continue;
         };
         // Strictly greater, so the first entry in `supported` wins a tie.
@@ -376,10 +430,9 @@ pub fn is_compressible(content_type: &str) -> bool {
     // Structured suffixes cover a long tail — `image/svg+xml`, `application/manifest+json`,
     // `application/atom+xml` — without enumerating it.
     if let Some((_, suffix)) = subtype.rsplit_once('+')
-        && matches!(
-            suffix.to_ascii_lowercase().as_str(),
-            "xml" | "json" | "text" | "yaml"
-        )
+        && ["xml", "json", "text", "yaml"]
+            .iter()
+            .any(|known| suffix.eq_ignore_ascii_case(known))
     {
         return true;
     }
@@ -697,7 +750,18 @@ impl Compression {
                         set_content_length(&mut parts.headers, compressed.len());
                         Body::full(compressed)
                     }
-                    Err(original) => return Response::from_parts(parts, Body::full(original)),
+                    Err(Some(original)) => {
+                        return Response::from_parts(parts, Body::full(original));
+                    }
+                    // The body is gone; a `500` is the only response left that doesn't lie
+                    // about what the client is holding.
+                    Err(None) => {
+                        use crate::http::response::IntoResponse;
+                        return crate::http::error::Error::Internal(
+                            "response compression failed".to_string(),
+                        )
+                        .into_response();
+                    }
                 }
             }
             Body::Stream(_) => {
@@ -727,13 +791,14 @@ impl Compression {
     /// One-shot compression of a fully-buffered body, on the blocking pool when the input
     /// is large enough to be worth the handoff.
     ///
-    /// Returns `Err(original)` when the codec is unavailable or fails, so the caller can
-    /// send the identity representation rather than a truncated or empty one.
+    /// Returns `Err(Some(original))` when the codec is unavailable, fails, or made the body
+    /// bigger, so the caller can send the identity representation instead. `Err(None)` means
+    /// the input itself was lost and neither representation can still be produced.
     async fn compress_in_memory(
         &self,
         encoding: Encoding,
         bytes: Bytes,
-    ) -> Result<Bytes, Bytes> {
+    ) -> Result<Bytes, Option<Bytes>> {
         let level = self.level;
         let run = move |bytes: Bytes| -> Result<Bytes, Bytes> {
             // `set_pledged_src_size` lets zstd shrink its window to fit the input, which
@@ -756,15 +821,13 @@ impl Compression {
         };
 
         if bytes.len() < self.blocking_threshold {
-            return run(bytes);
+            return run(bytes).map_err(Some);
         }
         match tokio::task::spawn_blocking(move || run(bytes)).await {
-            Ok(result) => result,
+            Ok(result) => result.map_err(Some),
             Err(e) => {
-                tracing::error!("compression task panicked: {e}");
-                // The input was moved into the panicking task and is unrecoverable; an
-                // empty identity body is the only remaining answer.
-                Ok(Bytes::new())
+                tracing::error!("compression task failed: {e}");
+                Err(None)
             }
         }
     }
@@ -836,14 +899,20 @@ fn add_vary_accept_encoding(headers: &mut HeaderMap) {
 
 /// Rewrites a strong `ETag` to its weak form — see the module docs on `ETag` interaction.
 fn weaken_etag(headers: &mut HeaderMap) {
-    let Some(etag) = headers.get(ETAG).and_then(|value| value.to_str().ok()) else {
+    let Some(etag) = headers.get(ETAG) else {
         return;
     };
-    if etag.starts_with("W/") {
+    let etag = etag.as_bytes();
+    if etag.starts_with(b"W/") {
         return;
     }
-    if let Ok(weakened) = HeaderValue::from_str(&format!("W/{etag}")) {
-        let _ = headers.insert(ETAG, weakened);
+    // Entity tags are short, so the `W/` prefix goes on in a stack buffer; only a tag past
+    // 62 bytes spills to the heap.
+    let mut weakened: SmallVec<[u8; 64]> = SmallVec::with_capacity(etag.len() + 2);
+    weakened.extend_from_slice(b"W/");
+    weakened.extend_from_slice(etag);
+    if let Ok(value) = HeaderValue::from_bytes(&weakened) {
+        let _ = headers.insert(ETAG, value);
     }
 }
 
@@ -886,7 +955,9 @@ impl LengthBuffer {
 /// is fallible for bodies in general.
 async fn collect_full(body: Body) -> Result<Bytes, crate::http::error::Error> {
     use http_body_util::BodyExt;
-    body.collect().await.map(http_body_util::Collected::to_bytes)
+    body.collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
 }
 
 pin_project_lite::pin_project! {
@@ -1017,6 +1088,11 @@ fn finish(
 mod tests {
     use super::*;
 
+    /// The q-value a header assigns to one coding, parsing it fresh each time.
+    fn quality_of(accept_encoding: &str, encoding: Encoding) -> Option<Quality> {
+        AcceptedEncodings::parse(accept_encoding).quality_of(encoding)
+    }
+
     fn response_with(content_type: &str, body: &'static str) -> Response<Body> {
         Response::builder()
             .header(CONTENT_TYPE, content_type)
@@ -1039,7 +1115,10 @@ mod tests {
     #[test]
     fn explicit_entry_beats_wildcard_even_when_lower() {
         assert_eq!(quality_of("*;q=1.0, gzip;q=0.1", Encoding::Gzip), Some(100));
-        assert_eq!(quality_of("*;q=0.1, gzip;q=1.0", Encoding::Gzip), Some(1000));
+        assert_eq!(
+            quality_of("*;q=0.1, gzip;q=1.0", Encoding::Gzip),
+            Some(1000)
+        );
     }
 
     #[test]
@@ -1141,9 +1220,10 @@ mod tests {
         assert!(!is_eligible(&already_coded));
 
         let mut no_transform = response_with("text/plain", "body");
-        no_transform
-            .headers_mut()
-            .insert(CACHE_CONTROL, HeaderValue::from_static("public, no-transform"));
+        no_transform.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, no-transform"),
+        );
         assert!(!is_eligible(&no_transform));
 
         let mut not_modified = response_with("text/plain", "body");
@@ -1207,7 +1287,11 @@ mod tests {
             .into_iter()
             .filter(|encoding| Encoding::encoder_available(*encoding))
             .collect();
-        assert_eq!(compression.encodings(), expected, "duplicates must not stack");
+        assert_eq!(
+            compression.encodings(),
+            expected,
+            "duplicates must not stack"
+        );
     }
 
     /// A coding is only useful if the response also says the cache must key on it, and the
@@ -1287,7 +1371,11 @@ mod tests {
         use std::io::Read;
 
         let chunks: Vec<Result<Frame<Bytes>, crate::http::error::Error>> = (0..16)
-            .map(|i| Ok(Frame::data(Bytes::from(format!("chunk {i} of streamed text\n")))))
+            .map(|i| {
+                Ok(Frame::data(Bytes::from(format!(
+                    "chunk {i} of streamed text\n"
+                ))))
+            })
             .collect();
         let expected: Vec<u8> = (0..16)
             .flat_map(|i| format!("chunk {i} of streamed text\n").into_bytes())

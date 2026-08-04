@@ -33,14 +33,21 @@
 
 use crate::http::early_hints;
 use crate::http::response::Body;
-use crate::server::Server;
+use crate::server::{REQUEST_TIMEOUT, Server};
 use bytes::Bytes;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use hyper::header::{HeaderMap, HeaderName};
 use hyper::{Request, Response, StatusCode};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+/// Streams the peer may have open at once, advertised in the initial `SETTINGS`.
+const MAX_CONCURRENT_STREAMS: u32 = 200;
+
+/// Advertised `SETTINGS_MAX_HEADER_LIST_SIZE`, matching what `hyper` sends.
+const MAX_HEADER_LIST_SIZE: u32 = 16 * 1024;
 
 /// Headers that are meaningless — and, per [RFC 9113 §8.2.2], malformed — in HTTP/2.
 ///
@@ -65,8 +72,14 @@ const CONNECTION_SPECIFIC_HEADERS: [HeaderName; 6] = [
 /// reopen when the application says it has consumed the bytes, so a body that never calls
 /// `release_capacity` stalls the peer after the initial window and hangs every upload past
 /// 64 KiB. Capacity is released as each frame is handed upward.
+///
+/// It also bounds how long the body may take to arrive, exactly as `DeadlineBody` does on
+/// the `hyper` path: without it a peer can open a stream, declare a body, send nothing, and
+/// hold a handler task and its connection permit for as long as it likes. The `Sleep` is
+/// allocated on first poll so a bodyless `GET` never registers a timer it won't use.
 struct H2Body {
     inner: h2::RecvStream,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// Set once `poll_data` has run dry, so trailers are polled exactly once afterwards.
     data_done: bool,
 }
@@ -80,6 +93,16 @@ impl HyperBody for H2Body {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
+
+        let deadline = this
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(REQUEST_TIMEOUT)));
+        if deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(crate::http::error::Error::Rejection {
+                status: StatusCode::REQUEST_TIMEOUT,
+                message: "Timed out reading request body".to_string(),
+            })));
+        }
 
         if !this.data_done {
             match this.inner.poll_data(cx) {
@@ -139,23 +162,35 @@ where
         .initial_window_size(65535)
         .initial_connection_window_size(1024 * 1024)
         .max_frame_size(16384)
-        .max_concurrent_streams(200);
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .max_header_list_size(MAX_HEADER_LIST_SIZE);
 
     let mut connection = builder.handshake::<_, Bytes>(io).await?;
+
+    // Caps the handler tasks this one connection can have running at once.
+    let stream_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS as usize));
 
     // `accept` drives the whole connection, not just stream acceptance, so in-flight
     // streams keep making progress while this awaits.
     while let Some(accepted) = connection.accept().await {
-        let (request, respond) = match accepted {
+        let (request, mut respond) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::debug!("[h2] stream accept error: {e}");
                 continue;
             }
         };
-        let state = state.clone();
+
+        let Ok(permit) = Arc::clone(&stream_permits).try_acquire_owned() else {
+            tracing::debug!("[h2] refusing stream: connection is at its in-flight limit");
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            continue;
+        };
+
+        let state = Arc::clone(&state);
         super::http::spawn_connection(async move {
             handle_stream(state, request, respond, peer).await;
+            drop(permit);
         });
     }
     Ok(())
@@ -173,8 +208,6 @@ async fn handle_stream<S>(
 {
     let (parts, recv_stream) = request.into_parts();
 
-    // RFC 8441 extended CONNECT — see the module docs for why this is refused rather than
-    // attempted.
     if parts.method == hyper::Method::CONNECT {
         tracing::debug!("[h2] refusing extended CONNECT: unsupported by the native driver");
         respond_with_status(&mut respond, StatusCode::NOT_IMPLEMENTED);
@@ -186,35 +219,50 @@ async fn handle_stream<S>(
         .as_ref()
         .is_some_and(|config| config.permits(&parts.method, &parts.headers));
 
-    let mut request = Request::from_parts(
-        parts,
+    let body = if recv_stream.is_end_stream() {
+        Body::empty()
+    } else {
         Body::stream(H2Body {
             inner: recv_stream,
+            deadline: None,
             data_done: false,
-        }),
-    );
+        })
+    };
+    let mut request = Request::from_parts(parts, body);
 
-    let hint_receiver = hints_permitted.then(|| {
+    let mut hint_receiver = hints_permitted.then(|| {
         let (receiver, handle) = early_hints::channel();
         let _ = request.extensions_mut().insert(handle);
         receiver
     });
 
-    let dispatch = std::pin::pin!(state.dispatch(request, peer));
-    let response = match hint_receiver {
-        None => dispatch.await,
-        Some(mut receiver) => {
-            let mut dispatch = dispatch;
-            loop {
-                tokio::select! {
-                    // Biased so a hint queued in the same poll as the final response still
-                    // goes out first — a 103 after the 200 is a protocol error.
-                    biased;
-                    Some(headers) = receiver.recv() => send_informational(&mut respond, headers),
-                    response = &mut dispatch => break response,
-                }
+    let mut dispatch = std::pin::pin!(state.dispatch(request, peer));
+
+    // Reset, hints and the handler are polled together in one pass rather than through
+    // `select!`, because all three need `&mut respond` and only one future can hold it.
+    //
+    // The reset check is what makes a peer's `RST_STREAM` actually stop the work: without
+    // it the handler runs to completion for a client that stopped listening, which is the
+    // amplification half of Rapid Reset. Dropping `dispatch` on the way out cancels the
+    // handler mid-await and returns the connection permit.
+    let response = std::future::poll_fn(|cx| {
+        if respond.poll_reset(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        // Drained before the handler is polled, so a hint queued in the same wake-up as the
+        // final response still goes out first — a 103 after the 200 is a protocol error.
+        if let Some(receiver) = hint_receiver.as_mut() {
+            while let Poll::Ready(Some(headers)) = receiver.poll_recv(cx) {
+                send_informational(&mut respond, headers);
             }
         }
+        dispatch.as_mut().poll(cx).map(Some)
+    })
+    .await;
+
+    let Some(response) = response else {
+        tracing::debug!("[h2] stream reset by peer; handler cancelled");
+        return;
     };
 
     let (mut parts, body) = response.into_parts();
@@ -410,8 +458,7 @@ mod tests {
         /// Bounded by a timeout so a regression that stops emitting hints fails the test
         /// instead of hanging it.
         async fn next_informational(&mut self) -> Option<hyper::Response<()>> {
-            let poll =
-                std::future::poll_fn(|cx| self.response.poll_informational(cx));
+            let poll = std::future::poll_fn(|cx| self.response.poll_informational(cx));
             match tokio::time::timeout(Duration::from_secs(5), poll).await {
                 Ok(Some(Ok(response))) => Some(response),
                 Ok(Some(Err(e))) => panic!("informational response error: {e}"),
@@ -559,9 +606,7 @@ mod tests {
         let router: Router<()> = Router::new().route(
             "/big",
             get(|| async {
-                crate::http::response::Html(
-                    std::iter::repeat_n('x', SIZE).collect::<String>(),
-                )
+                crate::http::response::Html(std::iter::repeat_n('x', SIZE).collect::<String>())
             }),
         );
 
