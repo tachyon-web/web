@@ -82,7 +82,7 @@ jobs:
           - name: http/3 (quic)
             flags: --features http3
           - name: full (no tor/i2p)
-            flags: --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3
+            flags: --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

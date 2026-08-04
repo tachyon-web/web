@@ -1,5 +1,8 @@
 //! HTTP constructs like error types and response helpers.
 
+pub mod compression;
+#[cfg(feature = "early-hints")]
+pub mod early_hints;
 pub mod error;
 pub mod response;
 

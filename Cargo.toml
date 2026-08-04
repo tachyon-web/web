@@ -62,6 +62,13 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"], opti
 # Optional Server-Sent Events support (see the `sse` feature).
 futures-core = { version = "0.3", default-features = false, optional = true }
 
+# Optional response-compression codecs (see the `compression-*` features).
+brotli = { version = "8", default-features = false, features = ["std"], optional = true }
+zstd = { version = "0.13", default-features = false, optional = true }
+
+# Optional native HTTP/2 connection driver (see the `early-hints` feature).
+h2 = { version = "0.4", optional = true }
+
 # Optional native .onion hidden-service support (see the `tor` feature).
 arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
 tor-hsservice = { version = "0.45", default-features = false, optional = true }
@@ -84,6 +91,11 @@ futures = "0.3"
 hyper = { version = "1", features = ["client", "http2"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# Decoders for the compression suite. `reqwest` is built without its own compression
+# features on purpose, so these tests see the coded bytes exactly as a browser would.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+brotli = { version = "8", default-features = false, features = ["std"] }
+zstd = { version = "0.13", default-features = false }
 
 [features]
 default = [
@@ -119,6 +131,19 @@ tor = [
     "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",
 ]
 i2p = ["dep:tachyon-i2p", "tachyon-i2p/aws-lc"]
+
+# Response compression. Names mirror `tower-http`'s so an axum migration is a
+# search-and-replace; `compression-full` likewise enables every codec.
+compression-gzip = ["dep:flate2"]
+compression-deflate = ["dep:flate2"]
+compression-br = ["dep:brotli"]
+compression-zstd = ["dep:zstd"]
+compression-full = [
+    "compression-gzip", "compression-deflate", "compression-br", "compression-zstd",
+]
+
+# RFC 8297 `103 Early Hints`.
+early-hints = ["dep:h2", "http2", "tls"]
 
 [workspace]
 members = [
@@ -174,6 +199,10 @@ required-features = ["json", "query"]
 [[example]]
 name = "sync_handlers"
 required-features = ["json"]
+
+[[example]]
+name = "compression_early_hints"
+required-features = ["compression-full", "early-hints", "cert-gen"]
 
 [package.metadata.docs.rs]
 all-features = true

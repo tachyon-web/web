@@ -207,6 +207,53 @@ where
         self
     }
 
+    /// Sends a `103 Early Hints` response carrying `links` before this route's handler runs.
+    ///
+    /// The `Link` header block is rendered once, here, and cloned per request — there is no
+    /// per-request formatting, and the hint goes out before any other middleware on this
+    /// route has done work. On a transport that cannot carry a 103 this costs one map
+    /// lookup and nothing else.
+    ///
+    /// Use this for hints that don't depend on the request. For hints that do, extract
+    /// [`EarlyHints`](crate::http::early_hints::EarlyHints) in the handler instead.
+    ///
+    /// **Do not attach this to a route that may redirect.** Hints preceding a `3xx` preload
+    /// resources for a page that is never rendered — see
+    /// [`http::early_hints`](crate::http::early_hints).
+    ///
+    /// ```rust
+    /// use tachyon_web::{Router, get};
+    /// use tachyon_web::http::early_hints::Link;
+    ///
+    /// let app: Router = Router::new().route(
+    ///     "/",
+    ///     get(|| async { "…" }).early_hints([Link::preload("/app.css").as_style()]),
+    /// );
+    /// ```
+    #[cfg(feature = "early-hints")]
+    #[must_use]
+    pub fn early_hints(
+        self,
+        links: impl IntoIterator<Item = crate::http::early_hints::Link>,
+    ) -> Self {
+        let headers = crate::http::early_hints::links_to_headers(links);
+        if headers.is_empty() {
+            return self;
+        }
+        self.hoop(move |req, next| {
+            let headers = headers.clone();
+            async move {
+                if let Some(hints) = req
+                    .extensions()
+                    .get::<crate::http::early_hints::EarlyHints>()
+                {
+                    let _ = hints.send_headers(headers);
+                }
+                next.run(req).await
+            }
+        })
+    }
+
     /// Compile all handler middleware chains in-place.
     pub fn compile_in_place(&mut self) {
         for i in 0..METHOD_COUNT {
@@ -985,6 +1032,91 @@ where
             .map(|h| wrap_handler(h, middleware));
 
         self
+    }
+
+    /// Sends a `103 Early Hints` response carrying `links` before the handler of any route
+    /// registered on this router **so far**.
+    ///
+    /// Like [`hoop`](Self::hoop), it wraps the current route table rather than a later one,
+    /// so call it after the routes it should cover. For per-route hints, use
+    /// [`MethodRouter::early_hints`] instead; for request-dependent hints, extract
+    /// [`EarlyHints`](crate::http::early_hints::EarlyHints) in the handler.
+    ///
+    /// **Do not apply this to routes that may redirect** — see
+    /// [`http::early_hints`](crate::http::early_hints).
+    ///
+    /// ```rust
+    /// use tachyon_web::{Router, get};
+    /// use tachyon_web::http::early_hints::Link;
+    ///
+    /// let app: Router = Router::new()
+    ///     .route("/", get(|| async { "…" }))
+    ///     .route("/about", get(|| async { "…" }))
+    ///     .early_hints([
+    ///         Link::preload("/static/app.css").as_style(),
+    ///         Link::preconnect("https://cdn.example.com"),
+    ///     ]);
+    /// ```
+    #[cfg(feature = "early-hints")]
+    #[must_use]
+    pub fn early_hints(
+        self,
+        links: impl IntoIterator<Item = crate::http::early_hints::Link>,
+    ) -> Self {
+        let headers = crate::http::early_hints::links_to_headers(links);
+        if headers.is_empty() {
+            return self;
+        }
+        self.hoop(move |req, next| {
+            let headers = headers.clone();
+            async move {
+                if let Some(hints) = req
+                    .extensions()
+                    .get::<crate::http::early_hints::EarlyHints>()
+                {
+                    let _ = hints.send_headers(headers);
+                }
+                next.run(req).await
+            }
+        })
+    }
+
+    /// Compresses responses from this router's routes, negotiating the coding against each
+    /// request's `Accept-Encoding`.
+    ///
+    /// Scoped to the routes registered **so far** — like [`hoop`](Self::hoop), it wraps the
+    /// current route table rather than a later one, so call it after the routes it should
+    /// cover. To compress everything a server produces regardless of which router answered,
+    /// use [`Server::compression`](crate::Server::compression) instead.
+    ///
+    /// See [`http::compression`](crate::http::compression) for what is and is not
+    /// compressed.
+    ///
+    /// ```rust
+    /// use tachyon_web::{Router, get};
+    /// use tachyon_web::http::compression::Compression;
+    ///
+    /// let app: Router = Router::new()
+    ///     .route("/api/report", get(|| async { "a large JSON report" }))
+    ///     .compression(Compression::new());
+    /// ```
+    #[must_use]
+    pub fn compression(self, compression: crate::http::compression::Compression) -> Self {
+        self.hoop(move |req, next| {
+            let compression = compression.clone();
+            async move {
+                // Taken before `next.run` consumes the request; the response it returns is
+                // what gets negotiated against. Cloning the `HeaderValue` rather than
+                // copying out a `String` keeps this to a refcount bump on its bytes.
+                let accept_encoding =
+                    req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
+                let response = next.run(req).await;
+                match accept_encoding.as_ref().and_then(|value| value.to_str().ok()) {
+                    Some(accept_encoding) => compression.apply_to(accept_encoding, response).await,
+                    None => response,
+                }
+            }
+        })
     }
 
     /// Route an incoming request directly, compiling the router on the fly.

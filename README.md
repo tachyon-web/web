@@ -162,6 +162,91 @@ let _app: Router<()> = Router::new().route("/ws", get(handler));
 
 Requires the `ws` feature.
 
+## Compression
+
+`Accept-Encoding` negotiation and response coding for `zstd`, `br`, `gzip` and `deflate`,
+applied to every transport at once:
+
+```rust
+use tachyon_web::{Router, Server};
+use tachyon_web::http::compression::{Compression, CompressionLevel};
+
+Server::new(app)
+    .compression(
+        Compression::new()                      // every codec this build has, zstd first
+            .level(CompressionLevel::Fastest),  // encode speed, for per-request bodies
+    )
+    .serve_http(listener)
+    .await?;
+```
+
+Or scoped to one router with `Router::compression(..)`. The codec feature names match
+`tower-http`'s (`compression-gzip`, `compression-br`, …, `compression-full`), so migrating
+from a `CompressionLayer` is a `Cargo.toml` search-and-replace.
+
+Negotiation is RFC 9110 §12.5.3: q-values are honoured, `q=0` is a refusal rather than a low
+ranking, and `*` resolves as a wildcard. Beyond that it does the things a compression layer
+is usually expected to do and usually doesn't: `Vary: Accept-Encoding` is appended even to
+the responses it leaves uncompressed, strong `ETag`s are weakened because a coded body is a
+different representation, `Cache-Control: no-transform` is honoured, `Content-Length` is
+rewritten to the coded length, output that came out larger than the input is discarded in
+favour of the original, and zstd's window is clamped to the 8 MiB every browser decoder caps
+at — the usual way to ship a `Content-Encoding: zstd` that works in `curl` and fails in
+Chrome. See the [`http::compression`] module docs for the full list of what is never
+compressed.
+
+`ServeDir` picks up pre-compressed `.zst` sidecars alongside the `.br` and `.gz` it already
+served, and negotiates among the ones each asset actually has.
+
+## 103 Early Hints
+
+[RFC 8297]. An informational response sent *during* handler think-time, telling the browser
+what to fetch before the HTML exists:
+
+```rust
+use tachyon_web::{Html, Router, Server, get};
+use tachyon_web::http::early_hints::{EarlyHints, EarlyHintsConfig, Link};
+
+async fn page(hints: EarlyHints) -> Html<String> {
+    hints.send([
+        Link::preload("/static/app.css").as_style(),
+        Link::preconnect("https://cdn.example.com"),
+    ]);                          // returns immediately, nothing to await
+
+    let data = load().await;     // the think-time this exists to overlap
+    Html(render(&data))
+}
+
+let app: Router = Router::new().route("/", get(page));
+
+Server::new(app)
+    .early_hints(EarlyHintsConfig::new())
+    .serve_https_config(listener, tls_config)
+    .await?;
+```
+
+There is also a declarative form — `get(page).early_hints([..])` on a route, or
+`Router::early_hints([..])` — which renders the `Link` block once at startup and sends it
+before the handler is even called.
+
+This is the one feature here that cannot be a middleware in any framework built on
+`Service<Request> -> Response`: an informational response is a *second* response, and that
+signature returns one. `hyper` refuses a 1xx status outright and never calls `h2`'s
+`send_informational`, so enabling `early-hints` moves HTTPS connections that negotiate `h2`
+onto Tachyon's own `h2`-based driver. HTTP/3 needs no such thing — Tachyon already owns that
+dispatch loop.
+
+Hints go out over HTTP/2-over-TLS and HTTP/3. HTTP/1.1, h2c, Tor and I2P hand handlers a
+no-op handle instead, so a handler never needs a fallback path. By default only requests
+carrying `Sec-Fetch-Mode: navigate` are hinted, which is both what browsers act on and what
+keeps an unexpected 1xx away from clients that mishandle one. The native HTTP/2 driver does
+not support RFC 8441 WebSockets-over-HTTP/2; no browser uses them, but read
+[`http::early_hints`] before enabling it if a non-browser client of yours does.
+
+[RFC 8297]: https://www.rfc-editor.org/rfc/rfc8297
+[`http::compression`]: https://docs.rs/tachyon-web/latest/tachyon_web/http/compression/
+[`http::early_hints`]: https://docs.rs/tachyon-web/latest/tachyon_web/http/early_hints/
+
 ## Feature flags
 
 Flags shared with Axum keep Axum's name and default:
@@ -178,6 +263,11 @@ Flags shared with Axum keep Axum's name and default:
 | `cookies` | | request `Cookie` parsing and the `Cookies` extractor/`IntoResponseParts` jar (matching `axum-extra`'s `CookieJar`), and the `cookie` dependency |
 | `tower-log` | on | `tower`'s own `log` feature; no effect without `tower` |
 | `ws` | | WebSocket support (RFC 6455) |
+| `compression-gzip` | | `gzip` response compression |
+| `compression-deflate` | | `deflate` response compression |
+| `compression-br` | | Brotli response compression |
+| `compression-zstd` | | Zstandard response compression |
+| `compression-full` | | all four codings above |
 
 Tachyon's own additions default off, the way Axum treats its extras:
 
@@ -188,6 +278,7 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `http3` | | HTTP/3 over QUIC via `s2n-quic`; needs `tls` |
 | `lets-encrypt` | | automatic Let's Encrypt certificate management; needs `tls`, `cert-gen` |
 | `sse` | | Server-Sent Events (`response::sse::{Event, Sse, KeepAlive}`) |
+| `early-hints` | | `103 Early Hints` (RFC 8297), plus the native HTTP/2 driver that emits them; needs `tls` |
 | `tower` | | `tower::Service`/`tower::Layer` interop, plus `tower::Service` for `CompiledRouter` |
 | `fips` | | enforce FIPS-mode cryptography at startup; refuses to start otherwise |
 | `tor` | | Tor v3 `.onion` support (`Server::serve_tor`/`serve_onion`) via `arti-client` |

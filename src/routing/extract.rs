@@ -1206,6 +1206,8 @@ macro_rules! impl_from_request_via_parts {
 }
 
 impl_from_request_via_parts!(RawQuery);
+#[cfg(feature = "early-hints")]
+impl_from_request_via_parts!(crate::http::early_hints::EarlyHints);
 impl_from_request_via_parts!(HeaderMap);
 impl_from_request_via_parts!(Method);
 impl_from_request_via_parts!(Uri);

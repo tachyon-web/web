@@ -140,7 +140,7 @@ async fn accept_tuned(
 /// `run_worker_pool` runs one `current_thread` runtime plus `LocalSet` per core, where
 /// `spawn_local` avoids a cross-thread handoff. On a plain multi-thread runtime there's no
 /// `LocalSet`, so this falls back to `tokio::spawn`.
-fn spawn_connection<F>(fut: F)
+pub(super) fn spawn_connection<F>(fut: F)
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -315,6 +315,20 @@ where
                     let (_, connection) = tls_stream.get_ref();
                     connection.alpn_protocol() == Some(b"h2")
                 };
+
+                // `hyper`'s HTTP/2 server has no way to emit an informational response, so
+                // an early-hints deployment takes the h2 half of the connection space onto
+                // Tachyon's own driver. Everything else stays on `hyper`.
+                #[cfg(feature = "early-hints")]
+                if is_h2 && state.early_hints.is_some() {
+                    if let Err(e) =
+                        crate::server::h2::serve_connection(state, tls_stream, peer).await
+                    {
+                        tracing::debug!("[https] native http/2 connection error: {}", e);
+                    }
+                    drop(permit);
+                    return;
+                }
 
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
                 let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer));

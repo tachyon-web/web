@@ -93,6 +93,64 @@
 //! }
 //! ```
 //!
+//! ## Response compression
+//!
+//! With any `compression-*` feature, [`Server::compression`] negotiates `zstd`, `br`, `gzip`
+//! or `deflate` per request and applies it to every transport above at once — see
+//! [`http::compression`] for what is and isn't compressed, and
+//! [`Router::compression`] to scope it to one router.
+//!
+//! ```rust,no_run
+//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::http::compression::Compression;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! let app: Router = Router::new().route("/", get(|| async { "hello" }));
+//! let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+//!
+//! Server::new(app)
+//!     .compression(Compression::new())
+//!     .serve_http(listener)
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## `103 Early Hints`
+//!
+//! With the `early-hints` feature, a handler can tell the browser what to fetch *while it is
+//! still working* — an informational response ahead of the real one, which the
+//! `Service<Request> → Response` shape underneath every other Rust framework cannot express.
+//! Reaching it means Tachyon drives HTTP/2 itself; see [`http::early_hints`] for the
+//! transport matrix and the tradeoffs that come with that.
+//!
+//! ```rust,no_run
+//! use tachyon_web::{Html, Router, Server, get};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//! #   #[cfg(all(feature = "early-hints", feature = "cert-gen"))]
+//! #   {
+//!     use tachyon_web::http::early_hints::{EarlyHints, EarlyHintsConfig, Link};
+//!
+//!     async fn page(hints: EarlyHints) -> Html<&'static str> {
+//!         hints.send([Link::preload("/static/app.css").as_style()]);
+//!         // ... the database round trip that hint is overlapping ...
+//!         Html("<h1>hello</h1>")
+//!     }
+//!
+//!     let app = Router::new().route("/", get(page));
+//!     let cert = tachyon_web::tls::generate_self_signed_cert(vec!["localhost".into()])?;
+//!
+//!     Server::new(app)
+//!         .early_hints(EarlyHintsConfig::new())
+//!         .start_all("0.0.0.0:443", None, cert.cert_pem, cert.key_pem)
+//!         .await?;
+//! #   }
+//!     Ok(())
+//! }
+//! ```
+//!
 //! ## Native Tor `.onion` hidden services
 //!
 //! With the `tor` feature, [`Server::serve_tor`] publishes the app directly as a v3 Tor hidden
@@ -147,7 +205,7 @@
 
 #![forbid(unsafe_code, elided_lifetimes_in_paths)]
 #![allow(clippy::multiple_crate_versions)]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 #[cfg(not(any(feature = "http1", feature = "http2")))]
 compile_error!(
@@ -162,6 +220,9 @@ pub mod tls;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+pub use http::compression::{self, Compression, CompressionLevel, Encoding};
+#[cfg(feature = "early-hints")]
+pub use http::early_hints::{self, EarlyHints, EarlyHintsConfig, Link};
 pub use http::error::{Error, Result};
 pub use http::response;
 pub use http::response::{

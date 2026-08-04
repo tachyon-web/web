@@ -166,13 +166,40 @@ where
             }
         };
 
-        // HTTP/3 stream frames aren't a standard `hyper::body::Body`, so (unlike the
-        // HTTP/1.1 and HTTP/2 paths) this body is fully buffered up front by
-        // `read_h3_body` rather than streamed lazily. It's still wrapped in the same
-        // unified `Body` type so it flows through the same extractor pipeline —
-        // `BodyStream`/`Request<Body>` handlers work identically, they just don't get
-        // the zero-buffering benefit over HTTP/3 in this version.
-        let req = Request::from_parts(parts, crate::http::response::Body::full(body_bytes));
+        #[cfg(feature = "early-hints")]
+        let hints_permitted = self
+            .early_hints
+            .as_ref()
+            .is_some_and(|config| config.permits(&parts.method, &parts.headers));
+
+        #[allow(unused_mut)]
+        let mut req = Request::from_parts(parts, crate::http::response::Body::full(body_bytes));
+
+        #[cfg(feature = "early-hints")]
+        let full_resp = if hints_permitted {
+            let (mut receiver, handle) = crate::http::early_hints::channel();
+            let _ = req.extensions_mut().insert(handle);
+            let dispatch = std::pin::pin!(self.dispatch(req, peer));
+            let mut dispatch = dispatch;
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(headers) = receiver.recv() => {
+                        let mut hint = Response::new(());
+                        *hint.status_mut() = StatusCode::EARLY_HINTS;
+                        *hint.headers_mut() = headers;
+                        if let Err(e) = stream.send_response(hint).await {
+                            tracing::debug!("[h3] early hint not sent: {e}");
+                        }
+                    }
+                    response = &mut dispatch => break response,
+                }
+            }
+        } else {
+            self.dispatch(req, peer).await
+        };
+
+        #[cfg(not(feature = "early-hints"))]
         let full_resp = self.dispatch(req, peer).await;
 
         let (resp_parts, body) = full_resp.into_parts();

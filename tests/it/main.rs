@@ -31,6 +31,12 @@ mod advanced_tests;
 ))]
 mod integration_tests;
 mod server_tests;
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-br",
+    feature = "compression-zstd",
+))]
+mod compression_tests;
 // Its only test drives the server with an HTTP/1.1 client.
 #[cfg(feature = "http1")]
 mod static_dir_tests;
