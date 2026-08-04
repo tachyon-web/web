@@ -412,8 +412,6 @@ async fn send_body(
             Some(Ok(frame)) => frame,
             Some(Err(e)) => {
                 tracing::debug!("[h2] response body failed mid-stream: {e}");
-                // The client has already received a `200` and part of a body, so the only
-                // way to signal "this is not the whole response" is to reset the stream.
                 send_stream.send_reset(h2::Reason::INTERNAL_ERROR);
                 return;
             }
@@ -425,8 +423,6 @@ async fn send_body(
                 if data.is_empty() {
                     continue;
                 }
-                // Lets a higher-urgency sibling on this connection call `reserve_capacity`
-                // first — see `PriorityScheduler`. A no-op when nothing is contending.
                 scheduler.turn(urgency).await;
                 send_stream.reserve_capacity(data.len());
                 if !await_capacity(&mut send_stream).await {
@@ -465,8 +461,6 @@ async fn send_body(
 async fn await_capacity(send_stream: &mut h2::SendStream<Bytes>) -> bool {
     while send_stream.capacity() == 0 {
         let available = std::future::poll_fn(|cx| {
-            // A reset makes every remaining byte pointless; without this check the send
-            // would park on capacity that is never coming.
             if send_stream.poll_reset(cx).is_ready() {
                 return Poll::Ready(None);
             }
@@ -475,7 +469,6 @@ async fn await_capacity(send_stream: &mut h2::SendStream<Bytes>) -> bool {
         .await;
 
         match available {
-            // A spurious zero-capacity wakeup; the `while` re-checks and re-parks.
             Some(Ok(0)) => {}
             Some(Ok(_)) => return true,
             Some(Err(e)) => {
@@ -782,7 +775,7 @@ mod tests {
     /// Rapid Reset (CVE-2023-44487): a peer that opens a stream and immediately resets it
     /// must not leave a handler running. `max_concurrent_streams` does not cover this —
     /// `h2` frees the slot the moment the reset lands — so without an explicit reset check
-    /// each cheap HEADERS+RST_STREAM pair buys the attacker a full router dispatch.
+    /// each cheap `HEADERS+RST_STREAM` pair buys the attacker a full router dispatch.
     #[tokio::test]
     async fn resetting_a_stream_cancels_its_handler() {
         use std::sync::Arc as StdArc;
@@ -852,7 +845,7 @@ mod tests {
         let (response, _send_stream) = harness.send_request.send_request(request, false).unwrap();
 
         // Auto-advanced past REQUEST_TIMEOUT by the paused clock rather than really slept.
-        let response = tokio::time::timeout(Duration::from_secs(120), response)
+        let response = tokio::time::timeout(Duration::from_mins(2), response)
             .await
             .expect("handler was never released — the body deadline did not fire")
             .expect("response");

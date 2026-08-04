@@ -373,7 +373,9 @@ pub struct Slot<'a> {
 
 impl fmt::Debug for Slot<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Slot").field("key", &self.key).finish_non_exhaustive()
+        f.debug_struct("Slot")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
     }
 }
 
@@ -770,7 +772,9 @@ mod tests {
         assert_eq!(l.len(), 3);
         let item = parse_item(b"12.445;foo=bar").unwrap();
         assert_eq!(
-            item.bare_item.as_decimal().map(|d| d.as_integer_scaled_1000()),
+            item.bare_item
+                .as_decimal()
+                .map(|d| d.as_integer_scaled_1000()),
             Some(sfv::integer(12_445))
         );
     }
