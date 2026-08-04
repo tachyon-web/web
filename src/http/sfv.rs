@@ -20,7 +20,7 @@
 //! assert_eq!(sfv::dict_boolean(&dict, "i"), Some(true));
 //! ```
 //!
-//! Typed headers are declared with [`sfv_dictionary!`], which generates a
+//! Typed headers are declared with [`sfv_dictionary!`](crate::sfv_dictionary), which generates a
 //! parser that pulls exactly the keys you name straight out of the input:
 //!
 //! ```rust
@@ -41,7 +41,7 @@
 //!
 //! # Cost
 //!
-//! [`sfv_dictionary!`] parses through [`sfv`]'s visitor API, so a typed header
+//! [`sfv_dictionary!`](crate::sfv_dictionary) parses through [`sfv`]'s visitor API, so a typed header
 //! never builds the intermediate [`Dictionary`] map: keys you did not declare
 //! are validated and dropped, and declared keys are written straight into the
 //! struct. Only `String` and `Vec<u8>` fields allocate, and only for the keys
@@ -108,7 +108,7 @@ pub enum SfvError {
     ///
     /// [`sfv`] converts any visitor error into a stringified [`sfv::Error`] via
     /// a blanket `impl<E: std::error::Error> From<E> for Repr`, which loses the
-    /// original variant. [`sfv_dictionary!`]-generated visitors instead stash
+    /// original variant. [`sfv_dictionary!`](crate::sfv_dictionary)-generated visitors instead stash
     /// the real error in a side channel and return this placeholder purely to
     /// abort parsing; callers replace it with the stashed error before it is
     /// ever observed. It should never reach a caller of this module.
@@ -246,7 +246,7 @@ pub fn dict_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
 /// A Rust type a bare item can be converted into.
 ///
 /// Implemented for `i64`, `bool`, `f64`, [`Decimal`], `String`, `Vec<u8>`,
-/// `Date` and `Option<T>`. [`sfv_dictionary!`] dispatches through this.
+/// `Date` and `Option<T>`. [`sfv_dictionary!`](crate::sfv_dictionary) dispatches through this.
 pub trait FromSfvValue: Sized {
     /// What this type expects, for the rejection message ("an integer", ...).
     const EXPECTED: &'static str;
@@ -317,7 +317,7 @@ impl<T: FromSfvValue> FromSfvValue for Option<T> {
     }
 }
 
-/// Object-safe sink used by [`sfv_dictionary!`] to write one parsed value into
+/// Object-safe sink used by [`sfv_dictionary!`](crate::sfv_dictionary) to write one parsed value into
 /// the field it belongs to.
 ///
 /// Being object-safe is what lets the generated dictionary visitor return a
@@ -337,7 +337,7 @@ impl<T: FromSfvValue> SlotSink for Option<T> {
     }
 }
 
-/// Side channel [`sfv_dictionary!`]-generated visitors use to carry the real
+/// Side channel [`sfv_dictionary!`](crate::sfv_dictionary)-generated visitors use to carry the real
 /// [`SfvError`] out of [`sfv`]'s parser.
 ///
 /// [`sfv`] converts any visitor error into a stringified [`sfv::Error`] via a
@@ -554,7 +554,7 @@ macro_rules! sfv_dictionary {
 
 /// Runs a dictionary visitor over `input`, applying the [`MAX_INPUT`] bound.
 ///
-/// Used by [`sfv_dictionary!`]; call it directly to hand-write a typed header
+/// Used by [`sfv_dictionary!`](crate::sfv_dictionary); call it directly to hand-write a typed header
 /// whose shape the macro does not cover.
 ///
 /// [`sfv`] stringifies any error a visitor returns rather than preserving it
@@ -563,7 +563,7 @@ macro_rules! sfv_dictionary {
 /// not the original variant. To preserve it, stash the real error in an
 /// [`ErrorSlot`] your visitor borrows and return [`SfvError::Aborted`] via
 /// [`capture`] in its place, then recover it from the slot after this
-/// function returns — see the code [`sfv_dictionary!`] generates.
+/// function returns — see the code [`sfv_dictionary!`](crate::sfv_dictionary) generates.
 ///
 /// # Errors
 ///
@@ -578,7 +578,7 @@ where
 
 /// A typed header parsed from a structured field.
 ///
-/// Implemented by [`sfv_dictionary!`], or by hand (via [`parse_with_visitor`]
+/// Implemented by [`sfv_dictionary!`](crate::sfv_dictionary), or by hand (via [`parse_with_visitor`]
 /// or the parse helpers) for headers the macro does not cover.
 pub trait FromStructuredHeader: Sized {
     /// The lowercase name of the header this type is parsed from.

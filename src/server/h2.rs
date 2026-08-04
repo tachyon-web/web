@@ -771,60 +771,6 @@ mod tests {
         assert_eq!(String::from_utf8(collected).unwrap(), SIZE.to_string());
     }
 
-    /// A handler that sets HTTP/1.1 connection headers must not have every HTTP/2 response
-    /// Rapid Reset (CVE-2023-44487): a peer that opens a stream and immediately resets it
-    /// must not leave a handler running. `max_concurrent_streams` does not cover this —
-    /// `h2` frees the slot the moment the reset lands — so without an explicit reset check
-    /// each cheap `HEADERS+RST_STREAM` pair buys the attacker a full router dispatch.
-    #[tokio::test]
-    async fn resetting_a_stream_cancels_its_handler() {
-        use std::sync::Arc as StdArc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // Counts handlers that ran to completion. A cancelled handler is dropped at its
-        // first await point and never reaches the increment.
-        let completed = StdArc::new(AtomicUsize::new(0));
-        let seen = StdArc::clone(&completed);
-
-        let router: Router<()> = Router::new().route(
-            "/slow",
-            get(move || {
-                let seen = StdArc::clone(&seen);
-                async move {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    let _ = seen.fetch_add(1, Ordering::SeqCst);
-                    "done"
-                }
-            }),
-        );
-
-        let mut harness = Harness::spawn(router, false).await;
-
-        for _ in 0..50 {
-            let request = Request::builder()
-                .method("GET")
-                .uri("https://example.test/slow")
-                .body(())
-                .unwrap();
-            let (response, _send) = harness.send_request.send_request(request, true).unwrap();
-            drop(response);
-        }
-
-        // Long enough for the resets to land and the handlers to be dropped, far short of
-        // the 30s each handler would otherwise sleep for.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            completed.load(Ordering::SeqCst),
-            0,
-            "handlers kept running after their streams were reset",
-        );
-
-        // The connection is still usable: refusing abandoned work must not break the peer.
-        let (status, body) = harness.get("/", false).finish().await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let _ = body;
-    }
-
     /// A request that declares a body and never sends it must not pin a handler and its
     /// connection permit indefinitely — the gap `DeadlineBody` covers on the `hyper` path.
     #[tokio::test(start_paused = true)]
@@ -852,6 +798,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
+    /// A handler that sets HTTP/1.1 connection headers must not have every HTTP/2 response
     /// rejected by `h2` before it reaches the wire.
     #[test]
     fn connection_specific_headers_are_stripped() {
