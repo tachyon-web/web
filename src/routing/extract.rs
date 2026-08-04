@@ -11,6 +11,10 @@ pub use crate::ws;
 #[cfg(feature = "ws")]
 pub use crate::ws::WebSocketUpgrade;
 
+/// Structured-field typed-header extractor, re-exported at the extractor path.
+/// See [`crate::http::sfv`] for the data model and the `sfv_dictionary!` macro.
+pub use crate::http::sfv::StructuredHeader;
+
 use crate::http::error::Error;
 use crate::http::response::Body;
 use bytes::Bytes;

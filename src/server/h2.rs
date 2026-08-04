@@ -33,6 +33,7 @@
 
 use crate::http::early_hints;
 use crate::http::response::Body;
+use crate::http::sfv::{self, FromStructuredHeader, Priority};
 use crate::server::{REQUEST_TIMEOUT, Server};
 use bytes::Bytes;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
@@ -41,6 +42,7 @@ use hyper::{Request, Response, StatusCode};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 /// Streams the peer may have open at once, advertised in the initial `SETTINGS`.
@@ -65,6 +67,70 @@ const CONNECTION_SPECIFIC_HEADERS: [HeaderName; 6] = [
     hyper::header::PROXY_AUTHORIZATION,
     HeaderName::from_static("keep-alive"),
 ];
+
+/// Number of urgency levels defined by [RFC 9218]'s `Priority` header: `0` (highest) through
+/// `7` (lowest).
+///
+/// [RFC 9218]: https://www.rfc-editor.org/rfc/rfc9218
+const URGENCY_LEVELS: usize = 8;
+
+/// Orders concurrent response bodies on one connection by [RFC 9218] urgency.
+///
+/// `h2` itself has no scheduler: it discards RFC 7540 `PRIORITY` frames, and grants
+/// connection-level flow-control window to streams strictly in the order they call
+/// `reserve_capacity` — see `h2`'s `prioritize::Prioritize::try_assign_capacity`. That means
+/// urgency can be enforced entirely at this layer, by biasing *when* each stream is allowed to
+/// call `reserve_capacity`, without touching `h2` internals.
+///
+/// A stream about to request capacity registers its urgency and waits until no stream at a
+/// strictly higher priority (a lower urgency number) is also waiting. The wait is bounded —
+/// [`PRIORITY_STARVATION_BOUND`] — so a continuously-busy high-urgency stream can slow lower
+/// ones down but can never fully starve them. Deferring the call is always safe: a stream that
+/// hasn't called `reserve_capacity` holds none of the connection's flow-control window, so it
+/// costs the waiting stream latency and nothing else.
+struct PriorityScheduler {
+    /// Streams currently waiting to call `reserve_capacity`, indexed by urgency (`0..=7`).
+    waiting: [AtomicUsize; URGENCY_LEVELS],
+    /// Wakes every waiter whenever a stream leaves `waiting`, so a lower-urgency stream
+    /// notices a higher one has cleared without sitting out its full timeout.
+    cleared: tokio::sync::Notify,
+}
+
+/// Upper bound on how long a stream defers `reserve_capacity` for a higher-urgency sibling
+/// before proceeding regardless. Long enough to give real priority under contention, short
+/// enough that a perpetually-busy high-urgency stream cannot starve the rest of a connection.
+const PRIORITY_STARVATION_BOUND: std::time::Duration = std::time::Duration::from_millis(20);
+
+impl PriorityScheduler {
+    fn new() -> Self {
+        Self {
+            waiting: std::array::from_fn(|_| AtomicUsize::new(0)),
+            cleared: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Blocks the calling stream until it is its turn to call `reserve_capacity`.
+    ///
+    /// A no-op — returns immediately — whenever no higher-urgency stream is contending, which
+    /// is the common case on an uncongested connection.
+    async fn turn(&self, urgency: u8) {
+        let urgency = urgency as usize;
+        self.waiting[urgency].fetch_add(1, Ordering::AcqRel);
+        while self.higher_priority_waiting(urgency) {
+            let _ = tokio::time::timeout(PRIORITY_STARVATION_BOUND, self.cleared.notified()).await;
+        }
+        self.waiting[urgency].fetch_sub(1, Ordering::AcqRel);
+        // Lets any lower-urgency stream sitting in this same loop re-check immediately
+        // instead of waiting out the rest of its timeout.
+        self.cleared.notify_waiters();
+    }
+
+    fn higher_priority_waiting(&self, urgency: usize) -> bool {
+        self.waiting[..urgency]
+            .iter()
+            .any(|count| count.load(Ordering::Acquire) > 0)
+    }
+}
 
 /// Adapts an [`h2::RecvStream`] to Tachyon's [`Body`].
 ///
@@ -169,6 +235,10 @@ where
 
     // Caps the handler tasks this one connection can have running at once.
     let stream_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS as usize));
+    // Shared across every stream on this connection, so `Priority` on one stream can defer
+    // `reserve_capacity` on another. Per-connection, not global: streams on different
+    // connections never contend for the same flow-control window anyway.
+    let priority_scheduler = Arc::new(PriorityScheduler::new());
 
     // `accept` drives the whole connection, not just stream acceptance, so in-flight
     // streams keep making progress while this awaits.
@@ -188,8 +258,9 @@ where
         };
 
         let state = Arc::clone(&state);
+        let priority_scheduler = Arc::clone(&priority_scheduler);
         super::http::spawn_connection(async move {
-            handle_stream(state, request, respond, peer).await;
+            handle_stream(state, request, respond, peer, priority_scheduler).await;
             drop(permit);
         });
     }
@@ -203,6 +274,7 @@ async fn handle_stream<S>(
     request: Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     peer: std::net::SocketAddr,
+    priority_scheduler: Arc<PriorityScheduler>,
 ) where
     S: Clone + Send + Sync + 'static,
 {
@@ -218,6 +290,10 @@ async fn handle_stream<S>(
         .early_hints
         .as_ref()
         .is_some_and(|config| config.permits(&parts.method, &parts.headers));
+
+    // RFC 9218: the client's request-time hint. A missing or malformed field falls back to
+    // the spec's default urgency (3) rather than rejecting the request over an advisory header.
+    let mut urgency = sfv::header_or_default::<Priority>(&parts.headers).urgency();
 
     let body = if recv_stream.is_end_stream() {
         Body::empty()
@@ -266,6 +342,12 @@ async fn handle_stream<S>(
     };
 
     let (mut parts, body) = response.into_parts();
+    // RFC 9218 §4: the handler may reprioritize by setting `Priority` on the response itself,
+    // overriding whatever the request carried. Read before stripping connection-specific
+    // headers below (`Priority` isn't one of them, but this keeps the read next to its source).
+    if parts.headers.contains_key(Priority::HEADER_NAME) {
+        urgency = sfv::header_or_default::<Priority>(&parts.headers).urgency();
+    }
     for header in CONNECTION_SPECIFIC_HEADERS {
         let _ = parts.headers.remove(header);
     }
@@ -283,7 +365,7 @@ async fn handle_stream<S>(
         }
     };
     if !empty_body {
-        send_body(send_stream, body).await;
+        send_body(send_stream, body, urgency, &priority_scheduler).await;
     }
 }
 
@@ -310,13 +392,19 @@ fn respond_with_status(respond: &mut h2::server::SendResponse<Bytes>, status: St
     }
 }
 
-/// Streams `body` out under HTTP/2 flow control.
+/// Streams `body` out under HTTP/2 flow control, honouring `urgency` against every other
+/// stream on the connection via `scheduler`.
 ///
 /// The frame is polled *before* any capacity is reserved. Reserving speculatively pins
 /// connection-level window that this stream may not end up using, which deadlocks a
 /// concurrent stream against peers that only emit `WINDOW_UPDATE` once their receive window
 /// is fully drained — the same ordering `hyper` settled on.
-async fn send_body(mut send_stream: h2::SendStream<Bytes>, body: Body) {
+async fn send_body(
+    mut send_stream: h2::SendStream<Bytes>,
+    body: Body,
+    urgency: u8,
+    scheduler: &PriorityScheduler,
+) {
     let mut body = std::pin::pin!(body);
 
     loop {
@@ -337,6 +425,9 @@ async fn send_body(mut send_stream: h2::SendStream<Bytes>, body: Body) {
                 if data.is_empty() {
                     continue;
                 }
+                // Lets a higher-urgency sibling on this connection call `reserve_capacity`
+                // first — see `PriorityScheduler`. A no-op when nothing is contending.
+                scheduler.turn(urgency).await;
                 send_stream.reserve_capacity(data.len());
                 if !await_capacity(&mut send_stream).await {
                     return;
@@ -688,6 +779,86 @@ mod tests {
     }
 
     /// A handler that sets HTTP/1.1 connection headers must not have every HTTP/2 response
+    /// Rapid Reset (CVE-2023-44487): a peer that opens a stream and immediately resets it
+    /// must not leave a handler running. `max_concurrent_streams` does not cover this —
+    /// `h2` frees the slot the moment the reset lands — so without an explicit reset check
+    /// each cheap HEADERS+RST_STREAM pair buys the attacker a full router dispatch.
+    #[tokio::test]
+    async fn resetting_a_stream_cancels_its_handler() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Counts handlers that ran to completion. A cancelled handler is dropped at its
+        // first await point and never reaches the increment.
+        let completed = StdArc::new(AtomicUsize::new(0));
+        let seen = StdArc::clone(&completed);
+
+        let router: Router<()> = Router::new().route(
+            "/slow",
+            get(move || {
+                let seen = StdArc::clone(&seen);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    let _ = seen.fetch_add(1, Ordering::SeqCst);
+                    "done"
+                }
+            }),
+        );
+
+        let mut harness = Harness::spawn(router, false).await;
+
+        for _ in 0..50 {
+            let request = Request::builder()
+                .method("GET")
+                .uri("https://example.test/slow")
+                .body(())
+                .unwrap();
+            let (response, _send) = harness.send_request.send_request(request, true).unwrap();
+            drop(response);
+        }
+
+        // Long enough for the resets to land and the handlers to be dropped, far short of
+        // the 30s each handler would otherwise sleep for.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "handlers kept running after their streams were reset",
+        );
+
+        // The connection is still usable: refusing abandoned work must not break the peer.
+        let (status, body) = harness.get("/", false).finish().await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = body;
+    }
+
+    /// A request that declares a body and never sends it must not pin a handler and its
+    /// connection permit indefinitely — the gap `DeadlineBody` covers on the `hyper` path.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_that_never_arrives_times_out() {
+        let router: Router<()> = Router::new().route(
+            "/upload",
+            crate::routing::post(|body: String| async move { format!("{}", body.len()) }),
+        );
+
+        let mut harness = Harness::spawn(router, false).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://example.test/upload")
+            .body(())
+            .unwrap();
+        // `false`: the stream stays open, so the server is left waiting on a body that is
+        // never coming.
+        let (response, _send_stream) = harness.send_request.send_request(request, false).unwrap();
+
+        // Auto-advanced past REQUEST_TIMEOUT by the paused clock rather than really slept.
+        let response = tokio::time::timeout(Duration::from_secs(120), response)
+            .await
+            .expect("handler was never released — the body deadline did not fire")
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
     /// rejected by `h2` before it reaches the wire.
     #[test]
     fn connection_specific_headers_are_stripped() {

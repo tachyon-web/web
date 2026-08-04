@@ -5,6 +5,7 @@ pub mod compression;
 pub mod early_hints;
 pub mod error;
 pub mod response;
+pub mod sfv;
 
 // Re-export standard HTTP types for convenience so users don't need to depend on `hyper` or `http` directly.
 pub use hyper::header;

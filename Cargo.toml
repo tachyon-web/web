@@ -23,6 +23,7 @@ pin-project-lite = "0.2"
 hyper = { version = "1", default-features = false, features = ["server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
+sfv = "0.15"
 
 # QUIC & HTTP/3
 s2n-quic = { version = "1.84", default-features = false, features = ["provider-tls-rustls"], optional = true }
@@ -91,6 +92,7 @@ futures = "0.3"
 hyper = { version = "1", features = ["client", "http2"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
 # Decoders for the compression suite. `reqwest` is built without its own compression
 # features on purpose, so these tests see the coded bytes exactly as a browser would.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
