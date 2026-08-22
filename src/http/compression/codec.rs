@@ -168,8 +168,8 @@ impl Encoder {
                 }
                 if let Some(size) = pledged_size {
                     // Advisory only; a failure here costs ratio, not correctness.
-                    let _ = encoder
-                        .set_pledged_src_size(Some(u64::try_from(size).unwrap_or(u64::MAX)));
+                    let _ =
+                        encoder.set_pledged_src_size(Some(u64::try_from(size).unwrap_or(u64::MAX)));
                 }
                 Some(Self::Zstd(Box::new(encoder)))
             }
@@ -381,11 +381,7 @@ mod tests {
         // window = base + base/8 * mantissa; round up to the next power of two.
         let window_base = 1u64.checked_shl(base).unwrap();
         let size = window_base
-            .checked_add(
-                (window_base / 8)
-                    .checked_mul(u64::from(mantissa))
-                    .unwrap(),
-            )
+            .checked_add((window_base / 8).checked_mul(u64::from(mantissa)).unwrap())
             .unwrap();
         size.next_power_of_two().trailing_zeros()
     }

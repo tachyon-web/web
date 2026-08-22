@@ -15,7 +15,10 @@ where
     /// Returns an error if FIPS compliance enforcement fails. The accept loop
     /// itself never surfaces per-connection errors as an `Err`; it just stops
     /// when `quic_server.accept()` returns `None`.
-    pub async fn serve_h3(self, mut quic_server: tachyon_quic::s2n_quic::Server) -> Result<(), std::io::Error> {
+    pub async fn serve_h3(
+        self,
+        mut quic_server: tachyon_quic::s2n_quic::Server,
+    ) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
         let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
@@ -45,9 +48,8 @@ where
 
         // Limit concurrent streams per connection for DoS protection — see
         // `Server::max_h3_concurrent_streams`.
-        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
-            self.max_h3_concurrent_streams,
-        ));
+        let stream_semaphore =
+            Arc::new(tokio::sync::Semaphore::new(self.max_h3_concurrent_streams));
 
         loop {
             let Ok(stream_permit) = stream_semaphore.clone().acquire_owned().await else {
@@ -82,7 +84,10 @@ where
     async fn read_h3_body(
         &self,
         parts: &hyper::http::request::Parts,
-        stream: &mut tachyon_quic::h3::server::RequestStream<tachyon_quic::BidiStream<Bytes>, Bytes>,
+        stream: &mut tachyon_quic::h3::server::RequestStream<
+            tachyon_quic::BidiStream<Bytes>,
+            Bytes,
+        >,
     ) -> Result<Bytes, StatusCode> {
         let method = &parts.method;
         if method == hyper::Method::GET || method == hyper::Method::HEAD {
@@ -277,7 +282,8 @@ mod tests {
             .expect("generate self-signed cert");
         let config = build_server_config(&cert.cert_pem, &cert.key_pem);
 
-        let quic_tls = tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(Arc::new(config));
+        let quic_tls =
+            tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(Arc::new(config));
         let quic_server = tachyon_quic::s2n_quic::Server::builder()
             .with_tls(quic_tls)
             .expect("with_tls")
@@ -325,12 +331,16 @@ mod tests {
             .expect("start quic client");
 
         let quic_conn = client
-            .connect(tachyon_quic::s2n_quic::client::Connect::new(addr).with_server_name("localhost"))
+            .connect(
+                tachyon_quic::s2n_quic::client::Connect::new(addr).with_server_name("localhost"),
+            )
             .await
             .expect("quic connect");
 
         let h3_conn = tachyon_quic::Connection::new(quic_conn);
-        let (mut driver, send_request) = tachyon_quic::h3::client::new(h3_conn).await.expect("h3 client new");
+        let (mut driver, send_request) = tachyon_quic::h3::client::new(h3_conn)
+            .await
+            .expect("h3 client new");
         let driver_task = tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });

@@ -239,8 +239,9 @@ impl PerMessageDeflate {
                 .compress
                 .compress_vec(data, &mut out, FlushCompress::Sync)
                 .map_err(|e| crate::http::error::Error::Internal(e.to_string()))?;
-            let consumed = usize::try_from(self.compress.total_in().saturating_sub(total_in_before))
-                .unwrap_or(usize::MAX);
+            let consumed =
+                usize::try_from(self.compress.total_in().saturating_sub(total_in_before))
+                    .unwrap_or(usize::MAX);
             if consumed >= data.len() {
                 break;
             }
@@ -282,10 +283,9 @@ impl PerMessageDeflate {
         );
         loop {
             grow(&mut out, 1024, capacity_limit);
-            let consumed_before = usize::try_from(
-                self.decompress.total_in().saturating_sub(total_in_before),
-            )
-            .unwrap_or(usize::MAX);
+            let consumed_before =
+                usize::try_from(self.decompress.total_in().saturating_sub(total_in_before))
+                    .unwrap_or(usize::MAX);
             let status = self
                 .decompress
                 .decompress_vec(
@@ -299,10 +299,9 @@ impl PerMessageDeflate {
                     "decompressed message exceeds the configured maximum size".to_string(),
                 ));
             }
-            let consumed = usize::try_from(
-                self.decompress.total_in().saturating_sub(total_in_before),
-            )
-            .unwrap_or(usize::MAX);
+            let consumed =
+                usize::try_from(self.decompress.total_in().saturating_sub(total_in_before))
+                    .unwrap_or(usize::MAX);
             if consumed >= input.len() {
                 break;
             }

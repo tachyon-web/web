@@ -121,9 +121,9 @@ where
         T: 'static,
     {
         if let Some(slot) = self.handlers.get_mut(idx) {
-            *slot = Some(middleware::MethodHandler::new(Arc::new(move |req, state| {
-                handler.clone().call(req, state)
-            })));
+            *slot = Some(middleware::MethodHandler::new(Arc::new(
+                move |req, state| handler.clone().call(req, state),
+            )));
         }
         self
     }
@@ -1456,7 +1456,8 @@ where
             idx
         };
 
-        let handler = effective_idx.and_then(|i| method_router.handlers.get(i).and_then(Option::as_ref));
+        let handler =
+            effective_idx.and_then(|i| method_router.handlers.get(i).and_then(Option::as_ref));
 
         if let Some(h) = handler {
             let mut resp = h.call(req, self.state.clone()).await;

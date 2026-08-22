@@ -279,8 +279,8 @@ impl AcceptedEncodings {
             if token == "*" {
                 // A repeated wildcard is malformed; the last one wins, as with any duplicate.
                 parsed.wildcard = Some(quality);
-            } else if let Some(slot) =
-                Encoding::from_token(token).and_then(|encoding| parsed.exact.get_mut(encoding.index()))
+            } else if let Some(slot) = Encoding::from_token(token)
+                .and_then(|encoding| parsed.exact.get_mut(encoding.index()))
             {
                 *slot = Some(quality);
             }

@@ -239,10 +239,9 @@ where
     let mut connection = builder.handshake::<_, Bytes>(io).await?;
 
     // Caps the handler tasks this one connection can have running at once.
-    let stream_permits = Arc::new(tokio::sync::Semaphore::new(usize::try_from(
-        MAX_CONCURRENT_STREAMS,
-    )
-    .unwrap_or(usize::MAX)));
+    let stream_permits = Arc::new(tokio::sync::Semaphore::new(
+        usize::try_from(MAX_CONCURRENT_STREAMS).unwrap_or(usize::MAX),
+    ));
     // Shared across every stream on this connection, so `Priority` on one stream can defer
     // `reserve_capacity` on another. Per-connection, not global: streams on different
     // connections never contend for the same flow-control window anyway.

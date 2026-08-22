@@ -398,7 +398,10 @@ impl AcmeManager {
                                     backoff
                                 );
                                 tokio::time::sleep(backoff).await;
-                                backoff = backoff.checked_mul(2).unwrap_or(BACKOFF_MAX).min(BACKOFF_MAX);
+                                backoff = backoff
+                                    .checked_mul(2)
+                                    .unwrap_or(BACKOFF_MAX)
+                                    .min(BACKOFF_MAX);
                                 continue;
                             }
                         }
@@ -410,7 +413,10 @@ impl AcmeManager {
                         );
                         tokio::time::sleep(backoff).await;
                         // Exponential backoff, capped at BACKOFF_MAX.
-                        backoff = backoff.checked_mul(2).unwrap_or(BACKOFF_MAX).min(BACKOFF_MAX);
+                        backoff = backoff
+                            .checked_mul(2)
+                            .unwrap_or(BACKOFF_MAX)
+                            .min(BACKOFF_MAX);
                         continue; // Skip the CHECK_INTERVAL sleep on failure.
                     }
                 }

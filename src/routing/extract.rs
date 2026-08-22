@@ -329,10 +329,7 @@ impl<'de> Iterator for QueryIter<'de> {
         let pair_str = self.input.get(..end).unwrap_or(self.input);
 
         if end < len {
-            self.input = self
-                .input
-                .get(end.saturating_add(1)..)
-                .unwrap_or_default();
+            self.input = self.input.get(end.saturating_add(1)..).unwrap_or_default();
         } else {
             self.input = "";
         }
@@ -342,15 +339,16 @@ impl<'de> Iterator for QueryIter<'de> {
         }
 
         let pair_bytes = pair_str.as_bytes();
-        let (key_raw, val_raw) = pair_bytes
-            .iter()
-            .position(|&b| b == b'=')
-            .map_or((pair_str, ""), |eq_idx| {
-                (
-                    pair_str.get(..eq_idx).unwrap_or(pair_str),
-                    pair_str.get(eq_idx.saturating_add(1)..).unwrap_or(""),
-                )
-            });
+        let (key_raw, val_raw) =
+            pair_bytes
+                .iter()
+                .position(|&b| b == b'=')
+                .map_or((pair_str, ""), |eq_idx| {
+                    (
+                        pair_str.get(..eq_idx).unwrap_or(pair_str),
+                        pair_str.get(eq_idx.saturating_add(1)..).unwrap_or(""),
+                    )
+                });
 
         let key = decode_query_param(key_raw);
         let val = decode_query_param(val_raw);
