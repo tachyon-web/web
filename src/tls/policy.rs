@@ -24,8 +24,7 @@ use std::sync::Arc;
 /// With the `fips` feature enabled, [`new`](Self::new)/[`Default::default`] always build the
 /// FIPS-140-3-compliant provider (see [`fips`](Self::fips)) — AES-256-GCM only; NIST SECP
 /// curves and ML-KEM only, no X25519. There is no fallback and no override: under `fips`,
-/// [`with_provider`](Self::with_provider) and
-/// [`Server::crypto_provider`](crate::server::Server::crypto_provider) don't compile, so a
+/// `TlsPolicy::with_provider` and `Server::crypto_provider` don't compile, so a
 /// non-compliant provider can't be plugged in even by mistake — the only `CryptoProvider` a
 /// `TlsPolicy` can ever hold under that feature is the FIPS one.
 ///

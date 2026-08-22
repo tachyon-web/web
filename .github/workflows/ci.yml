@@ -42,7 +42,7 @@ jobs:
         run: cargo test --locked -p parity-tests
       - uses: dtolnay/rust-toolchain@1.92
       - name: msrv (1.92)
-        run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
+        run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,sfv,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
 
   build:
     name: "${{ matrix.name }}"
@@ -66,7 +66,7 @@ jobs:
           - name: transports + interop (ws, sse, tower, tls, acme, http/3)
             flags: --features ws,sse,tower,tower-log,tls,cert-gen,lets-encrypt,http3
           - name: full (no tor/i2p)
-            flags: --features ws,sse,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
+            flags: --features ws,sse,sfv,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

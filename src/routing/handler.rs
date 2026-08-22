@@ -233,11 +233,14 @@ mod tests {
     struct FailReq;
     impl<S: Sync> FromRequest<S> for FailReq {
         type Rejection = crate::http::error::Error;
-        async fn from_request(_req: Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
-            Err(crate::http::error::Error::Rejection {
+        fn from_request(
+            _req: Request<Body>,
+            _state: &S,
+        ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+            std::future::ready(Err(crate::http::error::Error::Rejection {
                 status: hyper::StatusCode::BAD_REQUEST,
                 message: "req fail".to_string(),
-            })
+            }))
         }
     }
 
@@ -255,8 +258,11 @@ mod tests {
     struct SucceedReq;
     impl<S: Sync> FromRequest<S> for SucceedReq {
         type Rejection = crate::http::error::Error;
-        async fn from_request(_req: Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
-            Ok(Self)
+        fn from_request(
+            _req: Request<Body>,
+            _state: &S,
+        ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+            std::future::ready(Ok(Self))
         }
     }
 
