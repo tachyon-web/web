@@ -308,7 +308,7 @@ pub struct Server<S> {
     pub(crate) websocket_permits: Arc<tokio::sync::Semaphore>,
     /// Crypto/TLS policy shared across every listener this `Server` runs — see
     /// [`Server::tls_policy`]. `None` means each listener falls back to
-    /// [`TlsPolicy::hardened`](crate::tls::TlsPolicy::hardened).
+    /// [`TlsPolicy::new`](crate::tls::TlsPolicy::new).
     #[cfg(feature = "tls")]
     pub(crate) tls_policy: Option<crate::tls::TlsPolicy>,
     /// Response compression, applied to every transport — see [`Server::compression`].
@@ -526,7 +526,13 @@ where
     /// [`tls_policy`](Self::tls_policy) directly if you also want to restrict protocol
     /// versions (e.g. TLS 1.3-only) or install this provider process-wide for arti's Tor
     /// relay connections.
-    #[cfg(feature = "tls")]
+    ///
+    /// Not available with the `fips` feature enabled: under `fips`, every `TlsPolicy` is forced
+    /// onto the FIPS-140-3-compliant provider (see
+    /// [`TlsPolicy`](crate::tls::TlsPolicy)'s `fips` docs) with no way to substitute a custom
+    /// one, so this method doesn't compile in that build rather than silently ignoring the
+    /// provider passed to it.
+    #[cfg(all(feature = "tls", not(feature = "fips")))]
     #[must_use]
     pub fn crypto_provider(self, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
         self.tls_policy(crate::tls::TlsPolicy::with_provider(provider))
@@ -538,7 +544,7 @@ where
     /// self-signed certs) from the same [`TlsPolicy`](crate::tls::TlsPolicy) instead of each
     /// reconstructing their own defaults.
     ///
-    /// Defaults to [`TlsPolicy::hardened`](crate::tls::TlsPolicy::hardened) if never called.
+    /// Defaults to [`TlsPolicy::new`](crate::tls::TlsPolicy::new) if never called.
     ///
     /// See [`TlsPolicy`](crate::tls::TlsPolicy)'s docs for how this interacts with Tor's
     /// relay/channel TLS layer (a separate concern from HTTPS termination).
@@ -551,7 +557,10 @@ where
 
     /// Returns the effective [`TlsPolicy`](crate::tls::TlsPolicy) for this server: the one set
     /// via [`tls_policy`](Self::tls_policy)/[`crypto_provider`](Self::crypto_provider), or
-    /// [`TlsPolicy::hardened`](crate::tls::TlsPolicy::hardened) if neither was called.
+    /// [`TlsPolicy::new`](crate::tls::TlsPolicy::new) if neither was called. With the `fips`
+    /// feature enabled, every reachable `TlsPolicy` value is already FIPS-140-3-compliant by
+    /// construction (see [`TlsPolicy`](crate::tls::TlsPolicy)'s `fips` docs), so there's nothing
+    /// further to enforce here.
     ///
     /// Only consumed by the entry points that actually build a `rustls::ServerConfig`
     /// themselves — or, for `tor`, that install this policy's provider as rustls's
@@ -887,7 +896,7 @@ where
             .map_err(|e| crate::tls::pem::key_io_error(&e))?;
 
         // Shares the same crypto/TLS policy as the onion/i2p listeners — see
-        // `Server::tls_policy`. Call `.tls_policy(TlsPolicy::hardened().tls13_only())` (or a
+        // `Server::tls_policy`. Call `.tls_policy(TlsPolicy::new().tls13_only())` (or a
         // fully custom `TlsPolicy`) for stricter version pinning than the default (TLS 1.3
         // and 1.2 both offered).
         let policy = self.effective_tls_policy();
@@ -1291,7 +1300,7 @@ mod tests {
             .max_websocket_connections(9);
         #[cfg(feature = "tls")]
         {
-            server = server.tls_policy(crate::tls::TlsPolicy::hardened().tls13_only());
+            server = server.tls_policy(crate::tls::TlsPolicy::new().tls13_only());
         }
 
         let cloned = server.clone();

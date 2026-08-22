@@ -19,6 +19,16 @@ use std::sync::Arc;
 /// that generates its own self-signed certificate (onion, I2P) will build it with this same
 /// provider, and clearnet's ACME/static `ServerConfig` uses it too.
 ///
+/// # `fips`
+///
+/// With the `fips` feature enabled, [`new`](Self::new)/[`Default::default`] always build the
+/// FIPS-140-3-compliant provider (see [`fips`](Self::fips)) — AES-256-GCM only; NIST SECP
+/// curves and ML-KEM only, no X25519. There is no fallback and no override: under `fips`,
+/// [`with_provider`](Self::with_provider) and
+/// [`Server::crypto_provider`](crate::server::Server::crypto_provider) don't compile, so a
+/// non-compliant provider can't be plugged in even by mistake — the only `CryptoProvider` a
+/// `TlsPolicy` can ever hold under that feature is the FIPS one.
+///
 /// # The Tor relay/channel layer is a separate concern
 ///
 /// This policy governs TLS *termination* — the handshake a browser or I2P/Tor client
@@ -51,28 +61,70 @@ impl std::fmt::Debug for TlsPolicy {
     }
 }
 
+/// Both TLS 1.3 and 1.2 — the default every constructor below starts from; narrow with
+/// [`TlsPolicy::tls13_only`].
+fn both_versions() -> Vec<&'static SupportedProtocolVersion> {
+    vec![&rustls::version::TLS13, &rustls::version::TLS12]
+}
+
 impl TlsPolicy {
-    /// Tachyon's curated default: hybrid post-quantum key-exchange groups preferred
+    /// Tachyon's default TLS policy.
+    ///
+    /// Without the `fips` feature: hybrid post-quantum key-exchange groups preferred
     /// (`X25519MLKEM768`, `SECP256R1MLKEM768`, `MLKEM1024`, `MLKEM768`), falling back to
     /// classical ECDHE groups (`SECP384R1`, `X25519`, `SECP256R1`) for interoperability;
     /// AES-256-GCM and ChaCha20-Poly1305 preferred over AES-128 for both TLS 1.3 and TLS 1.2
-    /// cipher suites. Both TLS 1.3 and 1.2 are offered — see [`tls13_only`](Self::tls13_only)
-    /// to pin more strictly.
+    /// cipher suites.
+    ///
+    /// With the `fips` feature: this *is* [`fips`](Self::fips) — see the [type docs](Self#fips).
+    ///
+    /// Both TLS 1.3 and 1.2 are offered — see [`tls13_only`](Self::tls13_only) to pin more
+    /// strictly.
     #[must_use]
-    pub fn hardened() -> Self {
-        Self::with_provider(hardened_provider())
+    pub fn new() -> Self {
+        #[cfg(feature = "fips")]
+        {
+            Self::fips()
+        }
+        #[cfg(not(feature = "fips"))]
+        {
+            Self {
+                provider: default_provider(),
+                versions: both_versions(),
+            }
+        }
     }
 
     /// Builds a policy from a fully custom [`CryptoProvider`] — for example one pinned to
-    /// `TLS13_AES_256_GCM_SHA384` only, or built from `rustls::crypto::default_fips_provider()`
-    /// (with the `fips` feature) for FIPS-140-3-validated `aws-lc-rs` primitives.
+    /// `TLS13_AES_256_GCM_SHA384` only.
     ///
     /// Defaults to offering both TLS 1.3 and TLS 1.2 — see [`tls13_only`](Self::tls13_only).
+    ///
+    /// Not available with the `fips` feature enabled — see the [type docs](Self#fips).
+    #[cfg(not(feature = "fips"))]
     #[must_use]
     pub fn with_provider(provider: Arc<CryptoProvider>) -> Self {
         Self {
             provider,
-            versions: vec![&rustls::version::TLS13, &rustls::version::TLS12],
+            versions: both_versions(),
+        }
+    }
+
+    /// The FIPS-140-3-compliant policy: AES-256-GCM cipher suites only (no ChaCha20-Poly1305
+    /// or AES-128), and only NIST SECP curves / ML-KEM key-exchange groups
+    /// (`SECP256R1MLKEM768`, `MLKEM1024`, `MLKEM768`, `SECP384R1`, `SECP256R1`) — no X25519 in
+    /// any form, since RFC 7748 Curve25519 isn't FIPS-140-3-approved for key agreement (NIST SP
+    /// 800-186 vs SP 800-56Arev3).
+    ///
+    /// Requires the `fips` feature, under which this is also what [`new`](Self::new) and
+    /// [`Default::default`] build — see the [type docs](Self#fips) for why it's the only
+    /// provider a `TlsPolicy` can hold in that build.
+    #[cfg(feature = "fips")]
+    #[must_use]
+    pub fn fips() -> Self {
+        Self {
+            provider: fips_provider(),
+            versions: both_versions(),
         }
     }
 
@@ -150,13 +202,15 @@ impl TlsPolicy {
 
 impl Default for TlsPolicy {
     fn default() -> Self {
-        Self::hardened()
+        Self::new()
     }
 }
 
-/// Tachyon's curated default `CryptoProvider`: hybrid post-quantum key-exchange groups
-/// preferred, AES-256-GCM/ChaCha20-Poly1305 preferred over AES-128, computed once and shared.
-fn hardened_provider() -> Arc<CryptoProvider> {
+/// Tachyon's default `CryptoProvider` (non-`fips` builds only): hybrid post-quantum
+/// key-exchange groups preferred, AES-256-GCM/ChaCha20-Poly1305 preferred over AES-128,
+/// computed once and shared.
+#[cfg(not(feature = "fips"))]
+fn default_provider() -> Arc<CryptoProvider> {
     static DEFAULT_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
     DEFAULT_PROVIDER
         .get_or_init(|| {
@@ -195,30 +249,102 @@ fn hardened_provider() -> Arc<CryptoProvider> {
         .clone()
 }
 
+/// Tachyon's FIPS-140-3-compliant `CryptoProvider`: AES-256-GCM cipher suites only, and only
+/// NIST SECP curves / ML-KEM key-exchange groups — computed once and shared. See
+/// [`TlsPolicy::fips`] for why each algorithm was chosen.
+#[cfg(feature = "fips")]
+fn fips_provider() -> Arc<CryptoProvider> {
+    static FIPS_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
+    FIPS_PROVIDER
+        .get_or_init(|| {
+            let kx_groups = vec![
+                rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
+                rustls::crypto::aws_lc_rs::kx_group::MLKEM1024,
+                rustls::crypto::aws_lc_rs::kx_group::MLKEM768,
+                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+                rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+            ];
+
+            let cipher_suites = vec![
+                // TLS 1.3
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
+                // TLS 1.2
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ];
+
+            Arc::new(CryptoProvider {
+                cipher_suites,
+                kx_groups,
+                ..rustls::crypto::aws_lc_rs::default_provider()
+            })
+        })
+        .clone()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::TlsPolicy;
 
     #[test]
-    fn hardened_offers_both_tls_versions_by_default() {
-        let policy = TlsPolicy::hardened();
+    fn new_offers_both_tls_versions_by_default() {
+        let policy = TlsPolicy::new();
         assert_eq!(policy.versions().len(), 2);
     }
 
     #[test]
     fn tls13_only_restricts_to_a_single_version() {
-        let policy = TlsPolicy::hardened().tls13_only();
+        let policy = TlsPolicy::new().tls13_only();
         assert_eq!(policy.versions(), &[&rustls::version::TLS13]);
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn new_is_fips_by_default_under_the_fips_feature() {
+        assert_eq!(
+            TlsPolicy::new().provider().cipher_suites,
+            TlsPolicy::fips().provider().cipher_suites
+        );
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_offers_only_aes_256_cipher_suites() {
+        let provider = TlsPolicy::fips().provider();
+        for suite in &provider.cipher_suites {
+            let name = format!("{suite:?}");
+            assert!(
+                name.contains("AES_256"),
+                "non-AES-256 cipher suite offered under fips: {name}"
+            );
+            assert!(
+                !name.contains("CHACHA20") && !name.contains("AES_128"),
+                "non-compliant cipher suite offered under fips: {name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_offers_only_secp_and_mlkem_kx_groups() {
+        let provider = TlsPolicy::fips().provider();
+        for group in &provider.kx_groups {
+            let name = format!("{:?}", group.name());
+            assert!(
+                !name.to_ascii_uppercase().contains("X25519"),
+                "X25519 is not FIPS-140-3-approved for key agreement, but was offered: {name}"
+            );
+        }
     }
 
     #[test]
     fn debug_format_reports_negotiated_versions() {
-        let both = format!("{:?}", TlsPolicy::hardened());
+        let both = format!("{:?}", TlsPolicy::new());
         assert!(both.contains("tls13: true"));
         assert!(both.contains("tls12: true"));
 
-        let tls13_only = format!("{:?}", TlsPolicy::hardened().tls13_only());
+        let tls13_only = format!("{:?}", TlsPolicy::new().tls13_only());
         assert!(tls13_only.contains("tls13: true"));
         assert!(tls13_only.contains("tls12: false"));
     }
@@ -228,10 +354,8 @@ mod tests {
     /// install first, never panics.
     #[test]
     fn install_as_process_default_is_idempotent() {
-        TlsPolicy::hardened().install_as_process_default();
-        TlsPolicy::hardened()
-            .tls13_only()
-            .install_as_process_default();
+        TlsPolicy::new().install_as_process_default();
+        TlsPolicy::new().tls13_only().install_as_process_default();
     }
 
     #[cfg(all(feature = "cert-gen", any(feature = "tor", feature = "i2p")))]
@@ -240,7 +364,7 @@ mod tests {
         let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
             .expect("generate self-signed cert");
 
-        let config = TlsPolicy::hardened()
+        let config = TlsPolicy::new()
             .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
             .expect("build server config from valid PEM");
 
@@ -250,7 +374,7 @@ mod tests {
     #[cfg(all(feature = "cert-gen", any(feature = "tor", feature = "i2p")))]
     #[test]
     fn server_config_from_pem_rejects_garbage_input() {
-        let err = TlsPolicy::hardened()
+        let err = TlsPolicy::new()
             .server_config_from_pem(b"not a certificate", b"not a key")
             .expect_err("garbage PEM must not build a config");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -264,7 +388,7 @@ mod tests {
         let cert_b = crate::tls::generate_self_signed_cert(vec!["b.example".to_string()])
             .expect("generate cert b");
 
-        let err = TlsPolicy::hardened()
+        let err = TlsPolicy::new()
             .server_config_from_pem(cert_a.cert_pem.as_bytes(), cert_b.key_pem.as_bytes())
             .expect_err("mismatched cert/key pair must not build a config");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);

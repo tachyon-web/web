@@ -294,7 +294,7 @@ impl AcmeManager {
     }
 
     /// [`new`](Self::new), with the signing key loaded through `policy`'s crypto provider
-    /// instead of [`TlsPolicy::hardened`](crate::tls::TlsPolicy::hardened)'s.
+    /// instead of [`TlsPolicy::new`](crate::tls::TlsPolicy::new)'s.
     ///
     /// [`Server::serve_all_acme`](crate::server::Server::serve_all_acme) passes its own
     /// effective policy, so a `fips`/custom provider covers the issued certificate too.
@@ -725,6 +725,7 @@ impl AcmeManager {
 /// so this only needs to handle short- and long-form DER lengths — no indefinite
 /// length, no BER quirks.
 mod min_der {
+    use std::num::Wrapping;
     use std::time::{Duration, SystemTime};
 
     /// Reads one DER TLV starting at `pos`, returning `(tag, content, end)` where
@@ -865,7 +866,12 @@ mod min_der {
         if !hi.is_ascii_digit() || !lo.is_ascii_digit() {
             return Err("expected two ASCII digits");
         }
-        Ok(u32::from(hi - b'0') * 10 + u32::from(lo - b'0'))
+        // `Wrapping`, not raw `-`/`*`/`+`: the digits are already range-checked above so this
+        // never actually wraps, but `clippy::arithmetic_side_effects` doesn't know that and
+        // `Wrapping` is its documented way to say "this is deliberate, bounded arithmetic".
+        let hi = Wrapping(u32::from(hi)) - Wrapping(u32::from(b'0'));
+        let lo = Wrapping(u32::from(lo)) - Wrapping(u32::from(b'0'));
+        Ok((hi * Wrapping(10) + lo).0)
     }
 
     /// Converts a UTC calendar date/time (as decoded from DER) into a `SystemTime`,
@@ -887,7 +893,12 @@ mod min_der {
             return Err("time-of-day out of range");
         }
         let days = days_from_civil(year, i64::from(month), i64::from(day));
-        let secs_of_day = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+        // Bounded by the `hour`/`minute`/`second` checks above — see `two_digits` for why
+        // `Wrapping` rather than raw arithmetic.
+        let secs_of_day = (Wrapping(i64::from(hour)) * Wrapping(3600)
+            + Wrapping(i64::from(minute)) * Wrapping(60)
+            + Wrapping(i64::from(second)))
+        .0;
         let total_secs = days
             .checked_mul(86_400)
             .and_then(|d| d.checked_add(secs_of_day))
@@ -895,18 +906,26 @@ mod min_der {
         // Certificates with a notAfter before 1970 aren't something we can (or need
         // to) support: we only ever compare this against `SystemTime::now()`.
         let total_secs = u64::try_from(total_secs).map_err(|_| "date before the Unix epoch")?;
-        Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(total_secs))
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(total_secs))
+            .ok_or("date arithmetic overflow")
     }
 
     /// Days since 1970-01-01 for a given proleptic-Gregorian civil date.
-    const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = (if y >= 0 { y } else { y - 399 }) / 400;
-        let yoe = y - era * 400; // [0, 399]
-        let mp = (m + 9) % 12; // [0, 11], Mar=0 .. Feb=11
-        let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-        era * 146_097 + doe - 719_468
+    ///
+    /// Uses `Wrapping` throughout — see `two_digits` for why — rather than raw arithmetic: the
+    /// month/day range is validated by `ymdhms_to_system_time` before this is ever called, and
+    /// the year range certificates can express (four-digit `GeneralizedTime`/two-digit
+    /// `UTCTime` years) is nowhere near enough to overflow `i64`, so this never actually wraps.
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let (y, m, d) = (Wrapping(y), Wrapping(m), Wrapping(d));
+        let y = if m.0 <= 2 { y - Wrapping(1) } else { y };
+        let era = Wrapping(if y.0 >= 0 { y.0 } else { (y - Wrapping(399)).0 } / 400);
+        let yoe = y - era * Wrapping(400); // [0, 399]
+        let mp = Wrapping((m + Wrapping(9)).0 % 12); // [0, 11], Mar=0 .. Feb=11
+        let doy = Wrapping((mp * Wrapping(153) + Wrapping(2)).0 / 5) + d - Wrapping(1); // [0, 365]
+        let doe = yoe * Wrapping(365) + Wrapping(yoe.0 / 4) - Wrapping(yoe.0 / 100) + doy; // [0, 146096]
+        (era * Wrapping(146_097) + doe - Wrapping(719_468)).0
     }
 
     #[cfg(test)]

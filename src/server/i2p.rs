@@ -694,7 +694,7 @@ mod tests {
     #[cfg(all(feature = "tls", feature = "cert-gen"))]
     #[test]
     fn tls_config_switches_to_a_custom_server_config() {
-        let policy = crate::tls::TlsPolicy::hardened();
+        let policy = crate::tls::TlsPolicy::new();
         let cert = crate::tls::generate_self_signed_cert(vec!["nick.b32.i2p".to_string()])
             .expect("generate self-signed cert");
         let server_config = policy

@@ -358,7 +358,7 @@ where
     /// Since `client` is already bootstrapped, arti has already constructed its internal
     /// relay/channel TLS provider from whatever `rustls::crypto::CryptoProvider` was installed
     /// process-wide *before this call* — install one yourself (e.g.
-    /// `server.effective_tls_policy()`, or simply `TlsPolicy::hardened().install_as_process_default()`,
+    /// `server.effective_tls_policy()`, or simply `TlsPolicy::new().install_as_process_default()`,
     /// both requiring this crate's `tls` feature) before bootstrapping `client` if that matters
     /// to you; it's too late to affect `client` by the time this function runs.
     /// [`serve_tor`](Server::serve_tor) does this for you because it owns the bootstrap.
@@ -531,7 +531,7 @@ where
                         .unwrap_or_else(|| "onion-service.invalid".to_string());
                     let cert = crate::tls::generate_self_signed_cert(vec![domain])?;
                     // Shares this server's crypto/TLS policy (see `Server::tls_policy`) rather
-                    // than stock rustls defaults, so a hardened/FIPS/custom provider set for
+                    // than stock rustls defaults, so a non-default/FIPS/custom provider set for
                     // clearnet applies here too.
                     let server_config = self.effective_tls_policy().server_config_from_pem(
                         cert.cert_pem.as_bytes(),
@@ -900,7 +900,7 @@ mod tests {
     #[cfg(all(feature = "tls", feature = "cert-gen"))]
     #[test]
     fn tls_config_switches_to_a_custom_server_config() {
-        let policy = crate::tls::TlsPolicy::hardened();
+        let policy = crate::tls::TlsPolicy::new();
         let cert = crate::tls::generate_self_signed_cert(vec!["nick.onion".to_string()])
             .expect("generate self-signed cert");
         let server_config = policy
