@@ -93,7 +93,7 @@ async fn test_server_request_timeout() {
 
     let mut resp_bytes = vec![0; 512];
     let n = stream.read(&mut resp_bytes).await.unwrap();
-    let resp_str = String::from_utf8_lossy(&resp_bytes[..n]);
+    let resp_str = String::from_utf8_lossy(resp_bytes.get(..n).unwrap());
     assert!(resp_str.contains("408"), "response was: {resp_str}");
 
     server_handle.abort();
@@ -125,7 +125,7 @@ async fn test_server_ignores_unread_body_for_bodyless_handler() {
     let resp_fut = async {
         let mut resp_bytes = vec![0; 512];
         let n = stream.read(&mut resp_bytes).await.unwrap();
-        String::from_utf8_lossy(&resp_bytes[..n]).into_owned()
+        String::from_utf8_lossy(resp_bytes.get(..n).unwrap()).into_owned()
     };
     let resp_str = tokio::time::timeout(Duration::from_secs(5), resp_fut)
         .await

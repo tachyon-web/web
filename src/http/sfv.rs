@@ -289,7 +289,9 @@ impl_from_sfv_value!(i64, "an integer", |item, _key| item
 impl_from_sfv_value!(bool, "a boolean", |item, _key| item.as_boolean());
 impl_from_sfv_value!(Decimal, "a decimal", |item, _key| item.as_decimal());
 impl_from_sfv_value!(f64, "a decimal", |item, _key| item.as_decimal().map(|d| {
-    #[allow(clippy::cast_precision_loss)]
+    // `i64 as f64` is lossy above 2^53, but `f64` has no infallible `From<i64>` — this is
+    // the standard way to accept that bounded precision loss.
+    #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
     let scaled = i64::from(d.as_integer_scaled_1000()) as f64;
     scaled / 1000.0
 }));
@@ -722,13 +724,11 @@ impl Priority {
     /// The urgency, with out-of-range values replaced by the RFC 9218 default
     /// of 3.
     #[must_use]
-    pub const fn urgency(&self) -> u8 {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        if self.raw_urgency < 0 || self.raw_urgency > 7 {
-            DEFAULT_URGENCY as u8
-        } else {
-            self.raw_urgency as u8
-        }
+    pub fn urgency(&self) -> u8 {
+        u8::try_from(self.raw_urgency)
+            .ok()
+            .filter(|urgency| *urgency <= 7)
+            .unwrap_or(3)
     }
 }
 

@@ -111,7 +111,7 @@ where
                     Ok(Some(mut chunk)) => {
                         while chunk.has_remaining() {
                             let data = chunk.chunk();
-                            if body_vec.len() + data.len() > limit {
+                            if body_vec.len().saturating_add(data.len()) > limit {
                                 return Err(over_limit);
                             }
                             body_vec.extend_from_slice(data);

@@ -68,7 +68,9 @@ pub(crate) fn guess_mime_type(path: &Path) -> &'static str {
     }
 
     let mut buf = [0u8; MAX_EXT_LEN];
-    let lowered = &mut buf[..ext.len()];
+    let Some(lowered) = buf.get_mut(..ext.len()) else {
+        return DEFAULT;
+    };
     lowered.copy_from_slice(ext.as_bytes());
     lowered.make_ascii_lowercase();
     let Ok(ext) = std::str::from_utf8(lowered) else {
@@ -502,8 +504,11 @@ impl ServeDir {
 
             let variant_len =
                 |variant: &Option<Representation>| variant.as_ref().map_or(0, |v| v.content.len());
-            *current_total +=
-                identity.content.len() + variant_len(&gz) + variant_len(&br) + variant_len(&zst);
+            *current_total = current_total
+                .saturating_add(identity.content.len())
+                .saturating_add(variant_len(&gz))
+                .saturating_add(variant_len(&br))
+                .saturating_add(variant_len(&zst));
 
             let _ = cache.insert(
                 relative,

@@ -398,7 +398,7 @@ impl AcmeManager {
                                     backoff
                                 );
                                 tokio::time::sleep(backoff).await;
-                                backoff = (backoff * 2).min(BACKOFF_MAX);
+                                backoff = backoff.checked_mul(2).unwrap_or(BACKOFF_MAX).min(BACKOFF_MAX);
                                 continue;
                             }
                         }
@@ -410,7 +410,7 @@ impl AcmeManager {
                         );
                         tokio::time::sleep(backoff).await;
                         // Exponential backoff, capped at BACKOFF_MAX.
-                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                        backoff = backoff.checked_mul(2).unwrap_or(BACKOFF_MAX).min(BACKOFF_MAX);
                         continue; // Skip the CHECK_INTERVAL sleep on failure.
                     }
                 }
@@ -732,7 +732,8 @@ mod min_der {
     /// `end` is the offset in `buf` just past the whole TLV (header + content).
     fn read_tlv(buf: &[u8], pos: usize) -> Result<(u8, &[u8], usize), &'static str> {
         let tag = *buf.get(pos).ok_or("truncated DER: missing tag")?;
-        let len_byte = *buf.get(pos + 1).ok_or("truncated DER: missing length")?;
+        let pos_plus_1 = pos.checked_add(1).ok_or("DER offset overflow")?;
+        let len_byte = *buf.get(pos_plus_1).ok_or("truncated DER: missing length")?;
         let (len, header_len) = if len_byte & 0x80 == 0 {
             (usize::from(len_byte), 2usize)
         } else {
@@ -744,9 +745,10 @@ mod min_der {
             if n == 0 || n > 4 {
                 return Err("unsupported DER length encoding");
             }
-            let start = pos + 2;
+            let start = pos.checked_add(2).ok_or("DER offset overflow")?;
+            let end = start.checked_add(n).ok_or("DER offset overflow")?;
             let bytes = buf
-                .get(start..start + n)
+                .get(start..end)
                 .ok_or("truncated DER: missing length bytes")?;
             // `checked_mul`, not `checked_shl`: a shift only reports shifting by more bits
             // than the type has, not shifting significant bits off the top — so on 32-bit a
@@ -758,9 +760,9 @@ mod min_der {
                     .and_then(|v| v.checked_add(usize::from(b)))
                     .ok_or("DER length overflow")?;
             }
-            (len, 2 + n)
+            (len, 2usize.checked_add(n).ok_or("DER offset overflow")?)
         };
-        let content_start = pos + header_len;
+        let content_start = pos.checked_add(header_len).ok_or("DER offset overflow")?;
         let content_end = content_start
             .checked_add(len)
             .ok_or("DER length overflow")?;
@@ -827,35 +829,42 @@ mod min_der {
 
     fn parse_utc_time(b: &[u8]) -> Result<SystemTime, &'static str> {
         // UTCTime, RFC 5280 profile: `YYMMDDHHMMSSZ` — always UTC, always seconds, always `Z`.
-        if b.len() != 13 || b[12] != b'Z' {
+        if b.len() != 13 || b.get(12) != Some(&b'Z') {
             return Err("malformed UTCTime");
         }
         // RFC 5280's Y2K pivot rule: YY >= 50 means 19YY, otherwise 20YY.
-        let yy = two_digits(&b[0..2])?;
-        let year = i64::from(if yy >= 50 { 1900 + yy } else { 2000 + yy });
+        let yy = two_digits(b.get(0..2).ok_or("malformed UTCTime")?)?;
+        let year = i64::from(if yy >= 50 {
+            (Wrapping(1900u32) + Wrapping(yy)).0
+        } else {
+            (Wrapping(2000u32) + Wrapping(yy)).0
+        });
         ymdhms_to_system_time(
             year,
-            two_digits(&b[2..4])?,
-            two_digits(&b[4..6])?,
-            two_digits(&b[6..8])?,
-            two_digits(&b[8..10])?,
-            two_digits(&b[10..12])?,
+            two_digits(b.get(2..4).ok_or("malformed UTCTime")?)?,
+            two_digits(b.get(4..6).ok_or("malformed UTCTime")?)?,
+            two_digits(b.get(6..8).ok_or("malformed UTCTime")?)?,
+            two_digits(b.get(8..10).ok_or("malformed UTCTime")?)?,
+            two_digits(b.get(10..12).ok_or("malformed UTCTime")?)?,
         )
     }
 
     fn parse_generalized_time(b: &[u8]) -> Result<SystemTime, &'static str> {
         // GeneralizedTime, RFC 5280 profile: `YYYYMMDDHHMMSSZ` — no fractional seconds.
-        if b.len() != 15 || b[14] != b'Z' {
+        if b.len() != 15 || b.get(14) != Some(&b'Z') {
             return Err("malformed GeneralizedTime");
         }
-        let year = i64::from(two_digits(&b[0..2])?) * 100 + i64::from(two_digits(&b[2..4])?);
+        let century = two_digits(b.get(0..2).ok_or("malformed GeneralizedTime")?)?;
+        let year_in_century = two_digits(b.get(2..4).ok_or("malformed GeneralizedTime")?)?;
+        // Bounded, range-checked two-digit groups — see the `Wrapping` note on `two_digits`.
+        let year = i64::from((Wrapping(century) * Wrapping(100) + Wrapping(year_in_century)).0);
         ymdhms_to_system_time(
             year,
-            two_digits(&b[4..6])?,
-            two_digits(&b[6..8])?,
-            two_digits(&b[8..10])?,
-            two_digits(&b[10..12])?,
-            two_digits(&b[12..14])?,
+            two_digits(b.get(4..6).ok_or("malformed GeneralizedTime")?)?,
+            two_digits(b.get(6..8).ok_or("malformed GeneralizedTime")?)?,
+            two_digits(b.get(8..10).ok_or("malformed GeneralizedTime")?)?,
+            two_digits(b.get(10..12).ok_or("malformed GeneralizedTime")?)?,
+            two_digits(b.get(12..14).ok_or("malformed GeneralizedTime")?)?,
         )
     }
 

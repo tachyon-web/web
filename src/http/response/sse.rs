@@ -329,7 +329,9 @@ where
                     // keep-alive ping only fires after the stream has actually been
                     // idle for `keep_alive.interval`, matching the documented behavior.
                     interval: tokio::time::interval_at(
-                        tokio::time::Instant::now() + keep_alive.interval,
+                        tokio::time::Instant::now()
+                            .checked_add(keep_alive.interval)
+                            .unwrap_or_else(tokio::time::Instant::now),
                         keep_alive.interval,
                     ),
                     comment_event: keep_alive.event,

@@ -34,7 +34,7 @@ async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn visit(State(CounterState(state)): State<CounterState>) -> impl IntoResponse {
-    let visits = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
+    let visits = state.counter.fetch_add(1, Ordering::SeqCst).saturating_add(1);
     format!("Total visits: {visits}")
 }
 

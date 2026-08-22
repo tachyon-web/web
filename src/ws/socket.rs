@@ -88,21 +88,28 @@ fn unmask(data: &mut [u8], mask: [u8; 4]) {
     ]);
     let mut chunks8 = data.chunks_exact_mut(8);
     for chunk in &mut chunks8 {
-        let word = u64::from_ne_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]) ^ mask8;
+        let bytes: [u8; 8] = (&*chunk)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("chunks_exact_mut(8) guarantees a length-8 chunk"));
+        let word = u64::from_ne_bytes(bytes) ^ mask8;
         chunk.copy_from_slice(&word.to_ne_bytes());
     }
 
     let mask4 = u32::from_ne_bytes(mask);
     let mut chunks4 = chunks8.into_remainder().chunks_exact_mut(4);
     for chunk in &mut chunks4 {
-        let word = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ mask4;
+        let bytes: [u8; 4] = (&*chunk)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("chunks_exact_mut(4) guarantees a length-4 chunk"));
+        let word = u32::from_ne_bytes(bytes) ^ mask4;
         chunk.copy_from_slice(&word.to_ne_bytes());
     }
 
     for (i, byte) in chunks4.into_remainder().iter_mut().enumerate() {
-        *byte ^= mask[i % 4];
+        let Some(mask_byte) = mask.get(i % 4) else {
+            unreachable!("i % 4 is always in range for a 4-byte mask");
+        };
+        *byte ^= mask_byte;
     }
 }
 
@@ -118,17 +125,17 @@ const fn is_valid_close_code(code: u16) -> bool {
 }
 
 fn parse_close(payload: &[u8]) -> Result<Option<CloseFrame>, Error> {
-    match payload.len() {
-        0 => Ok(None),
-        1 => Err(Error::Internal("invalid WebSocket close frame".to_string())),
-        _ => {
-            let code = u16::from_be_bytes([payload[0], payload[1]]);
+    match payload {
+        [] => Ok(None),
+        [_] => Err(Error::Internal("invalid WebSocket close frame".to_string())),
+        [a, b, rest @ ..] => {
+            let code = u16::from_be_bytes([*a, *b]);
             if !is_valid_close_code(code) {
                 return Err(Error::Internal(format!(
                     "received an invalid or reserved WebSocket close code: {code}"
                 )));
             }
-            let reason = std::str::from_utf8(&payload[2..])
+            let reason = std::str::from_utf8(rest)
                 .map_err(|_| Error::Internal("WebSocket close reason is not UTF-8".to_string()))?;
             Ok(Some(CloseFrame {
                 code: code.into(),
@@ -409,7 +416,7 @@ impl WebSocket {
                 return Poll::Ready(None);
             }
 
-            budget -= 1;
+            budget = budget.saturating_sub(1);
             if budget == 0 {
                 // Yield cooperatively: re-register interest so we're polled again promptly, but
                 // let the executor run other tasks first instead of monopolizing this thread.

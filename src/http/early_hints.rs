@@ -475,7 +475,7 @@ impl Link {
         if !is_safe_target(&self.target) {
             return None;
         }
-        let mut rendered = String::with_capacity(self.target.len() + 32);
+        let mut rendered = String::with_capacity(self.target.len().saturating_add(32));
         rendered.push('<');
         rendered.push_str(&self.target);
         rendered.push_str(">; rel=");
@@ -746,7 +746,7 @@ impl EarlyHints {
         if channel
             .sent
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sent| {
-                (sent < MAX_HINTS_PER_REQUEST).then_some(sent + 1)
+                (sent < MAX_HINTS_PER_REQUEST).then_some(sent.saturating_add(1))
             })
             .is_err()
         {

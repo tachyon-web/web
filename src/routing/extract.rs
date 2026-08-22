@@ -148,7 +148,8 @@ impl DefaultBodyLimit {
         let limit = self.limit.unwrap_or(usize::MAX);
         move |mut req: hyper::Request<Body>, next: crate::routing::middleware::Next<S>| {
             let _ = req.extensions_mut().insert(MaxBodySize(limit));
-            Box::pin(next.run(req)) as BoxedResponseFuture
+            let future: BoxedResponseFuture = Box::pin(next.run(req));
+            future
         }
     }
 }
@@ -323,10 +324,13 @@ impl<'de> Iterator for QueryIter<'de> {
         let bytes = self.input.as_bytes();
         let len = bytes.len();
         let end = bytes.iter().position(|&b| b == b'&').unwrap_or(len);
-        let pair_str = &self.input[..end];
+        let pair_str = self.input.get(..end).unwrap_or(self.input);
 
         if end < len {
-            self.input = &self.input[end + 1..];
+            self.input = self
+                .input
+                .get(end.saturating_add(1)..)
+                .unwrap_or_default();
         } else {
             self.input = "";
         }
@@ -340,7 +344,10 @@ impl<'de> Iterator for QueryIter<'de> {
             .iter()
             .position(|&b| b == b'=')
             .map_or((pair_str, ""), |eq_idx| {
-                (&pair_str[..eq_idx], &pair_str[eq_idx + 1..])
+                (
+                    pair_str.get(..eq_idx).unwrap_or(pair_str),
+                    pair_str.get(eq_idx.saturating_add(1)..).unwrap_or(""),
+                )
             });
 
         let key = decode_query_param(key_raw);
@@ -358,26 +365,28 @@ fn decode_query_param(s: &str) -> std::borrow::Cow<'_, str> {
 
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'%' => {
+                let hex_bytes = bytes.get(i.saturating_add(1)..i.saturating_add(3));
+                if let Some(hex_bytes) = hex_bytes
+                    && let Ok(hex) = std::str::from_utf8(hex_bytes)
                     && let Ok(val) = u8::from_str_radix(hex, 16)
                 {
                     decoded.push(val);
-                    i += 3;
+                    i = i.saturating_add(3);
                     continue;
                 }
                 decoded.push(b'%');
-                i += 1;
+                i = i.saturating_add(1);
             }
             b'+' => {
                 decoded.push(b' ');
-                i += 1;
+                i = i.saturating_add(1);
             }
-            b => {
-                decoded.push(b);
-                i += 1;
+            other => {
+                decoded.push(other);
+                i = i.saturating_add(1);
             }
         }
     }

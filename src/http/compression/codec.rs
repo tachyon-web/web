@@ -26,8 +26,8 @@ pub enum CompressionLevel {
     /// save transmission time.
     Fastest,
     /// The best ratio worth using on a server: gzip/deflate 9, Brotli 11, zstd 19. zstd
-    /// stops short of its true max of 22 — levels 20-22 need hundreds of MiB of encoder
-    /// state per stream, a DoS vector when one exists per in-flight response. Pass
+    /// stops short of its true max of 22 — levels 20-22 need hundreds of `MiB` of encoder
+    /// state per stream, a `DoS` vector when one exists per in-flight response. Pass
     /// [`CompressionLevel::Precise`] to override.
     Best,
     /// A middle setting tuned per codec: gzip/deflate 6, Brotli 4, zstd 3. Brotli sits at 4
@@ -168,7 +168,8 @@ impl Encoder {
                 }
                 if let Some(size) = pledged_size {
                     // Advisory only; a failure here costs ratio, not correctness.
-                    let _ = encoder.set_pledged_src_size(Some(size as u64));
+                    let _ = encoder
+                        .set_pledged_src_size(Some(u64::try_from(size).unwrap_or(u64::MAX)));
                 }
                 Some(Self::Zstd(Box::new(encoder)))
             }
@@ -367,18 +368,25 @@ mod tests {
     /// the base-2 log of the window size.
     #[cfg(feature = "compression-zstd")]
     fn zstd_frame_window_log(frame: &[u8]) -> u32 {
-        let descriptor = frame[4];
+        let descriptor = *frame.get(4).unwrap();
         let single_segment = (descriptor >> 5) & 1 == 1;
         assert!(
             !single_segment,
             "expected a windowed frame, got Single_Segment_Flag"
         );
-        let window_descriptor = frame[5];
+        let window_descriptor = *frame.get(5).unwrap();
         let exponent = u32::from(window_descriptor >> 3);
         let mantissa = u32::from(window_descriptor & 0b111);
-        let base = 10 + exponent;
+        let base = 10u32.checked_add(exponent).unwrap();
         // window = base + base/8 * mantissa; round up to the next power of two.
-        let size = (1u64 << base) + ((1u64 << base) / 8) * u64::from(mantissa);
+        let window_base = 1u64.checked_shl(base).unwrap();
+        let size = window_base
+            .checked_add(
+                (window_base / 8)
+                    .checked_mul(u64::from(mantissa))
+                    .unwrap(),
+            )
+            .unwrap();
         size.next_power_of_two().trailing_zeros()
     }
 

@@ -102,7 +102,7 @@ async fn test_advanced_features() {
 }
 
 #[test]
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "tls", not(feature = "fips")))]
 fn test_custom_crypto_provider() {
     use std::sync::Arc;
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());

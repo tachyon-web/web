@@ -157,12 +157,11 @@ fn b32_decode_ident_hash(host: &str) -> [u8; 32] {
             .iter()
             .position(|&a| a == c.to_ascii_lowercase())
             .expect("invalid base32 character");
-        bits = (bits << 5) | val as u64;
-        bit_count += 5;
+        bits = (bits << 5) | u64::try_from(val).unwrap();
+        bit_count = bit_count.saturating_add(5);
         if bit_count >= 8 {
-            bit_count -= 8;
-            #[allow(clippy::cast_possible_truncation)] // masked to 8 bits by construction
-            out.push(((bits >> bit_count) & 0xff) as u8);
+            bit_count = bit_count.saturating_sub(8);
+            out.push(u8::try_from((bits >> bit_count) & 0xff).unwrap());
         }
     }
     out.try_into().expect("decoded length was not 32 bytes")

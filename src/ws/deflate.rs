@@ -232,15 +232,15 @@ impl PerMessageDeflate {
     /// Compresses one full message payload, stripping the trailing sync-flush marker per §7.2.1.
     fn compress_raw(&mut self, data: &[u8]) -> Result<Vec<u8>, crate::http::error::Error> {
         let total_in_before = self.compress.total_in();
-        let mut out = Vec::with_capacity(data.len() + 32);
+        let mut out = Vec::with_capacity(data.len().saturating_add(32));
         loop {
             grow(&mut out, 1024.max(data.len()), usize::MAX);
             let status = self
                 .compress
                 .compress_vec(data, &mut out, FlushCompress::Sync)
                 .map_err(|e| crate::http::error::Error::Internal(e.to_string()))?;
-            let consumed =
-                usize::try_from(self.compress.total_in() - total_in_before).unwrap_or(usize::MAX);
+            let consumed = usize::try_from(self.compress.total_in().saturating_sub(total_in_before))
+                .unwrap_or(usize::MAX);
             if consumed >= data.len() {
                 break;
             }
@@ -265,7 +265,7 @@ impl PerMessageDeflate {
         max_size: Option<usize>,
     ) -> Result<Vec<u8>, crate::http::error::Error> {
         let max_size = max_size.unwrap_or(usize::MAX);
-        let mut input = Vec::with_capacity(data.len() + DEFLATE_TAIL.len());
+        let mut input = Vec::with_capacity(data.len().saturating_add(DEFLATE_TAIL.len()));
         input.extend_from_slice(data);
         input.extend_from_slice(&DEFLATE_TAIL);
 
@@ -282,19 +282,27 @@ impl PerMessageDeflate {
         );
         loop {
             grow(&mut out, 1024, capacity_limit);
-            let consumed_before =
-                usize::try_from(self.decompress.total_in() - total_in_before).unwrap_or(usize::MAX);
+            let consumed_before = usize::try_from(
+                self.decompress.total_in().saturating_sub(total_in_before),
+            )
+            .unwrap_or(usize::MAX);
             let status = self
                 .decompress
-                .decompress_vec(&input[consumed_before..], &mut out, FlushDecompress::Sync)
+                .decompress_vec(
+                    input.get(consumed_before..).unwrap_or(&[]),
+                    &mut out,
+                    FlushDecompress::Sync,
+                )
                 .map_err(|e| crate::http::error::Error::Internal(e.to_string()))?;
             if out.len() > max_size {
                 return Err(crate::http::error::Error::Internal(
                     "decompressed message exceeds the configured maximum size".to_string(),
                 ));
             }
-            let consumed =
-                usize::try_from(self.decompress.total_in() - total_in_before).unwrap_or(usize::MAX);
+            let consumed = usize::try_from(
+                self.decompress.total_in().saturating_sub(total_in_before),
+            )
+            .unwrap_or(usize::MAX);
             if consumed >= input.len() {
                 break;
             }
@@ -330,7 +338,7 @@ fn grow(out: &mut Vec<u8>, min_initial: usize, max_capacity: usize) {
         .saturating_add(current.max(min_initial))
         .min(max_capacity);
     if target > current {
-        out.reserve(target - current);
+        out.reserve(target.saturating_sub(current));
     }
 }
 

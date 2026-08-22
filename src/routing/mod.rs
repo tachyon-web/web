@@ -120,9 +120,11 @@ where
         H: Handler<T, S>,
         T: 'static,
     {
-        self.handlers[idx] = Some(middleware::MethodHandler::new(Arc::new(
-            move |req, state| handler.clone().call(req, state),
-        )));
+        if let Some(slot) = self.handlers.get_mut(idx) {
+            *slot = Some(middleware::MethodHandler::new(Arc::new(move |req, state| {
+                handler.clone().call(req, state)
+            })));
+        }
         self
     }
 
@@ -133,7 +135,7 @@ where
         let mut out = String::with_capacity(56);
         let implicit_head = self.handlers[IDX_GET].is_some() && self.handlers[IDX_HEAD].is_none();
         for (i, name) in METHOD_NAMES.iter().enumerate() {
-            if self.handlers[i].is_some() {
+            if self.handlers.get(i).is_some_and(Option::is_some) {
                 if !out.is_empty() {
                     out.push(',');
                 }
@@ -162,7 +164,7 @@ where
             if let Some(handler) = theirs.take() {
                 if mine.is_some() {
                     return Err(RouterError::MethodOverlap {
-                        method: METHOD_NAMES[i],
+                        method: METHOD_NAMES.get(i).copied().unwrap_or("UNKNOWN"),
                         path: path.to_string(),
                     });
                 }
@@ -206,18 +208,16 @@ where
                 fut.await.into_response()
             }))
         });
-        for i in 0..METHOD_COUNT {
-            if let Some(handler) = &mut self.handlers[i] {
-                match position {
-                    middleware::MiddlewarePosition::First => {
-                        handler.middlewares.insert(0, boxed.clone());
-                    }
-                    middleware::MiddlewarePosition::Last => {
-                        handler.middlewares.push(boxed.clone());
-                    }
+        for handler in self.handlers.iter_mut().flatten() {
+            match position {
+                middleware::MiddlewarePosition::First => {
+                    handler.middlewares.insert(0, boxed.clone());
                 }
-                handler.compiled = None;
+                middleware::MiddlewarePosition::Last => {
+                    handler.middlewares.push(boxed.clone());
+                }
             }
+            handler.compiled = None;
         }
         self
     }
@@ -266,10 +266,8 @@ where
 
     /// Compile all handler middleware chains in-place.
     pub fn compile_in_place(&mut self) {
-        for i in 0..METHOD_COUNT {
-            if let Some(handler) = &mut self.handlers[i] {
-                handler.compile_in_place();
-            }
+        for handler in self.handlers.iter_mut().flatten() {
+            handler.compile_in_place();
         }
     }
 
@@ -282,7 +280,7 @@ where
     {
         let mut new_handlers: [Option<middleware::MethodHandler<S2>>; METHOD_COUNT] =
             [const { None }; METHOD_COUNT];
-        for (i, opt_handler) in self.handlers.iter().enumerate() {
+        for (slot, opt_handler) in new_handlers.iter_mut().zip(self.handlers.iter()) {
             if let Some(handler) = opt_handler {
                 let mut compiled_h = handler.clone();
                 compiled_h.compile_in_place();
@@ -290,7 +288,7 @@ where
                 let state = state.clone();
                 let new_h: BoxedHandler<S2> =
                     Arc::new(move |req, _parent_state| compiled_raw(req, state.clone()));
-                new_handlers[i] = Some(middleware::MethodHandler::new(new_h));
+                *slot = Some(middleware::MethodHandler::new(new_h));
             }
         }
         MethodRouter {
@@ -1246,16 +1244,18 @@ fn extract_param_names(path: &str) -> Arc<[Arc<str>]> {
     let mut names = Vec::new();
     let bytes = path.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{'
-            && let Some(end) = path[i + 1..].find('}')
+    while let Some(&byte) = bytes.get(i) {
+        let after_brace = i.saturating_add(1);
+        if byte == b'{'
+            && let Some(rest) = path.get(after_brace..)
+            && let Some(end) = rest.find('}')
+            && let Some(inner) = rest.get(..end)
         {
-            let inner = &path[i + 1..i + 1 + end];
             let name = inner.strip_prefix('*').unwrap_or(inner);
             names.push(Arc::from(name));
-            i += 1 + end + 1;
+            i = after_brace.saturating_add(end).saturating_add(1);
         } else {
-            i += 1;
+            i = i.saturating_add(1);
         }
     }
     Arc::from(names)
@@ -1271,22 +1271,21 @@ pub(crate) fn percent_decode(s: &str) -> Option<std::borrow::Cow<'_, str>> {
     }
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 < bytes.len() {
-                let hex = &bytes[i + 1..i + 3];
-                if let Ok(hex_str) = std::str::from_utf8(hex)
-                    && let Ok(val) = u8::from_str_radix(hex_str, 16)
-                {
-                    decoded.push(val);
-                    i += 3;
-                    continue;
-                }
+    while let Some(&byte) = bytes.get(i) {
+        if byte == b'%' {
+            let hex = bytes.get(i.saturating_add(1)..i.saturating_add(3));
+            if let Some(hex) = hex
+                && let Ok(hex_str) = std::str::from_utf8(hex)
+                && let Ok(val) = u8::from_str_radix(hex_str, 16)
+            {
+                decoded.push(val);
+                i = i.saturating_add(3);
+                continue;
             }
             return None; // invalid percent encoding
         }
-        decoded.push(bytes[i]);
-        i += 1;
+        decoded.push(byte);
+        i = i.saturating_add(1);
     }
     let s = String::from_utf8(decoded).ok()?;
     Some(std::borrow::Cow::Owned(s))
@@ -1337,7 +1336,10 @@ fn strip_trailing_slash(req: &mut Request<Body>) {
     if path.len() <= 1 || !path.ends_with('/') {
         return;
     }
-    let new_path = path[..path.len() - 1].to_string();
+    let new_path = path
+        .get(..path.len().saturating_sub(1))
+        .unwrap_or(path)
+        .to_string();
     set_uri_path(req, &new_path);
 }
 
@@ -1454,7 +1456,7 @@ where
             idx
         };
 
-        let handler = effective_idx.and_then(|i| method_router.handlers[i].as_ref());
+        let handler = effective_idx.and_then(|i| method_router.handlers.get(i).and_then(Option::as_ref));
 
         if let Some(h) = handler {
             let mut resp = h.call(req, self.state.clone()).await;

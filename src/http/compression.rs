@@ -225,7 +225,11 @@ fn parse_quality(raw: &str) -> Option<Quality> {
     }
     let mut frac: Quality = 0;
     for i in 0..3 {
-        frac = frac * 10 + Quality::from(frac_part.as_bytes().get(i).map_or(0, |b| b - b'0'));
+        let digit = frac_part
+            .as_bytes()
+            .get(i)
+            .map_or(0, |b| b.saturating_sub(b'0'));
+        frac = frac.saturating_mul(10).saturating_add(Quality::from(digit));
     }
     Some((int.saturating_mul(1000).saturating_add(frac)).min(Q_MAX))
 }
@@ -275,8 +279,10 @@ impl AcceptedEncodings {
             if token == "*" {
                 // A repeated wildcard is malformed; the last one wins, as with any duplicate.
                 parsed.wildcard = Some(quality);
-            } else if let Some(encoding) = Encoding::from_token(token) {
-                parsed.exact[encoding.index()] = Some(quality);
+            } else if let Some(slot) =
+                Encoding::from_token(token).and_then(|encoding| parsed.exact.get_mut(encoding.index()))
+            {
+                *slot = Some(quality);
             }
         }
         parsed
@@ -290,7 +296,8 @@ impl AcceptedEncodings {
     ///
     /// [RFC 9110 §12.5.3]: https://www.rfc-editor.org/rfc/rfc9110#section-12.5.3
     fn quality_of(&self, encoding: Encoding) -> Option<Quality> {
-        let effective = match (self.exact[encoding.index()], self.wildcard) {
+        let exact = self.exact.get(encoding.index()).copied().flatten();
+        let effective = match (exact, self.wildcard) {
             // An explicit entry always beats the wildcard, even a lower one.
             (Some(q), _) | (None, Some(q)) => q,
             (None, None) => {
@@ -874,7 +881,7 @@ fn weaken_etag(headers: &mut HeaderMap) {
     }
     // Entity tags are short, so the `W/` prefix goes on in a stack buffer; only a tag past
     // 62 bytes spills to the heap.
-    let mut weakened: SmallVec<[u8; 64]> = SmallVec::with_capacity(etag.len() + 2);
+    let mut weakened: SmallVec<[u8; 64]> = SmallVec::with_capacity(etag.len().saturating_add(2));
     weakened.extend_from_slice(b"W/");
     weakened.extend_from_slice(etag);
     if let Ok(value) = HeaderValue::from_bytes(&weakened) {
@@ -906,11 +913,13 @@ impl LengthBuffer {
         }
         let mut index = self.0.len();
         while value > 0 && index > 0 {
-            index -= 1;
-            self.0[index] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+            index = index.saturating_sub(1);
+            if let Some(slot) = self.0.get_mut(index) {
+                *slot = b'0'.saturating_add(u8::try_from(value % 10).unwrap_or(0));
+            }
             value /= 10;
         }
-        std::str::from_utf8(&self.0[index..]).unwrap_or("0")
+        std::str::from_utf8(self.0.get(index..).unwrap_or(&[])).unwrap_or("0")
     }
 }
 

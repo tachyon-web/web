@@ -114,19 +114,24 @@ impl PriorityScheduler {
     /// A no-op — returns immediately — whenever no higher-urgency stream is contending, which
     /// is the common case on an uncongested connection.
     async fn turn(&self, urgency: u8) {
-        let urgency = urgency as usize;
-        self.waiting[urgency].fetch_add(1, Ordering::AcqRel);
+        let urgency = usize::from(urgency);
+        let Some(slot) = self.waiting.get(urgency) else {
+            return;
+        };
+        slot.fetch_add(1, Ordering::AcqRel);
         while self.higher_priority_waiting(urgency) {
             let _ = tokio::time::timeout(PRIORITY_STARVATION_BOUND, self.cleared.notified()).await;
         }
-        self.waiting[urgency].fetch_sub(1, Ordering::AcqRel);
+        slot.fetch_sub(1, Ordering::AcqRel);
         // Lets any lower-urgency stream sitting in this same loop re-check immediately
         // instead of waiting out the rest of its timeout.
         self.cleared.notify_waiters();
     }
 
     fn higher_priority_waiting(&self, urgency: usize) -> bool {
-        self.waiting[..urgency]
+        self.waiting
+            .get(..urgency)
+            .unwrap_or(&[])
             .iter()
             .any(|count| count.load(Ordering::Acquire) > 0)
     }
@@ -234,7 +239,10 @@ where
     let mut connection = builder.handshake::<_, Bytes>(io).await?;
 
     // Caps the handler tasks this one connection can have running at once.
-    let stream_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS as usize));
+    let stream_permits = Arc::new(tokio::sync::Semaphore::new(usize::try_from(
+        MAX_CONCURRENT_STREAMS,
+    )
+    .unwrap_or(usize::MAX)));
     // Shared across every stream on this connection, so `Priority` on one stream can defer
     // `reserve_capacity` on another. Per-connection, not global: streams on different
     // connections never contend for the same flow-control window anyway.
