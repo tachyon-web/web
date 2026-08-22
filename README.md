@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Server::new(app)
         .start_all(
             "0.0.0.0:443",
-            Some("0.0.0.0:80"),  // optional HTTP -> HTTPS redirect
+            Some("0.0.0.0:80"), // optional HTTP -> HTTPS redirect
             cert.cert_pem,
             cert.key_pem,
         )
@@ -113,12 +113,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     Server::new(app)
         .serve_all_acme(
-            "0.0.0.0:443",                          // HTTPS / HTTP/2 / HTTP/3
-            "0.0.0.0:80",                           // HTTP redirect + ACME challenges
-            vec!["example.com".to_string()],        // domains (must resolve to this server)
-            "admin@example.com".to_string(),        // Let's Encrypt contact email
-            "/var/cache/tachyon/certs",             // persistent cert cache (survives restarts)
-            false,                                  // false = production LE, true = staging
+            "0.0.0.0:443",                   // HTTPS / HTTP/2 / HTTP/3
+            "0.0.0.0:80",                    // HTTP redirect + ACME challenges
+            vec!["example.com".to_string()], // domains (must resolve to this server)
+            "admin@example.com".to_string(), // Let's Encrypt contact email
+            "/var/cache/tachyon/certs",      // persistent cert cache (survives restarts)
+            false,                           // false = production LE, true = staging
         )
         .await?;
     Ok(())
@@ -168,16 +168,23 @@ Requires the `ws` feature.
 applied to every transport at once:
 
 ```rust,no_run
-use tachyon_web::{Router, Server};
+use tachyon_web::{Router, Server, get};
 use tachyon_web::http::compression::{Compression, CompressionLevel};
 
-Server::new(app)
-    .compression(
-        Compression::new()                      // every codec this build has, zstd first
-            .quality(CompressionLevel::Fastest),  // encode speed, for per-request bodies
-    )
-    .serve_http(listener)
-    .await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let app: Router = Router::new().route("/", get(|| async { "hello" }));
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+
+    Server::new(app)
+        .compression(
+            Compression::new()                       // every codec this build has, zstd first
+                .quality(CompressionLevel::Fastest), // encode speed, for per-request bodies
+        )
+        .serve_http(listener)
+        .await?;
+    Ok(())
+}
 ```
 
 Or scoped to one router with `Router::compression(..)`. The codec feature names match
@@ -198,6 +205,36 @@ compressed.
 `ServeDir` picks up pre-compressed `.zst` sidecars alongside the `.br` and `.gz` it already
 served, and negotiates among the ones each asset actually has.
 
+## Structured Field Values
+
+RFC 9651 gives most headers standardised since 2019 (`Priority`, `Cache-Status`,
+`Signature-Input`, …) a real data model instead of a string to regex. `sfv_dictionary!`
+declares a typed header that parses itself, rejecting a malformed field with `400 Bad
+Request` before your handler runs:
+
+```rust,no_run
+use tachyon_web::http::sfv::StructuredHeader;
+use tachyon_web::sfv_dictionary;
+use tachyon_web::{Router, get};
+
+sfv_dictionary! {
+    /// A made-up session header.
+    pub struct SessionState for "secure-session-state" {
+        "id" => id: String,
+        "ttl" => ttl: i64 = 0,
+    }
+}
+
+async fn handler(StructuredHeader(session): StructuredHeader<SessionState>) -> String {
+    format!("session {} (ttl {})", session.id, session.ttl)
+}
+
+let _app: Router<()> = Router::new().route("/", get(handler));
+```
+
+Requires the `sfv` feature. RFC 9218 `Priority`-based HTTP/2 stream scheduling works without
+it — it's built on the same machinery internally, just not exposed as public API.
+
 ## 103 Early Hints
 
 [RFC 8297]. An informational response sent *during* handler think-time, telling the browser
@@ -207,22 +244,35 @@ what to fetch before the HTML exists:
 use tachyon_web::{Html, Router, Server, get};
 use tachyon_web::http::early_hints::{EarlyHints, EarlyHintsConfig, Link};
 
+async fn load() -> String {
+    "some data".to_string()
+}
+
+fn render(data: &str) -> String {
+    format!("<p>{data}</p>")
+}
+
 async fn page(hints: EarlyHints) -> Html<String> {
     hints.send([
         Link::preload("/static/app.css").as_style(),
         Link::preconnect("https://cdn.example.com"),
-    ]);                          // returns immediately, nothing to await
+    ]); // returns immediately, nothing to await
 
-    let data = load().await;     // the think-time this exists to overlap
+    let data = load().await; // the think-time this exists to overlap
     Html(render(&data))
 }
 
-let app: Router = Router::new().route("/", get(page));
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let app: Router = Router::new().route("/", get(page));
+    let cert = tachyon_web::tls::generate_self_signed_cert(vec!["localhost".into()])?;
 
-Server::new(app)
-    .early_hints(EarlyHintsConfig::new())
-    .serve_https_config(listener, tls_config)
-    .await?;
+    Server::new(app)
+        .early_hints(EarlyHintsConfig::new())
+        .start_all("0.0.0.0:443", None, cert.cert_pem, cert.key_pem)
+        .await?;
+    Ok(())
+}
 ```
 
 There is also a declarative form — `get(page).early_hints([..])` on a route, or
@@ -278,6 +328,7 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `http3` | | HTTP/3 over QUIC via `s2n-quic`; needs `tls` |
 | `lets-encrypt` | | automatic Let's Encrypt certificate management; needs `tls`, `cert-gen` |
 | `sse` | | Server-Sent Events (`response::sse::{Event, Sse, KeepAlive}`) |
+| `sfv` | | Structured Field Values (RFC 9651): the `StructuredHeader` extractor, `sfv_dictionary!`, and the raw `sfv` model re-exports |
 | `early-hints` | | `103 Early Hints` (RFC 8297), plus the native HTTP/2 driver that emits them; needs `tls` |
 | `tower` | | `tower::Service`/`tower::Layer` interop, plus `tower::Service` for `CompiledRouter` |
 | `fips` | | enforce FIPS-mode cryptography at startup; refuses to start otherwise |

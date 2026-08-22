@@ -259,7 +259,8 @@ pub(super) struct Encoder(());
 #[allow(
     clippy::unused_self,
     clippy::missing_const_for_fn,
-    clippy::unnecessary_wraps
+    clippy::unnecessary_wraps,
+    clippy::needless_pass_by_ref_mut
 )]
 impl Encoder {
     pub(super) const fn new(

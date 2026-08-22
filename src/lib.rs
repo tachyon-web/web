@@ -83,7 +83,7 @@
 //!         Server::new(app)
 //!             .start_all(
 //!                 "0.0.0.0:443",
-//!                 Some("0.0.0.0:80"),  // optional HTTP → HTTPS redirect
+//!                 Some("0.0.0.0:80"), // optional HTTP → HTTPS redirect
 //!                 cert.cert_pem,
 //!                 cert.key_pem,
 //!             )
@@ -164,11 +164,11 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     #[cfg(feature = "tor")]
-//!     {
-//!         let app = Router::new().route("/", get(hello));
-//!         Server::new(app).serve_tor("my-hidden-service").await?;
-//!     }
+//! #   #[cfg(feature = "tor")]
+//! #   {
+//!     let app = Router::new().route("/", get(hello));
+//!     Server::new(app).serve_tor("my-hidden-service").await?;
+//! #   }
 //!     Ok(())
 //! }
 //! ```
@@ -186,11 +186,11 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     #[cfg(feature = "i2p")]
-//!     {
-//!         let app = Router::new().route("/", get(hello));
-//!         Server::new(app).serve_i2p("my-eepsite").await?;
-//!     }
+//! #   #[cfg(feature = "i2p")]
+//! #   {
+//!     let app = Router::new().route("/", get(hello));
+//!     Server::new(app).serve_i2p("my-eepsite").await?;
+//! #   }
 //!     Ok(())
 //! }
 //! ```
@@ -207,9 +207,33 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-// #[cfg(doctest)] // Need enable all relevent features
-// #[doc = include_str!("../README.md")]
-// struct ReadmeDoctests;
+#[cfg(all(
+    doctest,
+    feature = "json",
+    feature = "matched-path",
+    feature = "original-uri",
+    feature = "http1",
+    feature = "http2",
+    feature = "cookies",
+    feature = "tower-log",
+    feature = "ws",
+    feature = "form",
+    feature = "query",
+    feature = "tls",
+    feature = "cert-gen",
+    feature = "http3",
+    feature = "fips",
+    feature = "lets-encrypt",
+    feature = "tower",
+    feature = "sse",
+    feature = "sfv",
+    feature = "tor",
+    feature = "i2p",
+    feature = "compression-full",
+    feature = "early-hints",
+))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 #[cfg(not(any(feature = "http1", feature = "http2")))]
 compile_error!(

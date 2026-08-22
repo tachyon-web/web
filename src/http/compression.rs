@@ -845,7 +845,7 @@ fn compressed_stream_body(
     feature = "compression-br",
     feature = "compression-zstd",
 )))]
-fn compressed_stream_body(
+const fn compressed_stream_body(
     body: Body,
     _encoding: Encoding,
     _level: CompressionLevel,
@@ -938,6 +938,7 @@ async fn collect_full(body: Body) -> Result<Bytes, crate::http::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "compression-gzip")]
     use hyper::body::Frame;
     use hyper::header::CONTENT_TYPE;
 
