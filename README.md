@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tachyon-web.svg)](https://crates.io/crates/tachyon-web)
 [![Docs.rs](https://img.shields.io/docsrs/tachyon-web)](https://docs.rs/tachyon-web)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![License](https://img.shields.io/badge/license-0BSD-8da0cb.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](#minimum-supported-rust-version)
 
 A multi-protocol web framework for Rust, built on [`hyper`](https://crates.io/crates/hyper) and
@@ -30,7 +30,7 @@ For side projects, internal tools, and prototypes, try it and report what broke.
 
 ## Quick start
 
-```rust
+```rust,no_run
 use tachyon_web::{Router, Server, get};
 use tachyon_web::http::response::Html;
 use tokio::net::TcpListener;
@@ -76,7 +76,7 @@ req/sec on the same hardware, see `benches/optimistic`.
 
 Throwaway self-signed certificate, for development:
 
-```rust
+```rust,no_run
 use tachyon_web::{Router, Server, get, tls};
 
 async fn hello() -> &'static str { "secure hello" }
@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 `serve_all_acme` runs the whole Let's Encrypt lifecycle in-process — account registration,
 the HTTP-01 challenge, disk caching, and renewal 30 days before expiry:
 
-```rust
+```rust,no_run
 use tachyon_web::{Router, Server, get};
 
 async fn hello() -> &'static str { "Hello, secure world!" }
@@ -139,7 +139,7 @@ it sits outside the crate's `#![forbid(unsafe_code)]` guarantee. Read the
 
 ## WebSockets
 
-```rust
+```rust,no_run
 use tachyon_web::ws::{WebSocket, WebSocketUpgrade};
 use tachyon_web::http::Response;
 use tachyon_web::http::response::Body;
@@ -167,7 +167,7 @@ Requires the `ws` feature.
 `Accept-Encoding` negotiation and response coding for `zstd`, `br`, `gzip` and `deflate`,
 applied to every transport at once:
 
-```rust
+```rust,no_run
 use tachyon_web::{Router, Server};
 use tachyon_web::http::compression::{Compression, CompressionLevel};
 
@@ -203,7 +203,7 @@ served, and negotiates among the ones each asset actually has.
 [RFC 8297]. An informational response sent *during* handler think-time, telling the browser
 what to fetch before the HTML exists:
 
-```rust
+```rust,no_run
 use tachyon_web::{Html, Router, Server, get};
 use tachyon_web::http::early_hints::{EarlyHints, EarlyHintsConfig, Link};
 
@@ -309,13 +309,7 @@ TLS, HTTP/3, and certificate management are built in rather than assembled by ev
 
 ## License
 
-Licensed under either of
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
-- [MIT license](LICENSE-MIT)
-
-at your option.
+Licensed under the [0BSD license](https://github.com/hacer-bark/cargo-unikernel/blob/main/LICENSE).
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
-this crate, as defined in the Apache-2.0 license, shall be dual licensed as above, without any
-additional terms or conditions.
+this crate shall be licensed as above, without any additional terms or conditions.

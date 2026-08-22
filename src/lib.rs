@@ -207,6 +207,10 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+// #[cfg(doctest)] // Need enable all relevent features
+// #[doc = include_str!("../README.md")]
+// struct ReadmeDoctests;
+
 #[cfg(not(any(feature = "http1", feature = "http2")))]
 compile_error!(
     "tachyon-web requires at least one of the \"http1\" or \"http2\" features to serve anything"

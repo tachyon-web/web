@@ -3,9 +3,9 @@ name = "tachyon-web"
 version = "0.0.3"
 edition = "2024"
 rust-version = "1.92"
-authors = ["Hacer"]
 readme = "README.md"
-license = "MIT OR Apache-2.0"
+authors = ["Hacer-Bark <hacer.bark@proton.me>"]
+license = "0BSD"
 description = "A fast, Axum-compatible async web framework with native TLS, HTTP/3, Tor (.onion), and I2P (.i2p) support"
 repository = "https://github.com/tachyon-web/web"
 homepage = "https://github.com/tachyon-web/web"
@@ -28,7 +28,7 @@ sfv = "0.15"
 # QUIC & HTTP/3
 s2n-quic = { version = "1.84", default-features = false, features = ["provider-tls-rustls"], optional = true }
 h3 = { version = "0.0.8", optional = true }
-s2n-quic-h3 = { version = "0.2", optional = true }
+tachyon-quic = { version = "0.2", optional = true }
 
 # TLS & Cryptography
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "prefer-post-quantum"], optional = true }
@@ -120,10 +120,10 @@ query = []
 # Tachyon-only additions
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]
 cert-gen = ["dep:rcgen", "tls"]
-http3 = ["dep:s2n-quic", "dep:h3", "dep:s2n-quic-h3", "tls"]
+http3 = ["dep:s2n-quic", "dep:h3", "dep:tachyon-quic", "tls"]
 fips = [
     "aws-lc-rs?/fips", "rustls?/fips", "instant-acme?/fips", "rcgen?/fips", 
-    "tachyon-i2p?/fips", "s2n-quic-h3?/fips", "s2n-quic?/provider-tls-fips",
+    "tachyon-i2p?/fips", "tachyon-quic?/fips", "s2n-quic?/provider-tls-fips",
 ]
 lets-encrypt = ["dep:instant-acme", "dep:webpki", "dep:serde_json", "tls", "cert-gen"]
 tower = ["dep:tower"]
@@ -153,7 +153,6 @@ members = [
     "benches/optimistic",
     "benches/static",
     "benches/api",
-    "parity-tests",
 ]
 
 [workspace.dependencies]
@@ -163,7 +162,7 @@ serde_json = "1"
 axum = "0.8"
 axum-server = "0.8"
 actix-web = "4"
-actix-files = "0.6"
+actix-files = "0.7"
 rocket = "0.5"
 salvo = "0.95"
 tower-http = "0.7"
@@ -189,6 +188,15 @@ expect_used = "deny"
 panic = "deny"
 todo = "deny"
 unimplemented = "deny"
+exit = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+
+[lints.rustdoc]
+all = "deny"
+broken_intra_doc_links = "deny"
 
 [[example]]
 name = "onion_i2p_server"
