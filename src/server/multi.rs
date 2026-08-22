@@ -20,7 +20,7 @@ enum Transport {
     #[cfg(feature = "tls")]
     Https(TcpListener, Box<rustls::ServerConfig>),
     #[cfg(feature = "http3")]
-    H3(s2n_quic::Server),
+    H3(tachyon_quic::s2n_quic::Server),
     #[cfg(feature = "tor")]
     Onion(super::tor::OnionConfig),
     #[cfg(feature = "i2p")]
@@ -77,7 +77,7 @@ where
     /// Adds an HTTP/3-over-QUIC transport — see [`Server::serve_h3`]. Requires the `http3`
     /// feature.
     #[cfg(feature = "http3")]
-    pub fn with_h3(mut self, quic_server: s2n_quic::Server) -> Self {
+    pub fn with_h3(mut self, quic_server: tachyon_quic::s2n_quic::Server) -> Self {
         self.transports.push(Transport::H3(quic_server));
         self
     }

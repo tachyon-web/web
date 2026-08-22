@@ -26,9 +26,7 @@ http-body-util = "0.1"
 sfv = "0.15"
 
 # QUIC & HTTP/3
-s2n-quic = { version = "1.84", default-features = false, features = ["provider-tls-rustls"], optional = true }
-h3 = { version = "0.0.8", optional = true }
-tachyon-quic = { version = "0.2", optional = true }
+tachyon-quic = { version = "0.3", optional = true }
 
 # TLS & Cryptography
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "prefer-post-quantum"], optional = true }
@@ -62,9 +60,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # Optional Server-Sent Events support (see the `sse` feature).
 futures-core = { version = "0.3", default-features = false, optional = true }
 
-# Optional response-compression codecs (see the `compression-*` features). The one-shot
-# in-memory path goes straight through these; `async-compression` (below) reuses them for
-# the streaming path instead of duplicating codec logic.
+# Optional response-compression codecs (see the `compression-*` features).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"], optional = true }
 brotli = { version = "8", default-features = false, features = ["std"], optional = true }
 zstd = { version = "0.13", default-features = false, optional = true }
@@ -123,10 +119,10 @@ query = []
 # Tachyon-only additions
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]
 cert-gen = ["dep:rcgen", "tls"]
-http3 = ["dep:s2n-quic", "dep:h3", "dep:tachyon-quic", "tls"]
+http3 = ["dep:tachyon-quic", "tls"]
 fips = [
     "aws-lc-rs?/fips", "rustls?/fips", "instant-acme?/fips", "rcgen?/fips", 
-    "tachyon-i2p?/fips", "tachyon-quic?/fips", "s2n-quic?/provider-tls-fips",
+    "tachyon-i2p?/fips", "tachyon-quic?/fips",
 ]
 lets-encrypt = ["dep:instant-acme", "dep:webpki", "dep:serde_json", "tls", "cert-gen"]
 tower = ["dep:tower"]
@@ -137,11 +133,7 @@ tor = [
 ]
 i2p = ["dep:tachyon-i2p", "tachyon-i2p/aws-lc"]
 
-# Response compression. Names mirror `tower-http`'s so an axum migration is a
-# search-and-replace; `compression-full` likewise enables every codec. Each also enables
-# `async-compression`'s matching backend, used for the streaming path. Deflate maps to
-# `async-compression`'s "zlib" backend — zlib-wrapped DEFLATE (RFC 1950) — not its "deflate"
-# backend, which is headerless raw DEFLATE.
+# Response compression.
 compression-gzip = ["dep:flate2", "dep:async-compression", "dep:futures-core", "async-compression/gzip"]
 compression-deflate = ["dep:flate2", "dep:async-compression", "dep:futures-core", "async-compression/zlib"]
 compression-br = ["dep:brotli", "dep:async-compression", "dep:futures-core", "async-compression/brotli"]

@@ -607,7 +607,7 @@ where
     ///
     /// Adds an HTTP/3-over-QUIC transport. Requires the `http3` feature.
     #[cfg(feature = "http3")]
-    pub fn with_h3(self, quic_server: s2n_quic::Server) -> MultiServer<S> {
+    pub fn with_h3(self, quic_server: tachyon_quic::s2n_quic::Server) -> MultiServer<S> {
         MultiServer::new(self).with_h3(quic_server)
     }
 
@@ -957,9 +957,9 @@ where
 #[cfg(feature = "http3")]
 fn build_quic_server(
     config: Arc<rustls::ServerConfig>,
-    io: impl s2n_quic::provider::io::TryInto<Error: std::error::Error + Send + Sync + 'static>,
-) -> Result<s2n_quic::Server, Box<dyn std::error::Error + Send + Sync>> {
-    let limits = s2n_quic::provider::limits::Limits::new()
+    io: impl tachyon_quic::s2n_quic::provider::io::TryInto<Error: std::error::Error + Send + Sync + 'static>,
+) -> Result<tachyon_quic::s2n_quic::Server, Box<dyn std::error::Error + Send + Sync>> {
+    let limits = tachyon_quic::s2n_quic::provider::limits::Limits::new()
         // 1 MB flow-control windows match H/2 settings and saturate LAN pipes.
         .with_data_window(1_048_576)?
         .with_bidirectional_local_data_window(1_048_576)?
@@ -977,8 +977,8 @@ fn build_quic_server(
         // Aggressive handshake timeout: reject slow clients quickly.
         .with_max_handshake_duration(Duration::from_secs(5))?;
 
-    Ok(s2n_quic::Server::builder()
-        .with_tls(s2n_quic::provider::tls::rustls::Server::from(config))?
+    Ok(tachyon_quic::s2n_quic::Server::builder()
+        .with_tls(tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(config))?
         .with_limits(limits)?
         .with_io(io)?
         .start()?)
@@ -990,7 +990,7 @@ fn build_quic_server(
 fn spawn_h3<S>(
     server: &Server<S>,
     config: Arc<rustls::ServerConfig>,
-    io: impl s2n_quic::provider::io::TryInto<Error: std::error::Error + Send + Sync + 'static>,
+    io: impl tachyon_quic::s2n_quic::provider::io::TryInto<Error: std::error::Error + Send + Sync + 'static>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: Clone + Send + Sync + 'static,

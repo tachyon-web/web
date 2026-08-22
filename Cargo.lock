@@ -6259,9 +6259,9 @@ dependencies = [
 
 [[package]]
 name = "tachyon-quic"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e0f89a54a9185ef205f3bbb07c2b928358a48a7a9aff17b1778a4aa1ddee578"
+checksum = "15260f8755336cf57e3ff6606691289e9d234390c82e5b49fc5ffd917bc161ce"
 dependencies = [
  "bytes",
  "h3",
@@ -6284,7 +6284,6 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h2 0.4.18",
- "h3",
  "http-body-util",
  "hyper 1.11.0",
  "hyper-util",
@@ -6296,7 +6295,6 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "rustls-webpki",
- "s2n-quic",
  "safelog",
  "serde",
  "serde_json",

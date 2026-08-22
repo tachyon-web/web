@@ -15,7 +15,7 @@ where
     /// Returns an error if FIPS compliance enforcement fails. The accept loop
     /// itself never surfaces per-connection errors as an `Err`; it just stops
     /// when `quic_server.accept()` returns `None`.
-    pub async fn serve_h3(self, mut quic_server: s2n_quic::Server) -> Result<(), std::io::Error> {
+    pub async fn serve_h3(self, mut quic_server: tachyon_quic::s2n_quic::Server) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
         let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
@@ -33,13 +33,13 @@ where
         Ok(())
     }
 
-    async fn handle_h3_connection(self: Arc<Self>, conn: s2n_quic::Connection) {
+    async fn handle_h3_connection(self: Arc<Self>, conn: tachyon_quic::s2n_quic::Connection) {
         let Ok(peer) = conn.remote_addr() else {
             return;
         };
 
-        let h3_conn = s2n_quic_h3::Connection::new(conn);
-        let Ok(mut h3_server) = h3::server::Connection::new(h3_conn).await else {
+        let h3_conn = tachyon_quic::Connection::new(conn);
+        let Ok(mut h3_server) = tachyon_quic::h3::server::Connection::new(h3_conn).await else {
             return;
         };
 
@@ -79,7 +79,7 @@ where
     async fn read_h3_body(
         &self,
         parts: &hyper::http::request::Parts,
-        stream: &mut h3::server::RequestStream<s2n_quic_h3::BidiStream<Bytes>, Bytes>,
+        stream: &mut tachyon_quic::h3::server::RequestStream<tachyon_quic::BidiStream<Bytes>, Bytes>,
     ) -> Result<Bytes, StatusCode> {
         let method = &parts.method;
         if method == hyper::Method::GET || method == hyper::Method::HEAD {
@@ -139,7 +139,7 @@ where
 
     async fn handle_h3_request(
         self: Arc<Self>,
-        resolver: h3::server::RequestResolver<s2n_quic_h3::Connection, Bytes>,
+        resolver: tachyon_quic::h3::server::RequestResolver<tachyon_quic::Connection, Bytes>,
         peer: std::net::SocketAddr,
     ) {
         let resolve_res = tokio::time::timeout(REQUEST_TIMEOUT, resolver.resolve_request()).await;
@@ -274,8 +274,8 @@ mod tests {
             .expect("generate self-signed cert");
         let config = build_server_config(&cert.cert_pem, &cert.key_pem);
 
-        let quic_tls = s2n_quic::provider::tls::rustls::Server::from(Arc::new(config));
-        let quic_server = s2n_quic::Server::builder()
+        let quic_tls = tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(Arc::new(config));
+        let quic_server = tachyon_quic::s2n_quic::Server::builder()
             .with_tls(quic_tls)
             .expect("with_tls")
             .with_io("127.0.0.1:0")
@@ -303,17 +303,17 @@ mod tests {
         addr: std::net::SocketAddr,
         cert_pem: &str,
     ) -> (
-        h3::client::SendRequest<s2n_quic_h3::OpenStreams, Bytes>,
+        tachyon_quic::h3::client::SendRequest<tachyon_quic::OpenStreams, Bytes>,
         tokio::task::JoinHandle<()>,
     ) {
-        let client_tls = s2n_quic::provider::tls::rustls::Client::builder()
+        let client_tls = tachyon_quic::s2n_quic::provider::tls::rustls::Client::builder()
             .with_certificate(cert_pem)
             .expect("with_certificate")
             .with_application_protocols(std::iter::once("h3"))
             .expect("with_application_protocols")
             .build()
             .expect("build client tls");
-        let client = s2n_quic::Client::builder()
+        let client = tachyon_quic::s2n_quic::Client::builder()
             .with_tls(client_tls)
             .expect("with_tls")
             .with_io("127.0.0.1:0")
@@ -322,12 +322,12 @@ mod tests {
             .expect("start quic client");
 
         let quic_conn = client
-            .connect(s2n_quic::client::Connect::new(addr).with_server_name("localhost"))
+            .connect(tachyon_quic::s2n_quic::client::Connect::new(addr).with_server_name("localhost"))
             .await
             .expect("quic connect");
 
-        let h3_conn = s2n_quic_h3::Connection::new(quic_conn);
-        let (mut driver, send_request) = h3::client::new(h3_conn).await.expect("h3 client new");
+        let h3_conn = tachyon_quic::Connection::new(quic_conn);
+        let (mut driver, send_request) = tachyon_quic::h3::client::new(h3_conn).await.expect("h3 client new");
         let driver_task = tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });
@@ -336,9 +336,9 @@ mod tests {
     }
 
     /// Reads all remaining `DATA` frames off a response stream into a `Vec<u8>`.
-    async fn recv_all<S>(stream: &mut h3::client::RequestStream<S, Bytes>) -> Vec<u8>
+    async fn recv_all<S>(stream: &mut tachyon_quic::h3::client::RequestStream<S, Bytes>) -> Vec<u8>
     where
-        S: h3::quic::RecvStream,
+        S: tachyon_quic::h3::quic::RecvStream,
     {
         let mut body = Vec::new();
         while let Some(mut chunk) = stream.recv_data().await.expect("recv_data") {
