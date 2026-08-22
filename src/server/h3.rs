@@ -43,8 +43,11 @@ where
             return;
         };
 
-        // Limit concurrent streams per connection for DoS protection.
-        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
+        // Limit concurrent streams per connection for DoS protection — see
+        // `Server::max_h3_concurrent_streams`.
+        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            self.max_h3_concurrent_streams,
+        ));
 
         loop {
             let Ok(stream_permit) = stream_semaphore.clone().acquire_owned().await else {

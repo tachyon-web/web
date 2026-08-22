@@ -80,7 +80,7 @@ tor-guardmgr = { version = "0.45", default-features = false, features = ["vangua
 tor-config = { version = "0.45", default-features = false, optional = true }
 
 # Optional native .i2p eepsite support (see the `i2p` feature).
-tachyon-i2p = { version = "0.0.4", optional = true, default-features = false }
+tachyon-i2p = { version = "0.0.5", optional = true, default-features = false }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "cookies", "form"] }

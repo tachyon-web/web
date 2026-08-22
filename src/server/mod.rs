@@ -91,6 +91,9 @@ pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIRECT_MAX_CONNECTIONS: usize = 2048;
 /// Default for [`Server::max_websocket_connections`] — see that field for how to size it.
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 25_600;
+/// Default for [`Server::max_h3_concurrent_streams`] — see that field for how to size it.
+#[cfg(feature = "http3")]
+pub const DEFAULT_MAX_H3_CONCURRENT_STREAMS: usize = 256;
 /// How long [`Server::serve_all_acme`] waits for the first certificate to be
 /// cached or provisioned before starting the TLS listener regardless.
 #[cfg(feature = "lets-encrypt")]
@@ -144,7 +147,6 @@ where
         let bind_tx = bind_tx.clone();
         let handle = std::thread::Builder::new()
             .name(format!("tachyon-worker-{i}"))
-            .stack_size(512 * 1024)
             .spawn(move || {
                 if let Some(id) = core_id {
                     let _ = core_affinity::set_for_current(id);
@@ -306,6 +308,15 @@ pub struct Server<S> {
     /// not rebuilt per worker — that's what makes the limit process-wide.
     #[cfg(feature = "ws")]
     pub(crate) websocket_permits: Arc<tokio::sync::Semaphore>,
+    /// Maximum number of HTTP/3 streams handled concurrently **per QUIC connection** — see
+    /// [`serve_h3`](Server::serve_h3). Distinct from [`max_connections`](Self::max_connections),
+    /// which caps whole connections, not streams within one: a single peer can open many
+    /// streams on one connection, so this is what actually bounds the handler tasks (and
+    /// request-body buffers) one connection can have in flight at once.
+    ///
+    /// Default: 256.
+    #[cfg(feature = "http3")]
+    pub max_h3_concurrent_streams: usize,
     /// Crypto/TLS policy shared across every listener this `Server` runs — see
     /// [`Server::tls_policy`]. `None` means each listener falls back to
     /// [`TlsPolicy::new`](crate::tls::TlsPolicy::new).
@@ -333,6 +344,8 @@ where
             max_websocket_connections: self.max_websocket_connections,
             #[cfg(feature = "ws")]
             websocket_permits: self.websocket_permits.clone(),
+            #[cfg(feature = "http3")]
+            max_h3_concurrent_streams: self.max_h3_concurrent_streams,
             #[cfg(feature = "tls")]
             tls_policy: self.tls_policy.clone(),
             compression: self.compression.clone(),
@@ -360,6 +373,8 @@ impl Server<()> {
             websocket_permits: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
             )),
+            #[cfg(feature = "http3")]
+            max_h3_concurrent_streams: DEFAULT_MAX_H3_CONCURRENT_STREAMS,
             #[cfg(feature = "tls")]
             tls_policy: None,
             compression: None,
@@ -519,6 +534,20 @@ where
         self
     }
 
+    /// Overrides the maximum number of HTTP/3 streams handled concurrently **per QUIC
+    /// connection** (default: 256) — see
+    /// [`Server::max_h3_concurrent_streams`](Self#structfield.max_h3_concurrent_streams) for how
+    /// this differs from [`max_connections`](Self::max_connections).
+    ///
+    /// Once a connection is at its limit, accepting its next stream simply waits for an
+    /// in-flight one to finish rather than accepting it and starving the rest.
+    #[cfg(feature = "http3")]
+    #[must_use]
+    pub const fn max_h3_concurrent_streams(mut self, limit: usize) -> Self {
+        self.max_h3_concurrent_streams = limit;
+        self
+    }
+
     /// Sets a custom `rustls::crypto::CryptoProvider` to be used for TLS operations.
     ///
     /// This overrides the default provider (which uses `aws-lc-rs` with customized Kex and AEAD).
@@ -646,10 +675,7 @@ where
     /// # Errors
     /// Returns an error if `http_addr` does not parse or the server fails to run.
     pub async fn start_http(self, http_addr: &str) -> Result<(), std::io::Error> {
-        let addr: std::net::SocketAddr = http_addr
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        self.start_http_addr(addr).await
+        self.start_http_addr(parse_addr(http_addr)?).await
     }
 
     /// HTTPS (HTTP/1.1 + HTTP/2) on an already-parsed address, with TLS configured by the
@@ -682,10 +708,8 @@ where
         tls_addr: &str,
         config: rustls::ServerConfig,
     ) -> Result<(), std::io::Error> {
-        let addr: std::net::SocketAddr = tls_addr
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        self.start_https_with_config_addr(addr, config).await
+        self.start_https_with_config_addr(parse_addr(tls_addr)?, config)
+            .await
     }
 
     /// HTTPS and HTTP/3 with a caller-supplied `rustls::ServerConfig`. Both listeners bind
@@ -706,9 +730,7 @@ where
 
         spawn_h3(&self, config.clone(), tls_addr)?;
 
-        let addr: std::net::SocketAddr = tls_addr
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let addr = parse_addr(tls_addr)?;
         let tls_acceptor = TlsAcceptor::from(config);
         let tls_acceptor = Arc::new(tls_acceptor);
         run_worker_pool(self, addr, None, move |server, listener| {
@@ -852,13 +874,9 @@ where
         spawn_h3(&self, tls_config, tls_addr)?;
 
         // Bind the HTTPS listener and serve (blocks the calling task).
-        let addr: std::net::SocketAddr = tls_addr
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let addr = parse_addr(tls_addr)?;
         let tls_acceptor = Arc::new(tls_acceptor);
-        let redirect_addr: std::net::SocketAddr = cleartext_addr
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let redirect_addr = parse_addr(cleartext_addr)?;
         let https_port = parse_port(tls_addr, 443);
         run_worker_pool(
             self,
@@ -923,23 +941,16 @@ where
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
         let https_port = parse_port(tls_addr, 443);
 
-        let redirect_info = if let Some(cleartext_addr) = cleartext_addr {
-            let redirect_addr: std::net::SocketAddr = cleartext_addr
-                .parse()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            Some((redirect_addr, https_port))
-        } else {
-            None
-        };
+        let redirect_info = cleartext_addr
+            .map(|cleartext_addr| parse_addr(cleartext_addr).map(|addr| (addr, https_port)))
+            .transpose()?;
 
         // Start HTTP/3 QUIC Server (if the feature is enabled).
         #[cfg(feature = "http3")]
         spawn_h3(&self, tls_config, tls_addr)?;
 
         // Start the HTTPS listener (blocks this task).
-        let addr: std::net::SocketAddr = tls_addr
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let addr = parse_addr(tls_addr)?;
         let tls_acceptor = Arc::new(tls_acceptor);
         run_worker_pool(self, addr, redirect_info, move |server, listener| {
             let tls_acceptor = tls_acceptor.clone();
@@ -1047,6 +1058,14 @@ fn parse_port(addr: &str, default_port: u16) -> u16 {
         .next_back()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(default_port)
+}
+
+/// Parses a bind address string (e.g. `"0.0.0.0:443"`), wrapping the error the same way every
+/// `serve_*`/`start_*` entry point below does — shared so that wrapping can't drift between
+/// call sites.
+fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Error> {
+    addr.parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }
 
 pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
@@ -1293,11 +1312,15 @@ mod tests {
     #[test]
     #[allow(clippy::redundant_clone)]
     fn clone_preserves_every_field() {
-        #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
+        #[cfg_attr(not(any(feature = "tls", feature = "http3")), allow(unused_mut))]
         let mut server = Server::new(Router::new())
             .max_body_size(4096)
             .max_connections(7)
             .max_websocket_connections(9);
+        #[cfg(feature = "http3")]
+        {
+            server = server.max_h3_concurrent_streams(11);
+        }
         #[cfg(feature = "tls")]
         {
             server = server.tls_policy(crate::tls::TlsPolicy::new().tls13_only());
@@ -1307,6 +1330,8 @@ mod tests {
         assert_eq!(cloned.max_body_size, 4096);
         assert_eq!(cloned.max_connections, 7);
         assert_eq!(cloned.max_websocket_connections, 9);
+        #[cfg(feature = "http3")]
+        assert_eq!(cloned.max_h3_concurrent_streams, 11);
         #[cfg(feature = "ws")]
         {
             assert_eq!(cloned.websocket_permits.available_permits(), 9);
