@@ -361,9 +361,12 @@ where
 {
     type Rejection = Error;
 
-    async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
+    fn from_request(
+        req: hyper::Request<Body>,
+        state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let (mut parts, _body) = req.into_parts();
-        Self::from_request_parts(&mut parts, state)
+        std::future::ready(Self::from_request_parts(&mut parts, state))
     }
 }
 

@@ -1220,7 +1220,7 @@ impl RustlsConfig {
     ///
     /// # Errors
     /// Returns an error if the certificates or private key cannot be parsed, or if the config is invalid.
-    #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn from_pem(cert: Vec<u8>, key: Vec<u8>) -> Result<Self, std::io::Error> {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 

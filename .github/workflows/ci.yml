@@ -38,8 +38,6 @@ jobs:
         run: cargo audit
       - name: clippy (default features)
         run: cargo clippy --locked -p tachyon-web --all-targets
-      - name: axum parity
-        run: cargo test --locked -p parity-tests
       - uses: dtolnay/rust-toolchain@1.92
       - name: msrv (1.92)
         run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,sfv,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints

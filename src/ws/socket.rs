@@ -86,26 +86,20 @@ fn unmask(data: &mut [u8], mask: [u8; 4]) {
     let mask8 = u64::from_ne_bytes([
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
     ]);
-    let mut chunks8 = data.chunks_exact_mut(8);
-    for chunk in &mut chunks8 {
-        let bytes: [u8; 8] = (&*chunk)
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("chunks_exact_mut(8) guarantees a length-8 chunk"));
-        let word = u64::from_ne_bytes(bytes) ^ mask8;
-        chunk.copy_from_slice(&word.to_ne_bytes());
+    let (chunks8, rest) = data.as_chunks_mut::<8>();
+    for chunk in chunks8 {
+        let word = u64::from_ne_bytes(*chunk) ^ mask8;
+        *chunk = word.to_ne_bytes();
     }
 
     let mask4 = u32::from_ne_bytes(mask);
-    let mut chunks4 = chunks8.into_remainder().chunks_exact_mut(4);
-    for chunk in &mut chunks4 {
-        let bytes: [u8; 4] = (&*chunk)
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("chunks_exact_mut(4) guarantees a length-4 chunk"));
-        let word = u32::from_ne_bytes(bytes) ^ mask4;
-        chunk.copy_from_slice(&word.to_ne_bytes());
+    let (chunks4, rest) = rest.as_chunks_mut::<4>();
+    for chunk in chunks4 {
+        let word = u32::from_ne_bytes(*chunk) ^ mask4;
+        *chunk = word.to_ne_bytes();
     }
 
-    for (i, byte) in chunks4.into_remainder().iter_mut().enumerate() {
+    for (i, byte) in rest.iter_mut().enumerate() {
         let Some(mask_byte) = mask.get(i % 4) else {
             unreachable!("i % 4 is always in range for a 4-byte mask");
         };
