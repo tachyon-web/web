@@ -1056,16 +1056,22 @@ pub struct BodyStream(pub Body);
 impl<S: Sync> FromRequest<S> for BodyStream {
     type Rejection = Infallible;
 
-    async fn from_request(req: hyper::Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(Self(req.into_body()))
+    fn from_request(
+        req: hyper::Request<Body>,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Ok(Self(req.into_body())))
     }
 }
 
 impl<S: Sync> FromRequest<S> for hyper::Request<Body> {
     type Rejection = Infallible;
 
-    async fn from_request(req: hyper::Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(req)
+    fn from_request(
+        req: hyper::Request<Body>,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Ok(req))
     }
 }
 
@@ -1207,12 +1213,14 @@ macro_rules! impl_from_request_via_parts {
         {
             type Rejection = <Self as FromRequestParts<S>>::Rejection;
 
-            async fn from_request(
+            fn from_request(
                 req: hyper::Request<Body>,
                 state: &S,
-            ) -> Result<Self, Self::Rejection> {
+            ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
                 let (mut parts, _) = req.into_parts();
-                <Self as FromRequestParts<S>>::from_request_parts(&mut parts, state)
+                std::future::ready(<Self as FromRequestParts<S>>::from_request_parts(
+                    &mut parts, state,
+                ))
             }
         }
     };

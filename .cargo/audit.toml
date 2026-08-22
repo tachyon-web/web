@@ -22,6 +22,17 @@ ignore = [
     # Drop this once `rsa` ships a constant-time release and Arti bumps to it.
     "RUSTSEC-2023-0071",
 
+    # RUSTSEC-2026-0258 — `h2` unbounded empty DATA frames (memory exhaustion).
+    #
+    # Reached only via the `actix-web` and `rocket` comparison frameworks pulled in by the
+    # `benches/*` workspace members (`actix-http -> h2`, `rocket -> hyper 0.14 -> h2`). The
+    # tachyon-web library itself depends on `h2 0.4.18` (patched) directly; the vulnerable
+    # `h2 0.3.27` never appears in a build of the published crate. No fixed release exists
+    # yet from either actix-web (4.15.0) or rocket (0.5.1), both still pinned to h2 0.3.x.
+    #
+    # Drop this once actix-web or rocket bump their `h2` dependency to >=0.4.16.
+    "RUSTSEC-2026-0258",
+
     # RUSTSEC-2024-0436 — `paste` is unmaintained (archived by its author).
     #
     # Informational only: no vulnerability, and it is a compile-time proc-macro that emits
