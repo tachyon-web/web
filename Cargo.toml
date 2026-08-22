@@ -127,6 +127,7 @@ fips = [
 lets-encrypt = ["dep:instant-acme", "dep:webpki", "dep:serde_json", "tls", "cert-gen"]
 tower = ["dep:tower"]
 sse = ["dep:futures-core", "dep:serde_json"]
+sfv = []
 tor = [
     "dep:arti-client", "dep:tor-hsservice", "dep:tor-proto", "dep:tor-cell",
     "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",

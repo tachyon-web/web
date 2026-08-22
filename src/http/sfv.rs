@@ -3,27 +3,33 @@
 //! Every header standardised since roughly 2019 is a Structured Field:
 //! `Priority`, `Cache-Status`, `Signature-Input`, `Reporting-Endpoints`,
 //! `Available-Dictionary`, `Unencoded-Digest`, the `Secure-Session-*` family.
-//! Most frameworks hand you a `&str` and let you write a regex. This module
-//! gives you the real data model — [`Item`], [`List`], [`Dictionary`] — plus
-//! [`StructuredHeader`], which turns a malformed field into a `400` before your
-//! handler ever runs.
+//! RFC 9218 `Priority` parsing (used internally for HTTP/2 stream scheduling)
+//! works unconditionally. The general-purpose layer below — the raw
+//! [`Item`]/[`List`]/[`Dictionary`] model, [`StructuredHeader`], and the
+//! [`sfv_dictionary!`](crate::sfv_dictionary) macro for declaring your own typed headers —
+//! requires the `sfv` feature.
 //!
 //! Parsing and serialisation come from the [`sfv`] crate;
 //! this module adds the request-side plumbing: header joining,
 //! a size bound, typed extraction, and rejection.
 //!
 //! ```rust
+//! # #[cfg(feature = "sfv")]
+//! # {
 //! use tachyon_web::http::sfv;
 //!
 //! let dict = sfv::parse_dictionary(b"u=1, i").expect("valid field");
 //! assert_eq!(sfv::dict_integer(&dict, "u"), Some(1));
 //! assert_eq!(sfv::dict_boolean(&dict, "i"), Some(true));
+//! # }
 //! ```
 //!
 //! Typed headers are declared with [`sfv_dictionary!`](crate::sfv_dictionary), which generates a
 //! parser that pulls exactly the keys you name straight out of the input:
 //!
 //! ```rust
+//! # #[cfg(feature = "sfv")]
+//! # {
 //! use tachyon_web::http::sfv::FromStructuredHeader;
 //! use tachyon_web::sfv_dictionary;
 //!
@@ -37,6 +43,7 @@
 //!
 //! let p = MyPriority::parse_field(b"u=5, i").expect("valid field");
 //! assert_eq!((p.urgency, p.incremental), (5, true));
+//! # }
 //! ```
 //!
 //! # Cost
@@ -61,12 +68,27 @@ use std::fmt;
 
 /// The underlying RFC 9651 implementation, re-exported so callers can use its
 /// serialisers and lower-level types without adding the dependency themselves.
+///
+/// Requires the `sfv` feature.
+#[cfg(feature = "sfv")]
 pub use sfv;
+#[cfg(not(feature = "sfv"))]
+use sfv;
 
+/// Requires the `sfv` feature.
+#[cfg(feature = "sfv")]
+pub use sfv::KeyRef;
+#[cfg(not(feature = "sfv"))]
+use sfv::KeyRef;
+
+/// The raw structured-field model. Requires the `sfv` feature.
+#[cfg(feature = "sfv")]
 pub use sfv::{
-    BareItem, BareItemFromInput, Date, Decimal, Dictionary, InnerList, Integer, Item, Key, KeyRef,
-    List, ListEntry, Parameters, Parser, StringRef, Token, TokenRef,
+    BareItem, Dictionary, InnerList, Integer, Item, Key, List, ListEntry, Parameters, StringRef,
+    Token, TokenRef,
 };
+
+use sfv::{BareItemFromInput, Date, Decimal, Parser};
 
 /// Maximum accepted length, in bytes, of a single structured field.
 ///
@@ -178,33 +200,45 @@ const fn checked(input: &[u8]) -> Result<&[u8]> {
 
 /// Parses a dictionary-typed field.
 ///
+/// Requires the `sfv` feature.
+///
 /// # Errors
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed
 /// `sf-dictionary`.
+#[cfg(feature = "sfv")]
 pub fn parse_dictionary(input: &[u8]) -> Result<Dictionary> {
     Ok(Parser::new(checked(input)?).parse_dictionary()?)
 }
 
 /// Parses a list-typed field.
 ///
+/// Requires the `sfv` feature.
+///
 /// # Errors
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed `sf-list`.
+#[cfg(feature = "sfv")]
 pub fn parse_list(input: &[u8]) -> Result<List> {
     Ok(Parser::new(checked(input)?).parse_list()?)
 }
 
 /// Parses an item-typed field.
 ///
+/// Requires the `sfv` feature.
+///
 /// # Errors
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed `sf-item`.
+#[cfg(feature = "sfv")]
 pub fn parse_item(input: &[u8]) -> Result<Item> {
     Ok(Parser::new(checked(input)?).parse_item()?)
 }
 
 /// The integer at `key`, if the key is present and holds an integer item.
+///
+/// Requires the `sfv` feature.
+#[cfg(feature = "sfv")]
 #[must_use]
 pub fn dict_integer(dict: &Dictionary, key: &str) -> Option<i64> {
     match dict.get(key)? {
@@ -216,6 +250,9 @@ pub fn dict_integer(dict: &Dictionary, key: &str) -> Option<i64> {
 /// The boolean at `key`, if the key is present and holds a boolean item.
 ///
 /// Note that a bare key (`i` rather than `i=?1`) is a boolean `true`.
+///
+/// Requires the `sfv` feature.
+#[cfg(feature = "sfv")]
 #[must_use]
 pub fn dict_boolean(dict: &Dictionary, key: &str) -> Option<bool> {
     match dict.get(key)? {
@@ -226,6 +263,9 @@ pub fn dict_boolean(dict: &Dictionary, key: &str) -> Option<bool> {
 
 /// The text at `key`, if the key is present and holds a string, token or
 /// display-string item.
+///
+/// Requires the `sfv` feature.
+#[cfg(feature = "sfv")]
 #[must_use]
 pub fn dict_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
     let ListEntry::Item(item) = dict.get(key)? else {
@@ -435,6 +475,8 @@ macro_rules! __sfv_missing {
 /// dictionary is built.
 ///
 /// ```rust
+/// # #[cfg(feature = "sfv")]
+/// # {
 /// use tachyon_web::http::sfv::FromStructuredHeader;
 /// use tachyon_web::sfv_dictionary;
 ///
@@ -451,9 +493,23 @@ macro_rules! __sfv_missing {
 /// let s = SessionState::parse_field(b"id=\"abc\", ttl=30, ext=1").expect("valid");
 /// assert_eq!((s.id.as_str(), s.ttl, s.note), ("abc", 30, None));
 /// assert!(SessionState::parse_field(b"ttl=30").is_err()); // `id` is required
+/// # }
 /// ```
+///
+/// Requires the `sfv` feature.
+#[cfg(feature = "sfv")]
 #[macro_export]
 macro_rules! sfv_dictionary {
+    ($($tt:tt)*) => {
+        $crate::__sfv_dictionary_impl! { $($tt)* }
+    };
+}
+
+/// Implementation behind [`sfv_dictionary!`](crate::sfv_dictionary), also used internally
+/// (without the `sfv` feature) to declare [`Priority`].
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __sfv_dictionary_impl {
     (
         $(#[$meta:meta])*
         $vis:vis struct $name:ident for $header:literal {
@@ -601,16 +657,23 @@ pub trait FromStructuredHeader: Sized {
 /// value all reject with `400 Bad Request` before the handler runs. Wrap it in
 /// `Option` if the header itself is optional.
 ///
+/// Requires the `sfv` feature.
+///
 /// ```rust,no_run
+/// # #[cfg(feature = "sfv")]
+/// # {
 /// use tachyon_web::http::sfv::{Priority, StructuredHeader};
 ///
 /// async fn handler(StructuredHeader(p): StructuredHeader<Priority>) -> String {
 ///     format!("urgency {}", p.urgency())
 /// }
+/// # }
 /// ```
+#[cfg(feature = "sfv")]
 #[derive(Debug, Clone, Copy)]
 pub struct StructuredHeader<T>(pub T);
 
+#[cfg(feature = "sfv")]
 impl<T> StructuredHeader<T> {
     /// Unwraps the parsed header.
     pub fn into_inner(self) -> T {
@@ -618,6 +681,7 @@ impl<T> StructuredHeader<T> {
     }
 }
 
+#[cfg(feature = "sfv")]
 impl<T> std::ops::Deref for StructuredHeader<T> {
     type Target = T;
 
@@ -659,6 +723,7 @@ fn join_header<'a>(
     Some(Ok(buf.as_slice()))
 }
 
+#[cfg(feature = "sfv")]
 impl<S, T> crate::routing::extract::FromRequestParts<S> for StructuredHeader<T>
 where
     T: FromStructuredHeader + Send,
@@ -701,7 +766,7 @@ where
         .unwrap_or_default()
 }
 
-sfv_dictionary! {
+__sfv_dictionary_impl! {
     /// RFC 9218 `Priority`: `u` is the urgency (0 highest, 7 lowest, 3 the
     /// default) and `i` requests incremental delivery.
     ///
@@ -745,9 +810,11 @@ impl Default for Priority {
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    #[cfg(feature = "sfv")]
     use crate::routing::extract::FromRequestParts;
 
     #[test]
+    #[cfg(feature = "sfv")]
     fn parses_dictionary_shapes() {
         let d = parse_dictionary(b"a=1, b=?0, c, d=\"x\", e=(1 2);q, f=@1659578233").unwrap();
         assert_eq!(dict_integer(&d, "a"), Some(1));
@@ -767,6 +834,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sfv")]
     fn parses_lists_and_items() {
         let l = parse_list(b"sugar, tea;x=1, (a b);y").unwrap();
         assert_eq!(l.len(), 3);
@@ -780,6 +848,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sfv")]
     fn rejects_malformed_fields() {
         let bad: &[&[u8]] = &[
             b"a=1,",
@@ -804,6 +873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sfv")]
     fn enforces_the_size_bound() {
         let long = vec![b'a'; MAX_INPUT + 1];
         assert!(matches!(
@@ -842,7 +912,7 @@ mod tests {
         ));
     }
 
-    sfv_dictionary! {
+    __sfv_dictionary_impl! {
         /// Test-only header exercising required, defaulted and optional fields.
         struct TestHeader for "x-test" {
             "id" => id: String,
@@ -874,6 +944,7 @@ mod tests {
         assert_eq!((h.id.as_str(), h.n), ("b", 2));
     }
 
+    #[cfg(feature = "sfv")]
     fn parts_with(values: &[&str]) -> hyper::http::request::Parts {
         let mut req = hyper::Request::new(());
         for v in values {
@@ -884,6 +955,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sfv")]
     fn extractor_parses_rejects_and_joins() {
         let mut parts = parts_with(&["u=1, i"]);
         let StructuredHeader(p) =
@@ -910,6 +982,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sfv")]
     fn extractor_rejects_oversized_joined_headers() {
         let chunk = "u=1".to_string() + &";p=1".repeat(1000);
         let values = vec![chunk.as_str(); 64];
