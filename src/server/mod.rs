@@ -433,7 +433,7 @@ where
     /// let server = Server::new(app).compression(
     ///     Compression::new()
     ///         .preference([Encoding::Zstd, Encoding::Gzip])
-    ///         .level(CompressionLevel::Fastest),
+    ///         .quality(CompressionLevel::Fastest),
     /// );
     /// ```
     #[must_use]

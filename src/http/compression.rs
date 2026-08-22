@@ -1,8 +1,10 @@
 //! Response compression: `Accept-Encoding` negotiation and content coding.
 //!
-//! Covers the four codings browsers actually negotiate — `zstd` ([RFC 8878]), `br`
-//! ([RFC 7932]), `gzip` ([RFC 1952]) and `deflate` ([RFC 1950]) — behind one
-//! [`Compression`] config, applied either to a whole server or to one router.
+//! Covers the four codings browsers negotiate — `zstd`, `br`, `gzip`, `deflate` — behind
+//! one [`Compression`] config, applied to a whole server or to one router. The API mirrors
+//! `tower-http`'s `CompressionLayer` (as used by `axum`), down to the feature flag names
+//! (`compression-gzip`, `compression-deflate`, `compression-br`, `compression-zstd`,
+//! `compression-full`), so porting a `tower-http` config over is a search-and-replace.
 //!
 //! ```rust,no_run
 //! use tachyon_web::{Router, Server, get};
@@ -20,108 +22,89 @@
 //! # }
 //! ```
 //!
-//! Every codec is behind its own feature flag, named to match `tower-http` so an
-//! `axum` migration is a search-and-replace: `compression-gzip`, `compression-deflate`,
-//! `compression-br`, `compression-zstd`, and `compression-full` for all four.
-//! [`Compression::new`] enables exactly the codecs that were compiled in, so adding a
-//! feature flag is the only step needed to start serving a new coding.
+//! [`Compression::new`] enables exactly the codecs compiled in, so enabling a feature flag
+//! is the only step needed to start serving a new coding.
 //!
 //! # What is *not* compressed
 //!
-//! Compression is skipped — and the response passes through byte-identical — when any of
-//! the following holds. These are correctness rules, not tuning knobs, and none of them
-//! are configurable:
-//!
-//! - the client's `Accept-Encoding` offers nothing this server supports (or is absent);
-//! - the response already carries a `Content-Encoding` other than `identity`;
-//! - the response carries `Cache-Control: no-transform` ([RFC 9111 §5.2.2.6]);
-//! - the status is `1xx`, `204 No Content`, `304 Not Modified`, or `206 Partial Content`
-//!   (a range is expressed against the representation the client already holds);
-//! - the body is empty, or its known length is below [`Compression::min_size`];
-//! - the `Content-Type` is one [`Compression::predicate`] rejects — by default anything
-//!   already compressed (JPEG, WOFF2, MP4, …) and `text/event-stream`, whose whole point
-//!   is per-event delivery.
+//! These are correctness rules, not tuning knobs — a response passes through byte-identical
+//! when: `Accept-Encoding` offers nothing supported; the response already has a
+//! `Content-Encoding`; it carries `Cache-Control: no-transform` ([RFC 9111 §5.2.2.6]); the
+//! status is `1xx`, `204`, `304`, or `206` (a range is against the representation the client
+//! already holds); the body is empty or below [`Compression::min_size`]; or
+//! [`Compression::compress_when`]'s predicate rejects it — by default
+//! [`predicate::DefaultPredicate`], matching `tower-http`: below 32 bytes, gRPC, images
+//! (`image/svg+xml` excepted), or `text/event-stream`.
 //!
 //! # BREACH
 //!
-//! Compressing a response that contains both a secret and attacker-influenced text leaks the
-//! secret. The attacker varies the text they control, watches the coded length, and keeps
-//! whatever guess compressed best — a CSRF token falls in a few thousand requests. TLS does
-//! not help; the length is visible regardless.
-//!
-//! Compression is off by default, and turning it on is the point at which to check:
-//!
-//! - Does any compressed response embed a CSRF token, session identifier, or API key
-//!   *alongside* text derived from the request (a search term, a `?q=`, a reflected name)?
-//!   Exclude those responses with [`Compression::predicate`], or move the secret to a header
-//!   or a `Set-Cookie`, neither of which is part of the body.
-//! - Over Tor or I2P, coded length is also a fingerprint: it varies with content in a way a
-//!   padded, uniform response does not, which is worth weighing against the bandwidth saved
-//!   on a link that is already slow.
-//!
-//! [`ServeDir`](crate::ServeDir) assets are static and request-independent, so they are not
-//! exposed to this.
+//! Compressing a response with both a secret and attacker-influenced text leaks the secret:
+//! the attacker varies the text they control and keeps whatever guess compressed best. TLS
+//! doesn't help — the length is visible regardless. Compression is off by default; turning
+//! it on is the point to check whether any response embeds a CSRF token or session id
+//! *alongside* request-derived text (a search term, a reflected name), and to exclude those
+//! with [`Compression::compress_when`] or move the secret out of the body.
+//! [`ServeDir`](crate::ServeDir) assets are static and request-independent, so unaffected.
 //!
 //! # Interaction with `ETag`
 //!
-//! A content coding produces a different representation, so it must not keep a *strong*
-//! entity tag ([RFC 9110 §8.8.3]). Compressing a response whose `ETag` is strong rewrites
-//! it to the weak form (`"abc"` → `W/"abc"`) rather than leaving a strong tag that two
-//! different byte streams now share. Weak tags, and the `If-None-Match` comparisons
-//! [`ServeDir`](crate::ServeDir) performs, are unaffected.
+//! A coding is a different representation, so it must not keep a *strong* entity tag
+//! ([RFC 9110 §8.8.3]) — a strong `ETag` is rewritten to the weak form (`"abc"` →
+//! `W/"abc"`) rather than left claiming two different byte streams are identical.
 //!
-//! [RFC 8878]: https://www.rfc-editor.org/rfc/rfc8878
-//! [RFC 7932]: https://www.rfc-editor.org/rfc/rfc7932
-//! [RFC 1952]: https://www.rfc-editor.org/rfc/rfc1952
-//! [RFC 1950]: https://www.rfc-editor.org/rfc/rfc1950
 //! [RFC 9111 §5.2.2.6]: https://www.rfc-editor.org/rfc/rfc9111#section-5.2.2.6
 //! [RFC 9110 §8.8.3]: https://www.rfc-editor.org/rfc/rfc9110#section-8.8.3
 
 use crate::http::response::Body;
 use bytes::Bytes;
-use hyper::body::{Body as HyperBody, Frame, SizeHint};
+use hyper::body::Body as HyperBody;
 use hyper::header::{
-    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG,
-    HeaderMap, HeaderValue, VARY,
+    ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, HeaderMap, HeaderValue,
+    VARY,
 };
 use hyper::{Response, StatusCode};
 use smallvec::SmallVec;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 mod codec;
+pub mod predicate;
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-deflate",
+    feature = "compression-br",
+    feature = "compression-zstd",
+))]
+mod stream;
 
 pub use codec::CompressionLevel;
+pub use predicate::Predicate;
 
 /// A content coding, as registered in the IANA HTTP Content Coding Registry.
 ///
-/// Every variant exists regardless of which `compression-*` features are enabled, because
-/// negotiation and pre-compressed static assets are useful without the matching encoder
-/// linked in — [`ServeDir`](crate::ServeDir) serves a `.zst` sidecar from disk whether or
-/// not this crate can produce one. [`Encoding::encoder_available`] reports whether the
-/// running binary can actually *perform* the coding.
+/// Every variant exists regardless of which `compression-*` features are enabled, so
+/// negotiation and pre-compressed static assets ([`ServeDir`](crate::ServeDir) sidecars)
+/// work without the matching encoder linked in. [`Encoding::encoder_available`] reports
+/// whether this binary can actually *perform* the coding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Encoding {
     /// No transformation. Always acceptable unless explicitly refused with `identity;q=0`.
     Identity,
-    /// `deflate` — zlib-wrapped DEFLATE, [RFC 1950]. Listed last by default: it buys
-    /// nothing over `gzip` and a handful of ancient servers emitted it raw, so some
-    /// clients distrust it.
+    /// `deflate` — zlib-wrapped DEFLATE ([RFC 1950]). Listed last by default: no better than
+    /// gzip, and some clients distrust it from ancient servers that emitted it raw.
     ///
     /// [RFC 1950]: https://www.rfc-editor.org/rfc/rfc1950
     Deflate,
-    /// `gzip` — [RFC 1952]. The universal fallback; assume every client supports it.
+    /// `gzip` ([RFC 1952]). The universal fallback.
     ///
     /// [RFC 1952]: https://www.rfc-editor.org/rfc/rfc1952
     Gzip,
-    /// `br` — Brotli, [RFC 7932]. Best ratio on text, and the right choice for assets
-    /// compressed ahead of time where encode cost is paid once.
+    /// `br` — Brotli ([RFC 7932]). Best ratio on text; best for assets compressed once
+    /// ahead of time, where encode cost isn't paid per request.
     ///
     /// [RFC 7932]: https://www.rfc-editor.org/rfc/rfc7932
     Brotli,
-    /// `zstd` — Zstandard, [RFC 8878]. Compresses far faster than Brotli at a comparable
-    /// ratio, which is the tradeoff that matters for a response generated per request.
+    /// `zstd` — Zstandard ([RFC 8878]). Compresses far faster than Brotli at a comparable
+    /// ratio, the tradeoff that matters for a body generated per request.
     ///
     /// [RFC 8878]: https://www.rfc-editor.org/rfc/rfc8878
     Zstd,
@@ -140,8 +123,8 @@ impl Encoding {
         }
     }
 
-    /// The conventional filename suffix for a pre-compressed sidecar of this coding —
-    /// `app.js.zst`, `app.js.br`, `app.js.gz`.
+    /// The conventional filename suffix for a pre-compressed sidecar — `app.js.zst`,
+    /// `app.js.br`, `app.js.gz`.
     #[must_use]
     pub const fn file_extension(self) -> &'static str {
         match self {
@@ -153,11 +136,8 @@ impl Encoding {
         }
     }
 
-    /// Parses a coding token, case-insensitively per [RFC 9110 §8.4.1].
-    ///
-    /// Returns `None` for unregistered tokens and for the deprecated `x-gzip`/`x-compress`
-    /// aliases — a client sending only `x-gzip` gets `identity`, which is correct if
-    /// unhelpful, and no modern client does.
+    /// Parses a coding token, case-insensitively per [RFC 9110 §8.4.1]. `None` for
+    /// unregistered tokens and the deprecated `x-gzip`/`x-compress` aliases.
     ///
     /// [RFC 9110 §8.4.1]: https://www.rfc-editor.org/rfc/rfc9110#section-8.4.1
     #[must_use]
@@ -187,10 +167,8 @@ impl Encoding {
         }
     }
 
-    /// The pre-validated `Content-Encoding` header value for this coding.
-    ///
-    /// A `const` construction from a static string, so it costs nothing to call per
-    /// response — unlike `HeaderValue::from_str`, which re-validates the bytes.
+    /// The pre-validated `Content-Encoding` header value for this coding, built `const`
+    /// from a static string so it skips `HeaderValue::from_str`'s re-validation.
     #[must_use]
     pub const fn header_value(self) -> HeaderValue {
         HeaderValue::from_static(match self {
@@ -211,9 +189,9 @@ impl std::fmt::Display for Encoding {
 
 /// The order codings are preferred in when the client expresses no preference of its own.
 ///
-/// `zstd` first: for a body compressed once per request, its throughput advantage over
-/// Brotli dominates Brotli's slightly better ratio. Pre-compressed static assets invert
-/// that tradeoff, which is why [`ServeDir`](crate::ServeDir) prefers `br` instead.
+/// `zstd` first: its throughput advantage over Brotli dominates Brotli's slightly better
+/// ratio for a body compressed once per request. Pre-compressed static assets invert that
+/// tradeoff, which is why [`ServeDir`](crate::ServeDir) prefers `br` instead.
 pub const DEFAULT_PREFERENCE: [Encoding; 4] = [
     Encoding::Zstd,
     Encoding::Brotli,
@@ -254,10 +232,8 @@ fn parse_quality(raw: &str) -> Option<Quality> {
 
 /// Every q-value a client expressed, indexed by [`Encoding`], plus the `*` wildcard.
 ///
-/// Parsing `Accept-Encoding` once into this and answering from it beats re-scanning the
-/// header per candidate coding: the header is attacker-controlled and can run to the
-/// connection's whole header allowance, so a pass per codec turns one large header into
-/// four large scans.
+/// Parsed once and answered from repeatedly, rather than re-scanning the (attacker
+/// controlled, potentially large) `Accept-Encoding` header per candidate coding.
 #[derive(Default)]
 struct AcceptedEncodings {
     /// Indexed by [`Encoding::index`]; `None` where the coding went unmentioned.
@@ -381,93 +357,8 @@ pub fn negotiate(accept_encoding: &str, supported: &[Encoding]) -> Encoding {
     best.map_or(Encoding::Identity, |(_, encoding)| encoding)
 }
 
-/// `application/*` subtypes that are text or otherwise uncompressed, and so are worth
-/// coding despite `application` being the catch-all for opaque binary payloads.
-const COMPRESSIBLE_APPLICATION_SUBTYPES: &[&str] = &[
-    "json",
-    "xml",
-    "javascript",
-    "x-javascript",
-    "ecmascript",
-    "x-ecmascript",
-    "xhtml+xml",
-    "wasm",
-    "sql",
-    "graphql",
-    "x-ndjson",
-    "ld+json",
-    "x-www-form-urlencoded",
-    "toml",
-    "yaml",
-    "x-yaml",
-    "vnd.api+json",
-    "vnd.ms-fontobject",
-    "rtf",
-    "postscript",
-    "x-tar",
-];
-
-/// Whether a `Content-Type` names a representation worth compressing.
-///
-/// The default for [`Compression::predicate`]. Roughly: text-shaped things yes, things
-/// that are already a compressed container no. Returns `true` for a response with no
-/// `Content-Type` at all, since an unlabelled body is usually text.
-#[must_use]
-pub fn is_compressible(content_type: &str) -> bool {
-    // Strip parameters: `text/html; charset=utf-8` → `text/html`.
-    let essence = content_type
-        .split(';')
-        .next()
-        .unwrap_or(content_type)
-        .trim();
-    let (kind, subtype) = essence.split_once('/').unwrap_or((essence, ""));
-
-    // Server-Sent Events are a stream of individually-meaningful events; buffering them
-    // into compressor blocks defeats the transport even though the bytes compress well.
-    if essence.eq_ignore_ascii_case("text/event-stream") {
-        return false;
-    }
-    // Structured suffixes cover a long tail — `image/svg+xml`, `application/manifest+json`,
-    // `application/atom+xml` — without enumerating it.
-    if let Some((_, suffix)) = subtype.rsplit_once('+')
-        && ["xml", "json", "text", "yaml"]
-            .iter()
-            .any(|known| suffix.eq_ignore_ascii_case(known))
-    {
-        return true;
-    }
-    if kind.eq_ignore_ascii_case("text") {
-        return true;
-    }
-    if kind.eq_ignore_ascii_case("font") {
-        // WOFF/WOFF2 wrap already-compressed tables; raw TTF/OTF do not.
-        return !subtype.eq_ignore_ascii_case("woff") && !subtype.eq_ignore_ascii_case("woff2");
-    }
-    if kind.eq_ignore_ascii_case("image") {
-        // Everything else in `image/*` is an already-compressed raster format.
-        return subtype.eq_ignore_ascii_case("bmp")
-            || subtype.eq_ignore_ascii_case("x-icon")
-            || subtype.eq_ignore_ascii_case("vnd.microsoft.icon");
-    }
-    if kind.eq_ignore_ascii_case("audio") || kind.eq_ignore_ascii_case("video") {
-        return false;
-    }
-    if essence.is_empty() {
-        return true;
-    }
-
-    kind.eq_ignore_ascii_case("application")
-        && COMPRESSIBLE_APPLICATION_SUBTYPES
-            .iter()
-            .any(|known| subtype.eq_ignore_ascii_case(known))
-}
-
-/// Decides, per response, whether compression should be attempted.
-///
-/// See [`Compression::predicate`].
-pub type Predicate = Arc<dyn Fn(&Response<Body>) -> bool + Send + Sync>;
-
-/// Response-compression configuration.
+/// Response-compression configuration, API-compatible with `tower-http`'s
+/// `CompressionLayer`.
 ///
 /// Cheap to clone (one `SmallVec` and one `Arc`), so a single value is built at startup and
 /// shared by every connection.
@@ -476,14 +367,18 @@ pub type Predicate = Arc<dyn Fn(&Response<Body>) -> bool + Send + Sync>;
 ///
 /// ```rust
 /// use tachyon_web::http::compression::{Compression, CompressionLevel, Encoding};
+/// use tachyon_web::http::header::HeaderMap;
+/// use hyper::http::Extensions;
 ///
 /// let compression = Compression::new()
 ///     // Speed over ratio for responses built per request.
-///     .level(CompressionLevel::Fastest)
+///     .quality(CompressionLevel::Fastest)
 ///     // Don't bother below 1 KiB.
 ///     .min_size(1024)
 ///     // Never compress this app's pre-signed URLs, whatever their content type.
-///     .predicate(|response| !response.headers().contains_key("x-signed-payload"));
+///     .compress_when(|_status, _version, headers: &HeaderMap, _ext: &Extensions| {
+///         !headers.contains_key("x-signed-payload")
+///     });
 ///
 /// assert!(compression.supports(Encoding::Identity));
 /// ```
@@ -494,7 +389,7 @@ pub struct Compression {
     level: CompressionLevel,
     min_size: u64,
     blocking_threshold: usize,
-    predicate: Option<Predicate>,
+    predicate: Arc<dyn Predicate>,
 }
 
 /// Bodies at or above this many bytes are compressed on the blocking pool rather than
@@ -520,7 +415,7 @@ impl std::fmt::Debug for Compression {
             .field("level", &self.level)
             .field("min_size", &self.min_size)
             .field("blocking_threshold", &self.blocking_threshold)
-            .field("predicate", &self.predicate.as_ref().map(|_| "<custom>"))
+            .field("predicate", &"<predicate>")
             .finish()
     }
 }
@@ -541,7 +436,7 @@ impl Compression {
             level: CompressionLevel::Default,
             min_size: DEFAULT_MIN_SIZE,
             blocking_threshold: DEFAULT_BLOCKING_THRESHOLD,
-            predicate: None,
+            predicate: Arc::new(predicate::DefaultPredicate::new()),
         }
     }
 
@@ -577,6 +472,69 @@ impl Compression {
         self
     }
 
+    /// Toggles `encoding` on or off — `tower-http`-style shorthand for [`Self::enable`] /
+    /// [`Self::disable`].
+    #[must_use]
+    fn toggle(self, encoding: Encoding, on: bool) -> Self {
+        if on {
+            self.enable(encoding)
+        } else {
+            self.disable(encoding)
+        }
+    }
+
+    /// Toggles `gzip`, matching `tower_http::CompressionLayer::gzip`.
+    #[must_use]
+    pub fn gzip(self, enable: bool) -> Self {
+        self.toggle(Encoding::Gzip, enable)
+    }
+
+    /// Toggles `deflate`, matching `tower_http::CompressionLayer::deflate`.
+    #[must_use]
+    pub fn deflate(self, enable: bool) -> Self {
+        self.toggle(Encoding::Deflate, enable)
+    }
+
+    /// Toggles `br` (Brotli), matching `tower_http::CompressionLayer::br`.
+    #[must_use]
+    pub fn br(self, enable: bool) -> Self {
+        self.toggle(Encoding::Brotli, enable)
+    }
+
+    /// Toggles `zstd`, matching `tower_http::CompressionLayer::zstd`.
+    #[must_use]
+    pub fn zstd(self, enable: bool) -> Self {
+        self.toggle(Encoding::Zstd, enable)
+    }
+
+    /// Disables `gzip`, matching `tower_http::CompressionLayer::no_gzip`. Available even when
+    /// the `compression-gzip` feature is off.
+    #[must_use]
+    pub fn no_gzip(self) -> Self {
+        self.disable(Encoding::Gzip)
+    }
+
+    /// Disables `deflate`, matching `tower_http::CompressionLayer::no_deflate`. Available even
+    /// when the `compression-deflate` feature is off.
+    #[must_use]
+    pub fn no_deflate(self) -> Self {
+        self.disable(Encoding::Deflate)
+    }
+
+    /// Disables `br` (Brotli), matching `tower_http::CompressionLayer::no_br`. Available even
+    /// when the `compression-br` feature is off.
+    #[must_use]
+    pub fn no_br(self) -> Self {
+        self.disable(Encoding::Brotli)
+    }
+
+    /// Disables `zstd`, matching `tower_http::CompressionLayer::no_zstd`. Available even when
+    /// the `compression-zstd` feature is off.
+    #[must_use]
+    pub fn no_zstd(self) -> Self {
+        self.disable(Encoding::Zstd)
+    }
+
     /// Replaces the preference list wholesale. Order is the server's tie-break ranking;
     /// codings this build cannot perform are dropped.
     #[must_use]
@@ -603,9 +561,10 @@ impl Compression {
     }
 
     /// Sets the quality/speed tradeoff, applied to every codec — each maps the level onto
-    /// its own scale. See [`CompressionLevel`].
+    /// its own scale. Matches `tower_http::CompressionLayer::quality`. See
+    /// [`CompressionLevel`].
     #[must_use]
-    pub const fn level(mut self, level: CompressionLevel) -> Self {
+    pub const fn quality(mut self, level: CompressionLevel) -> Self {
         self.level = level;
         self
     }
@@ -637,38 +596,34 @@ impl Compression {
         self
     }
 
-    /// Replaces the content-type test with a custom one.
+    /// Replaces the predicate deciding whether a response should be compressed. Matches
+    /// `tower_http::CompressionLayer::compress_when` — see [`predicate::Predicate`] for the
+    /// full type, and [`predicate::SizeAbove`]/[`predicate::NotForContentType`] for the
+    /// building blocks [`predicate::DefaultPredicate`] (the default) composes.
     ///
-    /// The predicate sees the full response, so it can key off any header, not just
-    /// `Content-Type`. It runs *after* the unconditional correctness rules in the module
-    /// docs, so it can only ever suppress compression, never force it onto a `304` or a
-    /// response that is already coded.
+    /// Runs *after* the unconditional correctness rules in the module docs, so it can only
+    /// ever suppress compression, never force it onto a `304` or a response already coded.
     ///
-    /// To keep the default type check and add to it, call [`is_compressible`] from inside
-    /// the predicate:
+    /// A plain closure works too, taking the same four arguments `tower-http` passes it:
     ///
     /// ```rust
-    /// use tachyon_web::http::compression::{Compression, is_compressible};
-    /// use tachyon_web::http::header::CONTENT_TYPE;
+    /// use tachyon_web::http::compression::Compression;
+    /// use tachyon_web::http::header::HeaderMap;
+    /// use hyper::http::Extensions;
     ///
-    /// let compression = Compression::new().predicate(|response| {
-    ///     if response.headers().contains_key("x-no-compress") {
-    ///         return false;
-    ///     }
-    ///     response
-    ///         .headers()
-    ///         .get(CONTENT_TYPE)
-    ///         .and_then(|value| value.to_str().ok())
-    ///         .is_none_or(is_compressible)
-    /// });
+    /// let compression = Compression::new().compress_when(
+    ///     |_status, _version, headers: &HeaderMap, _ext: &Extensions| {
+    ///         !headers.contains_key("x-no-compress")
+    ///     },
+    /// );
     /// # let _ = compression;
     /// ```
     #[must_use]
-    pub fn predicate<F>(mut self, predicate: F) -> Self
+    pub fn compress_when<P>(mut self, predicate: P) -> Self
     where
-        F: Fn(&Response<Body>) -> bool + Send + Sync + 'static,
+        P: Predicate,
     {
-        self.predicate = Some(Arc::new(predicate));
+        self.predicate = Arc::new(predicate);
         self
     }
 
@@ -709,11 +664,7 @@ impl Compression {
         // next client — one that *does* accept a coding — gets served this entry forever.
         add_vary_accept_encoding(response.headers_mut());
 
-        let allowed = self.predicate.as_ref().map_or_else(
-            || passes_default_predicate(&response),
-            |predicate| predicate(&response),
-        );
-        if !allowed {
+        if !self.predicate.should_compress(&response) {
             return response;
         }
 
@@ -764,21 +715,15 @@ impl Compression {
                     }
                 }
             }
-            Body::Stream(_) => {
-                let Some(encoder) = codec::Encoder::new(encoding, self.level, None) else {
-                    return Response::from_parts(parts, body);
-                };
-                // The coded length is unknowable until the last frame, so the response
-                // becomes chunked (HTTP/1.1) or simply length-less (HTTP/2, HTTP/3).
-                let _ = parts.headers.remove(CONTENT_LENGTH);
-                Body::stream(CompressedBody {
-                    inner: body,
-                    encoder: Some(encoder),
-                    pending_trailers: None,
-                    flushed_while_pending: false,
-                    finished: false,
-                })
-            }
+            Body::Stream(_) => match compressed_stream_body(body, encoding, self.level) {
+                Ok(new_body) => {
+                    // The coded length is unknowable until the last frame, so the response
+                    // becomes chunked (HTTP/1.1) or simply length-less (HTTP/2, HTTP/3).
+                    let _ = parts.headers.remove(CONTENT_LENGTH);
+                    new_body
+                }
+                Err(body) => return Response::from_parts(parts, body),
+            },
         };
 
         let _ = parts
@@ -871,13 +816,34 @@ fn is_eligible(response: &Response<Body>) -> bool {
     !headers.contains_key(hyper::header::CONTENT_RANGE)
 }
 
-/// [`is_compressible`] against a response's `Content-Type`.
-fn passes_default_predicate(response: &Response<Body>) -> bool {
-    response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_none_or(is_compressible)
+/// Wraps `body` in a streaming compressor for `encoding` (see `stream.rs`), or hands it back
+/// unchanged if this build has no codec for it.
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-deflate",
+    feature = "compression-br",
+    feature = "compression-zstd",
+))]
+fn compressed_stream_body(
+    body: Body,
+    encoding: Encoding,
+    level: CompressionLevel,
+) -> Result<Body, Body> {
+    stream::compressed_body(body, encoding, level)
+}
+
+#[cfg(not(any(
+    feature = "compression-gzip",
+    feature = "compression-deflate",
+    feature = "compression-br",
+    feature = "compression-zstd",
+)))]
+fn compressed_stream_body(
+    body: Body,
+    _encoding: Encoding,
+    _level: CompressionLevel,
+) -> Result<Body, Body> {
+    Err(body)
 }
 
 /// Appends `Accept-Encoding` to `Vary` without disturbing entries already there, and
@@ -960,133 +926,11 @@ async fn collect_full(body: Body) -> Result<Bytes, crate::http::error::Error> {
         .map(http_body_util::Collected::to_bytes)
 }
 
-pin_project_lite::pin_project! {
-    /// A streaming body that codes each frame as it passes through.
-    ///
-    /// Frames are written into the encoder as they arrive and whatever the encoder has
-    /// emitted so far is forwarded. When the inner body goes `Pending` — no more data is
-    /// available *right now* — the encoder is flushed once, so a slow producer's bytes
-    /// reach the client instead of sitting in a half-full compressor block until the next
-    /// frame arrives. That flush costs a little ratio and is skipped entirely for a body
-    /// that never blocks, which is the common case for a file or a buffered render.
-    struct CompressedBody {
-        #[pin]
-        inner: Body,
-        // `None` once `finish()` has consumed it.
-        encoder: Option<codec::Encoder>,
-        // Trailers seen before the encoder was flushed; re-emitted after the final block.
-        pending_trailers: Option<HeaderMap>,
-        flushed_while_pending: bool,
-        finished: bool,
-    }
-}
-
-impl HyperBody for CompressedBody {
-    type Data = Bytes;
-    type Error = crate::http::error::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let mut this = self.project();
-
-        loop {
-            if *this.finished {
-                return Poll::Ready(this.pending_trailers.take().map(Frame::trailers).map(Ok));
-            }
-
-            match this.inner.as_mut().poll_frame(cx) {
-                Poll::Ready(Some(Ok(frame))) => {
-                    let frame = match frame.into_data() {
-                        Ok(data) => {
-                            if data.is_empty() {
-                                continue;
-                            }
-                            let Some(encoder) = this.encoder.as_mut() else {
-                                continue;
-                            };
-                            if let Err(e) = encoder.write(&data) {
-                                return Poll::Ready(Some(Err(e.into())));
-                            }
-                            *this.flushed_while_pending = false;
-                            let output = encoder.take_output();
-                            if output.is_empty() {
-                                // Still inside a compressor block. Ask for more input
-                                // rather than emitting a zero-length frame.
-                                continue;
-                            }
-                            return Poll::Ready(Some(Ok(Frame::data(Bytes::from(output)))));
-                        }
-                        // Trailers arrive after the last data frame, so this is the end of
-                        // the stream: finish the encoder, emit the tail, then the trailers.
-                        Err(non_data) => non_data,
-                    };
-                    *this.pending_trailers = frame.into_trailers().ok();
-                    match finish(this.encoder, this.finished) {
-                        Ok(Some(tail)) => return Poll::Ready(Some(Ok(Frame::data(tail)))),
-                        // Nothing left to emit; the next turn of the loop sees `finished`
-                        // and hands back the stashed trailers.
-                        Ok(None) => {}
-                        Err(e) => return Poll::Ready(Some(Err(e))),
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                Poll::Ready(None) => match finish(this.encoder, this.finished) {
-                    Ok(Some(tail)) => return Poll::Ready(Some(Ok(Frame::data(tail)))),
-                    Ok(None) => {}
-                    Err(e) => return Poll::Ready(Some(Err(e))),
-                },
-                Poll::Pending => {
-                    if *this.flushed_while_pending {
-                        return Poll::Pending;
-                    }
-                    *this.flushed_while_pending = true;
-                    let Some(encoder) = this.encoder.as_mut() else {
-                        return Poll::Pending;
-                    };
-                    if let Err(e) = encoder.flush() {
-                        return Poll::Ready(Some(Err(e.into())));
-                    }
-                    let output = encoder.take_output();
-                    if output.is_empty() {
-                        return Poll::Pending;
-                    }
-                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from(output)))));
-                }
-            }
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.finished && self.pending_trailers.is_none()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        // The coded length is not known until the stream ends, and claiming the identity
-        // length here would produce a `Content-Length` that lies.
-        SizeHint::default()
-    }
-}
-
-/// Consumes the encoder and returns its final block, or `None` if it produced no bytes.
-///
-/// Sets `finished` either way, so a caller looping on `Ok(None)` terminates.
-fn finish(
-    encoder: &mut Option<codec::Encoder>,
-    finished: &mut bool,
-) -> Result<Option<Bytes>, crate::http::error::Error> {
-    *finished = true;
-    let Some(encoder) = encoder.take() else {
-        return Ok(None);
-    };
-    let tail = encoder.finish()?;
-    Ok((!tail.is_empty()).then(|| Bytes::from(tail)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::body::Frame;
+    use hyper::header::CONTENT_TYPE;
 
     /// The q-value a header assigns to one coding, parsing it fresh each time.
     fn quality_of(accept_encoding: &str, encoding: Encoding) -> Option<Quality> {
@@ -1149,23 +993,6 @@ mod tests {
             negotiate("gzip, br, zstd", &[Encoding::Gzip, Encoding::Brotli]),
             Encoding::Gzip,
         );
-    }
-
-    #[test]
-    fn compressible_types_cover_structured_suffixes_and_exclude_packed_formats() {
-        assert!(is_compressible("text/html; charset=utf-8"));
-        assert!(is_compressible("application/json"));
-        assert!(is_compressible("image/svg+xml"));
-        assert!(is_compressible("application/manifest+json"));
-        assert!(is_compressible("application/wasm"));
-        assert!(is_compressible("font/ttf"));
-        assert!(is_compressible(""));
-
-        assert!(!is_compressible("text/event-stream"));
-        assert!(!is_compressible("image/png"));
-        assert!(!is_compressible("video/mp4"));
-        assert!(!is_compressible("font/woff2"));
-        assert!(!is_compressible("application/octet-stream"));
     }
 
     #[test]

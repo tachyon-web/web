@@ -304,7 +304,7 @@ async fn content_length_matches_the_coded_body() {
         return;
     };
     let server = TestServer::spawn_with(app(), |s| {
-        s.compression(Compression::new().level(CompressionLevel::Best))
+        s.compression(Compression::new().quality(CompressionLevel::Best))
     })
     .await;
 

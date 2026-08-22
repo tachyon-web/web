@@ -1,9 +1,10 @@
-//! The codec layer behind [`Compression`](super::Compression).
+//! The one-shot codec layer behind [`Compression`](super::Compression)'s in-memory path.
 //!
-//! One `Write`-shaped adapter per content coding, all writing into a `Vec<u8>` the caller
-//! drains between frames. Deliberately synchronous: an async-compression wrapper would add
-//! an `AsyncRead`/`Stream` conversion on both sides of a codec that is pure CPU work, and
-//! [`super::Compression`] already decides — via `blocking_threshold` — where that work runs.
+//! One `Write`-shaped adapter per content coding, writing into an owned `Vec<u8>`.
+//! Deliberately synchronous — compression is pure CPU work with no I/O to be asynchronous
+//! about, and [`super::Compression`] already decides, via `blocking_threshold`, where that
+//! work runs. The streaming path (`stream.rs`) instead goes through `async-compression`,
+//! reusing this module's level/window mappings so both paths compress identically.
 
 use super::Encoding;
 #[cfg(any(
@@ -16,27 +17,22 @@ use std::io::Write;
 
 /// The compression quality/speed tradeoff, mapped onto each codec's own scale.
 ///
-/// Named to match `tower-http`'s type of the same name so an `axum` migration keeps
-/// working; the numeric mappings differ where `tower-http`'s defaults are a poor fit for
-/// per-request compression, and each variant documents what it actually resolves to.
+/// Named to match `tower-http`'s type of the same name, though the numeric mappings differ
+/// where `tower-http`'s defaults are a poor fit for per-request compression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressionLevel {
-    /// The cheapest setting each codec offers: gzip/deflate 1, Brotli 1, zstd 1.
-    ///
-    /// The right choice for large dynamic responses on a busy server, where the bytes
-    /// saved past this point cost more CPU than they save transmission time.
+    /// The cheapest setting each codec offers: gzip/deflate 1, Brotli 1, zstd 1. Right for
+    /// large dynamic responses, where bytes saved past this point cost more CPU than they
+    /// save transmission time.
     Fastest,
-    /// The best ratio worth using on a server: gzip/deflate 9, Brotli 11, zstd 19.
-    ///
-    /// zstd stops at 19 rather than its true maximum of 22 — levels 20-22 need hundreds of
-    /// megabytes of encoder state per stream, which is a denial-of-service vector when one
-    /// exists per in-flight response. Pass [`CompressionLevel::Precise`] to override.
+    /// The best ratio worth using on a server: gzip/deflate 9, Brotli 11, zstd 19. zstd
+    /// stops short of its true max of 22 — levels 20-22 need hundreds of MiB of encoder
+    /// state per stream, a DoS vector when one exists per in-flight response. Pass
+    /// [`CompressionLevel::Precise`] to override.
     Best,
-    /// A middle setting tuned per codec: gzip/deflate 6, Brotli 4, zstd 3.
-    ///
-    /// Brotli sits at 4 rather than its nominal default of 11: quality 11 is an order of
-    /// magnitude slower and is meant for assets compressed once ahead of time, not for a
-    /// body built per request.
+    /// A middle setting tuned per codec: gzip/deflate 6, Brotli 4, zstd 3. Brotli sits at 4
+    /// rather than its nominal default of 11, which is an order of magnitude slower and
+    /// meant for assets compressed once ahead of time, not a body built per request.
     Default,
     /// An exact level, clamped to the codec's valid range — 0-9 for gzip and deflate,
     /// 0-11 for Brotli, 1-22 for zstd.
@@ -46,7 +42,7 @@ pub enum CompressionLevel {
 impl CompressionLevel {
     /// Level for gzip and deflate, in flate2's 0-9 range.
     #[cfg(any(feature = "compression-gzip", feature = "compression-deflate"))]
-    fn flate(self) -> u32 {
+    pub(super) fn flate(self) -> u32 {
         match self {
             Self::Fastest => 1,
             Self::Best => 9,
@@ -57,7 +53,7 @@ impl CompressionLevel {
 
     /// Quality for Brotli, in its 0-11 range.
     #[cfg(feature = "compression-br")]
-    fn brotli(self) -> u32 {
+    pub(super) fn brotli(self) -> u32 {
         match self {
             Self::Fastest => 1,
             Self::Best => 11,
@@ -68,7 +64,7 @@ impl CompressionLevel {
 
     /// Level for zstd, in its 1-22 range.
     #[cfg(feature = "compression-zstd")]
-    fn zstd(self) -> i32 {
+    pub(super) fn zstd(self) -> i32 {
         match self {
             Self::Fastest => 1,
             Self::Best => 19,
@@ -86,9 +82,9 @@ impl CompressionLevel {
 ///
 /// [RFC 7932 §9.1]: https://www.rfc-editor.org/rfc/rfc7932#section-9.1
 #[cfg(feature = "compression-br")]
-const BROTLI_WINDOW_LOG: u32 = 22;
+pub(super) const BROTLI_WINDOW_LOG: u32 = 22;
 
-/// Size of Brotli's internal output staging buffer.
+/// Size of Brotli's internal output staging buffer (one-shot path only).
 #[cfg(feature = "compression-br")]
 const BROTLI_BUFFER_SIZE: usize = 8 * 1024;
 
@@ -100,13 +96,13 @@ const BROTLI_BUFFER_SIZE: usize = 8 * 1024;
 /// fails in the browser. This is the single most common way to ship a broken
 /// `Content-Encoding: zstd`, so the window is clamped rather than left to the level.
 #[cfg(feature = "compression-zstd")]
-const ZSTD_MAX_WINDOW_LOG: u32 = 23;
+pub(super) const ZSTD_MAX_WINDOW_LOG: u32 = 23;
 
 /// The lowest zstd level whose default window exceeds [`ZSTD_MAX_WINDOW_LOG`].
 #[cfg(feature = "compression-zstd")]
-const ZSTD_WINDOW_CLAMP_FROM: i32 = 19;
+pub(super) const ZSTD_WINDOW_CLAMP_FROM: i32 = 19;
 
-/// A configured encoder writing into an owned output buffer.
+/// A configured one-shot encoder writing into an owned output buffer.
 #[cfg(any(
     feature = "compression-gzip",
     feature = "compression-deflate",
@@ -187,8 +183,7 @@ impl Encoder {
         }
     }
 
-    /// Feeds `data` to the codec. Output accumulates in the internal buffer, which
-    /// [`Self::take_output`] drains.
+    /// Feeds `data` to the codec.
     pub(super) fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         match self {
             #[cfg(feature = "compression-gzip")]
@@ -202,38 +197,7 @@ impl Encoder {
         }
     }
 
-    /// Ends the current compressor block so everything written so far is decodable by
-    /// the client, without ending the stream. Costs ratio, so the streaming body only does
-    /// it when the source has nothing more to give right now.
-    pub(super) fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            #[cfg(feature = "compression-gzip")]
-            Self::Gzip(encoder) => encoder.flush(),
-            #[cfg(feature = "compression-deflate")]
-            Self::Deflate(encoder) => encoder.flush(),
-            #[cfg(feature = "compression-br")]
-            Self::Brotli(encoder) => encoder.flush(),
-            #[cfg(feature = "compression-zstd")]
-            Self::Zstd(encoder) => encoder.flush(),
-        }
-    }
-
-    /// Takes everything the codec has emitted so far, leaving an empty buffer behind.
-    pub(super) fn take_output(&mut self) -> Vec<u8> {
-        match self {
-            #[cfg(feature = "compression-gzip")]
-            Self::Gzip(encoder) => std::mem::take(encoder.get_mut()),
-            #[cfg(feature = "compression-deflate")]
-            Self::Deflate(encoder) => std::mem::take(encoder.get_mut()),
-            #[cfg(feature = "compression-br")]
-            Self::Brotli(encoder) => std::mem::take(encoder.get_mut()),
-            #[cfg(feature = "compression-zstd")]
-            Self::Zstd(encoder) => std::mem::take(encoder.get_mut()),
-        }
-    }
-
-    /// Ends the stream and returns the remaining output — the codec's trailer plus
-    /// anything still buffered.
+    /// Ends the stream and returns the complete compressed output.
     pub(super) fn finish(self) -> std::io::Result<Vec<u8>> {
         match self {
             #[cfg(feature = "compression-gzip")]
@@ -294,8 +258,7 @@ pub(super) struct Encoder(());
 #[allow(
     clippy::unused_self,
     clippy::missing_const_for_fn,
-    clippy::unnecessary_wraps,
-    clippy::needless_pass_by_ref_mut
+    clippy::unnecessary_wraps
 )]
 impl Encoder {
     pub(super) const fn new(
@@ -308,14 +271,6 @@ impl Encoder {
 
     pub(super) fn write(&mut self, _data: &[u8]) -> std::io::Result<()> {
         Ok(())
-    }
-
-    pub(super) fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    pub(super) fn take_output(&mut self) -> Vec<u8> {
-        Vec::new()
     }
 
     pub(super) fn finish(self) -> std::io::Result<Vec<u8>> {
@@ -341,7 +296,7 @@ mod tests {
     use crate::http::compression::Encoding;
 
     /// Round-trips through every codec this build has, proving the framing the browser
-    /// will see is the one the matching decoder expects — one-shot and streamed.
+    /// will see is the one the matching decoder expects.
     #[test]
     fn every_available_codec_round_trips() {
         let input = "the quick brown fox jumps over the lazy dog. ".repeat(200);
@@ -365,17 +320,6 @@ mod tests {
                 "{encoding} did not shrink highly redundant input"
             );
             assert_eq!(decompress(encoding, &compressed), input.as_bytes());
-
-            // Streamed in pieces, with a mid-stream flush, must decode identically.
-            let mut encoder = Encoder::new(encoding, CompressionLevel::Fastest, None).unwrap();
-            let mut streamed = Vec::new();
-            for chunk in input.as_bytes().chunks(97) {
-                encoder.write(chunk).unwrap();
-                encoder.flush().unwrap();
-                streamed.extend_from_slice(&encoder.take_output());
-            }
-            streamed.extend_from_slice(&encoder.finish().unwrap());
-            assert_eq!(decompress(encoding, &streamed), input.as_bytes());
         }
     }
 

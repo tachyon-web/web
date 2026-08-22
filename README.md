@@ -174,7 +174,7 @@ use tachyon_web::http::compression::{Compression, CompressionLevel};
 Server::new(app)
     .compression(
         Compression::new()                      // every codec this build has, zstd first
-            .level(CompressionLevel::Fastest),  // encode speed, for per-request bodies
+            .quality(CompressionLevel::Fastest),  // encode speed, for per-request bodies
     )
     .serve_http(listener)
     .await?;

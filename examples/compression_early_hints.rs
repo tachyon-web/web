@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Compression::new()
                 // Responses built per request: favour encode speed over the last few
                 // percent of ratio.
-                .level(CompressionLevel::Fastest),
+                .quality(CompressionLevel::Fastest),
         )
         // Moves HTTPS connections that negotiate h2 onto Tachyon's own HTTP/2 driver,
         // which is what can actually emit a 1xx. See `http::early_hints`.
