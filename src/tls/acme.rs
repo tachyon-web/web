@@ -14,8 +14,12 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
 use instant_acme::{
-    Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+    Account, AccountBuilder, AccountCredentials, BodyWrapper, ChallengeType, Identifier,
+    NewAccount, NewOrder, OrderStatus,
 };
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -650,6 +654,25 @@ impl AcmeManager {
             .await?)
     }
 
+    /// Builds an [`AccountBuilder`] whose HTTP client negotiates outbound TLS to the ACME
+    /// server through this manager's own `CryptoProvider` — the same one `self.provider`
+    /// loads signing keys through (see the `provider` field) — rather than
+    /// [`Account::builder`]'s bundled default, which resolves to rustls's process-wide
+    /// default provider and doesn't honor a `fips`/custom provider passed to
+    /// [`with_policy`](Self::with_policy).
+    fn account_builder(&self) -> Result<AccountBuilder, AcmeError> {
+        let connector = HttpsConnectorBuilder::new()
+            .with_provider_and_native_roots(self.provider.clone())
+            .map_err(AcmeError::Io)?
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .build();
+        let client: HyperClient<_, BodyWrapper<bytes::Bytes>> =
+            HyperClient::builder(TokioExecutor::new()).build(connector);
+        Ok(Account::builder_with_http(Box::new(client)))
+    }
+
     /// Loads existing ACME account credentials from `<cache_dir>/account-{staging|prod}.json`
     /// or creates a new account and caches the credentials.
     ///
@@ -665,7 +688,7 @@ impl AcmeManager {
                 Ok(creds_bytes) => {
                     match serde_json::from_slice::<AccountCredentials>(&creds_bytes) {
                         Ok(creds) => {
-                            let builder = Account::builder()?;
+                            let builder = self.account_builder()?;
                             match builder.from_credentials(creds).await {
                                 Ok(account) => {
                                     info!("[acme] reusing cached account ({env_suffix})");
@@ -689,7 +712,7 @@ impl AcmeManager {
         info!("[acme] registering new account ({env_suffix})");
         let contact = [format!("mailto:{}", self.email)];
         let contact_refs: Vec<&str> = contact.iter().map(String::as_str).collect();
-        let builder = Account::builder()?;
+        let builder = self.account_builder()?;
         let (account, creds) = builder
             .create(
                 &NewAccount {

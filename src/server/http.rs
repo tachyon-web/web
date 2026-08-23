@@ -270,9 +270,12 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if FIPS compliance enforcement fails. Per-connection I/O
-    /// errors (accept failures, handshake failures, etc.) are logged and do not
-    /// terminate the accept loop.
+    /// Returns an error if FIPS compliance enforcement fails, or — under the `fips` feature —
+    /// if `acceptor`'s `rustls::ServerConfig` doesn't itself negotiate FIPS-approved
+    /// algorithms (see [`crate::server::assert_fips_server_config`]; this catches a config
+    /// built without going through [`TlsPolicy`](crate::tls::TlsPolicy)). Per-connection I/O
+    /// errors (accept failures, handshake failures, etc.) are logged and do not terminate the
+    /// accept loop.
     #[cfg(feature = "tls")]
     pub async fn serve_https(
         self,
@@ -280,6 +283,8 @@ where
         acceptor: TlsAcceptor,
     ) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
+        #[cfg(feature = "fips")]
+        crate::server::assert_fips_server_config(acceptor.config())?;
         let state = Arc::new(self);
         let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
 

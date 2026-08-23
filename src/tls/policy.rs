@@ -110,10 +110,11 @@ impl TlsPolicy {
     }
 
     /// The FIPS-140-3-compliant policy: AES-256-GCM cipher suites only (no ChaCha20-Poly1305
-    /// or AES-128), and only NIST SECP curves / ML-KEM key-exchange groups
-    /// (`SECP256R1MLKEM768`, `MLKEM1024`, `MLKEM768`, `SECP384R1`, `SECP256R1`) — no X25519 in
-    /// any form, since RFC 7748 Curve25519 isn't FIPS-140-3-approved for key agreement (NIST SP
-    /// 800-186 vs SP 800-56Arev3).
+    /// or AES-128), and only NIST SECP curves / the hybrid `SECP256R1MLKEM768` key-exchange
+    /// group — no X25519 in any form, since RFC 7748 Curve25519 isn't FIPS-140-3-approved for
+    /// key agreement (NIST SP 800-186 vs SP 800-56Arev3), and no standalone ML-KEM group,
+    /// since SP 800-56C rev2 only sanctions a *hybrid* Z' = Z || T built from an approved SP
+    /// 800-56A/B scheme — bare ML-KEM doesn't qualify on its own.
     ///
     /// Requires the `fips` feature, under which this is also what [`new`](Self::new) and
     /// [`Default::default`] build — see the [type docs](Self#fips) for why it's the only
@@ -256,10 +257,13 @@ fn fips_provider() -> Arc<CryptoProvider> {
     static FIPS_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
     FIPS_PROVIDER
         .get_or_init(|| {
+            // Deliberately excludes standalone `MLKEM768`/`MLKEM1024`: SP 800-56C rev2 only
+            // sanctions a hybrid shared secret Z' = Z || T built from an SP 800-56A/B scheme,
+            // which `SECP256R1MLKEM768` satisfies (classical-first, so its FIPS status tracks
+            // the approved NIST curve) but bare ML-KEM as the sole key-establishment scheme
+            // does not — see `TlsPolicy::fips`'s docs.
             let kx_groups = vec![
                 rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
-                rustls::crypto::aws_lc_rs::kx_group::MLKEM1024,
-                rustls::crypto::aws_lc_rs::kx_group::MLKEM768,
                 rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
                 rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
             ];
@@ -326,13 +330,17 @@ mod tests {
 
     #[cfg(feature = "fips")]
     #[test]
-    fn fips_offers_only_secp_and_mlkem_kx_groups() {
+    fn fips_offers_only_secp_and_hybrid_mlkem_kx_groups() {
         let provider = TlsPolicy::fips().provider();
         for group in &provider.kx_groups {
-            let name = format!("{:?}", group.name());
+            let name = format!("{:?}", group.name()).to_ascii_uppercase();
             assert!(
-                !name.to_ascii_uppercase().contains("X25519"),
+                !name.contains("X25519"),
                 "X25519 is not FIPS-140-3-approved for key agreement, but was offered: {name}"
+            );
+            assert!(
+                name == "SECP256R1MLKEM768" || !name.contains("MLKEM"),
+                "standalone ML-KEM isn't a sanctioned SP 800-56C hybrid, but was offered: {name}"
             );
         }
     }

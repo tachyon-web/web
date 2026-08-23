@@ -488,6 +488,10 @@ where
         R: Runtime,
     {
         crate::server::enforce_fips_compliance()?;
+        #[cfg(all(feature = "tls", feature = "fips"))]
+        if let OnionTls::Custom(server_config) = &config.tls {
+            crate::server::assert_fips_server_config(server_config)?;
+        }
 
         let hs_nickname = parse_nickname(&config.nickname)?;
         let svc_cfg = OnionServiceConfigBuilder::default()

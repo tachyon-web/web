@@ -218,6 +218,15 @@ where
     F: Fn(Server<S>, TcpListener) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
 {
+    // Fails fast, with the real error text, before binding a listener on every core: every
+    // worker thread runs `serve_fn` via `let _ = serve_fn(...).await` (its return value is
+    // otherwise unobservable, since the accept loop is expected to run forever), so a
+    // same-check failure inside `serve_fn` itself only ever surfaced as the generic "all
+    // worker threads exited" error below, with the actual cause left to a log line. This
+    // check is cheap and a no-op without the `fips` feature, so running it unconditionally
+    // here (plain HTTP included) costs nothing.
+    enforce_fips_compliance()?;
+
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let mut handles = Vec::new();
@@ -803,6 +812,8 @@ where
         mut config: rustls::ServerConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         enforce_fips_compliance()?;
+        #[cfg(feature = "fips")]
+        assert_fips_server_config(&config)?;
 
         config.alpn_protocols = alpn_protocols(true);
         let config = Arc::new(config);
@@ -1116,12 +1127,21 @@ where
 /// Enforces FIPS compliance on the cryptographic module.
 /// If the `fips` feature is enabled and `aws-lc-rs` is not running in FIPS mode,
 /// returns an error to prevent server startup.
-#[allow(dead_code, clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+///
+/// This only checks that the *backend* is in FIPS mode — it says nothing about whether a
+/// particular `rustls::ServerConfig` actually negotiates FIPS-approved algorithms. A config
+/// built outside [`TlsPolicy`](crate::tls::TlsPolicy) (a caller-supplied one, or one built via
+/// bare `rustls::ServerConfig::builder()`) can still offer non-approved suites/groups even
+/// when this check passes. Every entry point that accepts such a config also calls
+/// [`assert_fips_server_config`] to close that gap.
+#[cfg_attr(
+    not(feature = "fips"),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
 pub(crate) fn enforce_fips_compliance() -> Result<(), std::io::Error> {
-    // `aws_lc_rs` is only linked when `tls` is enabled, so a `tor`/`i2p` + `fips` build without
-    // `tls` has no crypto provider of ours to check. (`tachyon-i2p/fips` still governs
-    // `libi2pd`'s separately-linked backend, independently of this check.)
-    #[cfg(all(feature = "fips", feature = "tls"))]
+    // `fips` implies `tls` (see the feature's Cargo.toml comment), so `aws_lc_rs` is always
+    // linked whenever this branch is compiled.
+    #[cfg(feature = "fips")]
     {
         if let Err(e) = aws_lc_rs::try_fips_mode() {
             return Err(std::io::Error::other(format!(
@@ -1130,6 +1150,35 @@ pub(crate) fn enforce_fips_compliance() -> Result<(), std::io::Error> {
         }
     }
     Ok(())
+}
+
+/// Rejects a caller-supplied `rustls::ServerConfig` that doesn't itself negotiate
+/// FIPS-140-3-approved algorithms, under the `fips` feature.
+///
+/// [`TlsPolicy::fips`](crate::tls::TlsPolicy::fips) is the only provider a `TlsPolicy` can hold
+/// under `fips` (see its docs), but a `ServerConfig` can also reach this crate through doors
+/// that never touch `TlsPolicy` at all: [`Server::serve_https_config`],
+/// [`Server::start_https_with_config`]/[`_addr`], [`Server::start_https_and_h3_with_config`],
+/// [`Server::with_https`]/[`MultiServer::with_https`](crate::server::multi::MultiServer::with_https),
+/// [`RustlsConfig::from_pem`], `OnionTls::Custom`, and `I2pTls::Custom`. Without this check, a
+/// caller could hand any of those a ChaCha20-only or X25519-only config and it would be served
+/// as-is even in a build that otherwise enforces FIPS. `rustls::ServerConfig::fips()` is the
+/// same predicate rustls itself uses: the negotiated provider is FIPS-approved *and*
+/// `require_ems` is set (FIPS 140-3 IG D.Q).
+#[cfg(all(feature = "tls", feature = "fips"))]
+pub(crate) fn assert_fips_server_config(
+    config: &rustls::ServerConfig,
+) -> Result<(), std::io::Error> {
+    if config.fips() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "TLS config is not FIPS-140-3-compliant (a non-approved cipher suite or \
+             key-exchange group is offered, or TLS 1.2 extended-master-secret isn't required) \
+             — build it via `TlsPolicy::fips()`/`TlsPolicy::new()` rather than \
+             `rustls::ServerConfig::builder()` directly",
+        ))
+    }
 }
 
 /// Builds the ALPN protocol list for a TLS `ServerConfig`, in preference order,
@@ -1407,7 +1456,20 @@ impl std::fmt::Debug for RustlsConfig {
 
 #[cfg(feature = "tls")]
 impl RustlsConfig {
-    /// Create a new `RustlsConfig` from PEM-formatted certificate chain and private key bytes.
+    /// Create a new `RustlsConfig` from PEM-formatted certificate chain and private key bytes,
+    /// using [`TlsPolicy::default`](crate::tls::TlsPolicy::default) — the same crypto/TLS
+    /// policy `Server::start_all`/`serve_all_acme` build from, and the FIPS-140-3-compliant
+    /// one under the `fips` feature (see [`TlsPolicy`](crate::tls::TlsPolicy)'s `fips` docs).
+    ///
+    /// Previously this built from `rustls::ServerConfig::builder()`'s process-wide default
+    /// provider instead: besides not respecting `fips`, that provider depends on load order —
+    /// whichever crate first called `CryptoProvider::install_default()` (for example,
+    /// `Server::serve_tor`/`serve_onion` install this crate's [`TlsPolicy`] process-wide for
+    /// arti's benefit) determined the actual cipher suites in effect. Going through
+    /// [`TlsPolicy`](crate::tls::TlsPolicy) removes that nondeterminism. Use
+    /// [`Server::tls_policy`](crate::server::Server::tls_policy) plus a hand-built
+    /// `rustls::ServerConfig` if you need a non-default provider or protocol-version
+    /// restriction here.
     ///
     /// # Errors
     /// Returns an error if the certificates or private key cannot be parsed, or if the config is invalid.
@@ -1420,12 +1482,23 @@ impl RustlsConfig {
         let key_der: PrivateKeyDer<'static> =
             crate::tls::pem::private_key(&key).map_err(|e| crate::tls::pem::key_io_error(&e))?;
 
-        let mut server_config = rustls::ServerConfig::builder()
+        let policy = crate::tls::TlsPolicy::default();
+        let mut server_config = rustls::ServerConfig::builder_with_provider(policy.provider())
+            .with_protocol_versions(policy.versions())
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("TLS version configuration failed: {e}"),
+                )
+            })?
             .with_no_client_auth()
             .with_single_cert(cert_chain, key_der)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         server_config.alpn_protocols = alpn_protocols(false);
+
+        #[cfg(feature = "fips")]
+        assert_fips_server_config(&server_config)?;
 
         Ok(Self {
             server_config: Arc::new(server_config),

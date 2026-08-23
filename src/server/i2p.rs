@@ -49,11 +49,22 @@
 //! selected here by the `i2p` feature) or the FIPS 140-3-validated AWS-LC-FIPS module. There's no
 //! separate `i2p-fips` feature — this crate's single top-level `fips` feature reaches into
 //! `tachyon-i2p/fips` too (taking priority over `i2p`'s `aws-lc` pick, harmlessly — see
-//! `i2pd-sys`'s crate docs for why), so enabling `i2p` and `fips` together is all it takes to
-//! publish this eepsite with FIPS-validated crypto everywhere, including the optional TLS layer
-//! ([`I2pConfig::tls_config`]/[`I2pConfig::self_signed_tls`]). See
-//! [`i2pd-sys`'s README](https://docs.rs/i2pd-sys) ("FIPS" section) for what this does and does
-//! not get you before reaching for it to satisfy a compliance requirement.
+//! `i2pd-sys`'s crate docs for why), so enabling `i2p` and `fips` together links the
+//! FIPS-validated module for both the optional TLS layer
+//! ([`I2pConfig::tls_config`]/[`I2pConfig::self_signed_tls`], enforced via
+//! `assert_fips_server_config`) and the I2P transport crypto `i2pd-sys` performs internally.
+//!
+//! **This does not make the I2P transport itself FIPS-140-3-compliant** — only the module
+//! computing its primitives. Every destination signature type
+//! ([`SigType::Eddsa25519`] by default) that isn't [`SigType::EcdsaP521`] uses a
+//! non-approved curve, and every [`CryptoType`] variant is an `Ecies*X25519` scheme —
+//! ECIES-X25519-AEAD-Ratchet mandates X25519 key agreement, which (like Tor's `ntor`/`ntor-v3`
+//! handshakes) isn't an approved key-establishment technique regardless of which library
+//! computes it. Under `fips`, treat only TLS termination on the eepsite's virtual TLS port as
+//! being in the FIPS boundary; the I2P transport underneath is out of scope by protocol
+//! design. See [`i2pd-sys`'s README](https://docs.rs/i2pd-sys) ("FIPS" section) for what
+//! linking the validated module does and does not get you before reaching for it to satisfy a
+//! compliance requirement.
 //!
 //! # Why there's no `redirect_http`/dual-stack option like `tor`'s `OnionConfig`
 //!
@@ -437,6 +448,10 @@ where
         config: I2pConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::server::enforce_fips_compliance()?;
+        #[cfg(all(feature = "tls", feature = "fips"))]
+        if let I2pTls::Custom(server_config) = &config.tls {
+            crate::server::assert_fips_server_config(server_config)?;
+        }
         validate_nickname(&config.nickname)?;
 
         let keys_path = config.keys_path();
