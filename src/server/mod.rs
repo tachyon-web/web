@@ -89,6 +89,32 @@ pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// `308` or a challenge token and closes, so the queue drains fast.
 #[cfg(feature = "tls")]
 pub const REDIRECT_MAX_CONNECTIONS: usize = 2048;
+/// Parameters for the plaintext port-80 redirect/ACME-challenge listener spawned alongside a
+/// TLS listener — see [`serve_http_redirect_and_challenges`].
+///
+/// Always defined (not `#[cfg(feature = "tls")]`) because [`run_worker_pool`]'s signature
+/// takes `Option<RedirectInfo>` unconditionally — only *constructing* a `Some` (and consuming
+/// it in [`run_worker_thread`]) requires the `tls` feature.
+#[derive(Clone)]
+struct RedirectInfo {
+    // All three fields are only ever populated behind `#[cfg(feature = "tls")]` construction
+    // sites — cfg'd out entirely (rather than left in and unread) for a non-`tls` build, so
+    // that build doesn't trip `-D dead-code` over a type it can only ever hold as `None`.
+    #[cfg(feature = "tls")]
+    addr: std::net::SocketAddr,
+    #[cfg(feature = "tls")]
+    https_port: u16,
+    /// The known-good hostnames this deployment serves, when available (e.g. the ACME
+    /// `domains` list in [`Server::serve_all_acme`]). When `Some`, an inbound `Host` header
+    /// that doesn't match any entry is replaced with the first domain rather than echoed back
+    /// into the `Location` header — otherwise a request naming an arbitrary `Host` would get a
+    /// same-status redirect to an attacker-chosen origin. `None` (e.g. [`Server::start_all`],
+    /// which only knows a certificate, not the domain list) falls back to echoing the request's
+    /// `Host` unchecked, matching this listener's long-standing behaviour there.
+    #[cfg(feature = "tls")]
+    allowed_hosts: Option<Arc<[String]>>,
+}
+
 /// Default for [`Server::max_websocket_connections`] — see that field for how to size it.
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 25_600;
 /// Default for [`Server::max_h3_concurrent_streams`] — see that field for how to size it.
@@ -103,6 +129,15 @@ thread_local! {
     pub(crate) static IS_LOCAL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Binds `addr` with `SO_REUSEADDR`/`SO_REUSEPORT` so one worker thread per core can share the
+/// port — see [`run_worker_pool`].
+///
+/// On Linux, `SO_REUSEPORT` lets *any* process running as the same effective UID join this
+/// listener's group and receive a share of its inbound connections — there is no additional
+/// namespace or capability check. That's inherent to the mechanism (no `SO_REUSEPORT_LB` or
+/// eBPF socket-selection filter is installed here), not a bug, but it's worth knowing given
+/// this crate's anonymity-transport features: a compromised same-UID process could observe or
+/// intercept a share of plaintext connections it otherwise has no access to.
 fn bind_reuseport(addr: std::net::SocketAddr) -> Result<std::net::TcpListener, std::io::Error> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = Domain::for_address(addr);
@@ -118,10 +153,64 @@ fn bind_reuseport(addr: std::net::SocketAddr) -> Result<std::net::TcpListener, s
     Ok(std::net::TcpListener::from(socket))
 }
 
+/// One worker thread's body: binds its share of `addr` (and, if configured, the redirect
+/// listener), reports the bind outcome over `bind_tx`, then runs `serve_fn` for the rest of
+/// this thread's life. Factored out of [`run_worker_pool`] to keep that function under
+/// clippy's line-count lint.
+async fn run_worker_thread<S, F, Fut>(
+    server: Arc<Server<S>>,
+    serve_fn: Arc<F>,
+    addr: std::net::SocketAddr,
+    redirect_info: Option<RedirectInfo>,
+    bind_tx: std::sync::mpsc::Sender<Result<(), std::io::Error>>,
+) where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(Server<S>, TcpListener) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
+{
+    IS_LOCAL_WORKER.with(|flag| flag.set(true));
+
+    // Only used for the HTTP->HTTPS redirect listener, which requires TLS.
+    #[cfg(not(feature = "tls"))]
+    let _ = &redirect_info;
+
+    #[cfg(feature = "tls")]
+    if let Some(info) = redirect_info {
+        let r_listener_res = bind_reuseport(info.addr).and_then(TcpListener::from_std);
+        match r_listener_res {
+            Ok(l) => {
+                tokio::task::spawn_local(async move {
+                    serve_http_redirect_and_challenges(l, info.https_port, info.allowed_hosts)
+                        .await;
+                });
+            }
+            Err(e) => {
+                tracing::error!("worker redirect bind error: {e}");
+            }
+        }
+    }
+
+    let listener_res = bind_reuseport(addr).and_then(TcpListener::from_std);
+    let listener = match listener_res {
+        Ok(l) => {
+            let _ = bind_tx.send(Ok(()));
+            l
+        }
+        Err(e) => {
+            tracing::error!("worker bind error: {e}");
+            let _ = bind_tx.send(Err(e));
+            return;
+        }
+    };
+
+    let server_clone = (*server).clone();
+    let _ = serve_fn(server_clone, listener).await;
+}
+
 async fn run_worker_pool<S, F, Fut>(
     server: Server<S>,
     addr: std::net::SocketAddr,
-    redirect_info: Option<(std::net::SocketAddr, u16)>,
+    redirect_info: Option<RedirectInfo>,
     serve_fn: F,
 ) -> Result<(), std::io::Error>
 where
@@ -145,6 +234,7 @@ where
         let serve_fn = serve_fn.clone();
         let core_id = core_ids.get(i).copied();
         let bind_tx = bind_tx.clone();
+        let redirect_info = redirect_info.clone();
         let handle = std::thread::Builder::new()
             .name(format!("tachyon-worker-{i}"))
             .spawn(move || {
@@ -161,57 +251,23 @@ where
                 };
 
                 let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, async move {
-                    IS_LOCAL_WORKER.with(|flag| flag.set(true));
-
-                    // Only used for the HTTP->HTTPS redirect listener, which requires TLS.
-                    #[cfg(not(feature = "tls"))]
-                    let _ = &redirect_info;
-
-                    #[cfg(feature = "tls")]
-                    if let Some((r_addr, https_port)) = redirect_info {
-                        let r_listener_res = bind_reuseport(r_addr).and_then(TcpListener::from_std);
-                        match r_listener_res {
-                            Ok(l) => {
-                                tokio::task::spawn_local(async move {
-                                    serve_http_redirect_and_challenges(l, https_port).await;
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!("worker redirect bind error: {e}");
-                            }
-                        }
-                    }
-
-                    let listener_res = bind_reuseport(addr).and_then(TcpListener::from_std);
-                    let listener = match listener_res {
-                        Ok(l) => {
-                            let _ = bind_tx.send(Ok(()));
-                            l
-                        }
-                        Err(e) => {
-                            tracing::error!("worker bind error: {e}");
-                            let _ = bind_tx.send(Err(e));
-                            return;
-                        }
-                    };
-
-                    let server_clone = (*server).clone();
-
-                    let _ = serve_fn(server_clone, listener).await;
-                });
+                local.block_on(
+                    &rt,
+                    run_worker_thread(server, serve_fn, addr, redirect_info, bind_tx),
+                );
             })?;
         handles.push(handle);
     }
     drop(bind_tx);
 
-    let bind_results = tokio::task::spawn_blocking(move || {
-        (0..cores)
+    let (bind_results, bind_rx) = tokio::task::spawn_blocking(move || {
+        let results = (0..cores)
             .filter_map(|_| bind_rx.recv().ok())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (results, bind_rx)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|_| (Vec::new(), std::sync::mpsc::channel().1));
     let bound = bind_results.iter().filter(|r| r.is_ok()).count();
     if bound == 0 {
         return Err(bind_results
@@ -228,8 +284,23 @@ where
     }
 
     let _ = handles;
-    std::future::pending::<()>().await;
-    Ok(())
+    // Each worker's accept loop runs indefinitely, so under normal operation this task
+    // should never resolve. But a worker can still exit early *after* a successful bind —
+    // e.g. `serve_fn`'s own `enforce_fips_compliance()` check failing right at the start of
+    // `serve_http`/`serve_https` — and previously that left this function blocked on
+    // `pending::<()>().await` forever, reporting nothing beyond a `tracing::error!` from
+    // inside the dead thread. Every worker holds its `bind_tx` clone for its entire
+    // lifetime (it's captured by the async block that runs `serve_fn`), so waiting for the
+    // channel to close — every clone dropped, meaning every worker thread has exited,
+    // whether from returning or panicking — is a reliable "the whole pool has died" signal.
+    let hangup = tokio::task::spawn_blocking(move || while bind_rx.recv().is_ok() {});
+    match hangup.await {
+        Ok(()) => Err(std::io::Error::other(
+            "all worker threads exited without accepting a connection — check for an early \
+             error from `serve_fn` (e.g. FIPS enforcement) in the logs above",
+        )),
+        Err(join_err) => Err(std::io::Error::other(join_err)),
+    }
 }
 
 /// Main server configuration and runner.
@@ -313,6 +384,14 @@ pub struct Server<S> {
     /// which caps whole connections, not streams within one: a single peer can open many
     /// streams on one connection, so this is what actually bounds the handler tasks (and
     /// request-body buffers) one connection can have in flight at once.
+    ///
+    /// Unlike the HTTP/1.1/HTTP/2 body path (which streams lazily into the handler), H3
+    /// request bodies are read to completion — up to [`max_body_size`](Self::max_body_size) —
+    /// *before* the handler runs (see `read_h3_body` in `server/h3.rs`). That makes this the
+    /// dominant term in one QUIC connection's worst-case memory: roughly
+    /// `max_h3_concurrent_streams × max_body_size`, e.g. 256 × 2 MiB = 512 MiB at the
+    /// defaults, before `max_connections` multiplies it across connections. Size this and
+    /// `max_body_size` together if H3 traffic is expected.
     ///
     /// Default: 256.
     #[cfg(feature = "http3")]
@@ -824,6 +903,7 @@ where
         // Built with this server's own policy so the ACME-issued certificate's signing key is
         // loaded through the same crypto provider the `ServerConfig` below negotiates with —
         // under `fips` those are distinct modules.
+        let allowed_hosts: Arc<[String]> = Arc::from(domains.clone());
         let policy = self.effective_tls_policy();
         let acme = AcmeManager::with_policy(cache_dir, domains, email, staging, &policy);
         let resolver = acme.resolver();
@@ -881,7 +961,11 @@ where
         run_worker_pool(
             self,
             addr,
-            Some((redirect_addr, https_port)),
+            Some(RedirectInfo {
+                addr: redirect_addr,
+                https_port,
+                allowed_hosts: Some(allowed_hosts),
+            }),
             move |server, listener| {
                 let tls_acceptor = tls_acceptor.clone();
                 async move { server.serve_https(listener, (*tls_acceptor).clone()).await }
@@ -942,7 +1026,16 @@ where
         let https_port = parse_port(tls_addr, 443);
 
         let redirect_info = cleartext_addr
-            .map(|cleartext_addr| parse_addr(cleartext_addr).map(|addr| (addr, https_port)))
+            .map(|cleartext_addr| {
+                parse_addr(cleartext_addr).map(|addr| RedirectInfo {
+                    addr,
+                    https_port,
+                    // No domain list is available here (only the cert/key PEM) — falls back
+                    // to echoing the request's `Host` unchecked, as before. Prefer
+                    // `serve_all_acme` when the domain list is known.
+                    allowed_hosts: None,
+                })
+            })
             .transpose()?;
 
         // Start HTTP/3 QUIC Server (if the feature is enabled).
@@ -1074,8 +1167,85 @@ fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Error> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }
 
+/// Strips the trailing `:port` from an HTTP `Host` header value, preserving IPv6 literals'
+/// brackets (e.g. `"[::1]:8443"` → `"[::1]"`) so the result is still a valid host in a URL.
+#[cfg(feature = "tls")]
+fn host_without_port(host: &str) -> &str {
+    let Some(rest) = host.strip_prefix('[') else {
+        return host.split(':').next().unwrap_or(host);
+    };
+    // `bracket_end` is an index into `rest` (one past the leading `[`); the matching `]` in
+    // `host` therefore sits at `bracket_end + 1`, so slicing up to (and including) that needs
+    // `..=bracket_end + 1`, i.e. an end bound of `bracket_end + 2`.
+    let Some(bracket_end) = rest.find(']') else {
+        return host;
+    };
+    let end = bracket_end.saturating_add(2);
+    host.get(..end).unwrap_or(host)
+}
+
+/// Resolves the host to put in the `Location` header of a plaintext→HTTPS redirect.
+///
+/// When `allowed_hosts` is `Some` (i.e. the caller knows its real domain list — see
+/// [`RedirectInfo::allowed_hosts`]), an inbound `Host` that doesn't match any entry is replaced
+/// with the first allowed domain rather than echoed back: otherwise a request naming an
+/// arbitrary `Host` would get a same-status redirect to an attacker-chosen origin (an open
+/// redirect). `None` preserves the historical echo-unchecked behaviour for callers that don't
+/// have a domain list to validate against (e.g. [`Server::start_all`]).
+#[cfg(feature = "tls")]
+fn resolve_redirect_host<'a>(host_header: &'a str, allowed_hosts: Option<&'a [String]>) -> &'a str {
+    let candidate = host_without_port(host_header);
+    let Some(allowed) = allowed_hosts else {
+        return candidate;
+    };
+    allowed
+        .iter()
+        .find(|d| d.eq_ignore_ascii_case(candidate))
+        .map_or_else(
+            || allowed.first().map_or(candidate, String::as_str),
+            String::as_str,
+        )
+}
+
+/// Whether an accept-loop I/O error indicates the process/system is transiently out of a
+/// resource (file descriptors, or kernel memory for the new connection's own data
+/// structures) rather than something wrong with the specific connection — the signal every
+/// accept loop uses to back off briefly instead of spinning a tight retry loop.
+///
+/// `23`/`24`/`10024` are `ENFILE`/`EMFILE`/`WSAEMFILE`. The additional platform-gated codes
+/// below are `ENOMEM`/`ENOBUFS` (or their BSD/Windows equivalents) — `accept(2)` can fail with
+/// those under memory pressure just as readily as it can run out of descriptors, and a caller
+/// spinning on either is equally counterproductive.
 pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(23 | 24 | 10024))
+    let Some(code) = e.raw_os_error() else {
+        return false;
+    };
+    if matches!(code, 23 | 24 | 10024) {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if matches!(code, 12 | 105) {
+        // ENOMEM | ENOBUFS
+        return true;
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    if matches!(code, 12 | 55) {
+        // ENOMEM | ENOBUFS
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(code, 10055 | 8) {
+        // WSAENOBUFS | WSA_NOT_ENOUGH_MEMORY
+        return true;
+    }
+    false
 }
 
 /// Plain HTTP listener that answers `/.well-known/acme-challenge/<token>` from the global
@@ -1090,9 +1260,27 @@ pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
 /// [`Server::max_connections`], which sizes the listener that actually runs application
 /// handlers.
 #[cfg(feature = "tls")]
-pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_port: u16) {
-    let builder =
+pub async fn serve_http_redirect_and_challenges(
+    listener: TcpListener,
+    https_port: u16,
+    allowed_hosts: Option<Arc<[String]>>,
+) {
+    let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    // Without a `Timer`, hyper silently drops `header_read_timeout` (only a `warn!`, no
+    // error) — this listener is bound to port 80 and reachable by anyone, so a client that
+    // opens a connection and never finishes its request line would otherwise hold one of
+    // [`REDIRECT_MAX_CONNECTIONS`] permits forever (Slowloris).
+    let _ = builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(REQUEST_TIMEOUT);
+    #[cfg(feature = "http2")]
+    let _ = builder
+        .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(REQUEST_TIMEOUT)
+        .keep_alive_timeout(REQUEST_TIMEOUT);
     let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(REDIRECT_MAX_CONNECTIONS));
 
     loop {
@@ -1113,12 +1301,14 @@ pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_por
         let _ = stream.set_nodelay(true);
         let io = hyper_util::rt::TokioIo::new(stream);
         let builder = builder.clone();
+        let allowed_hosts = allowed_hosts.clone();
 
         drop(tokio::spawn(async move {
             let _ = builder
                 .serve_connection(
                     io,
                     service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let allowed_hosts = allowed_hosts.clone();
                         async move {
                             // Serve ACME HTTP-01 challenge response.
                             #[cfg(feature = "lets-encrypt")]
@@ -1142,7 +1332,8 @@ pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_por
                                 .get("host")
                                 .and_then(|h| h.to_str().ok())
                                 .unwrap_or("localhost");
-                            let host_no_port = host.split(':').next().unwrap_or("localhost");
+                            let redirect_host =
+                                resolve_redirect_host(host, allowed_hosts.as_deref());
                             let port_suffix = if https_port == 443 {
                                 String::new()
                             } else {
@@ -1153,7 +1344,7 @@ pub async fn serve_http_redirect_and_challenges(listener: TcpListener, https_por
                                 .path_and_query()
                                 .map_or("/", hyper::http::uri::PathAndQuery::as_str);
                             let location =
-                                format!("https://{host_no_port}{port_suffix}{path_and_query}");
+                                format!("https://{redirect_host}{port_suffix}{path_and_query}");
 
                             let resp = Response::builder()
                                 .status(308) // 308 Permanent Redirect preserves the HTTP method.
@@ -1356,9 +1547,71 @@ mod tests {
         assert!(cloned.tls_policy.is_some());
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn host_without_port_strips_a_plain_hostname() {
+        assert_eq!(host_without_port("example.com:8443"), "example.com");
+        assert_eq!(host_without_port("example.com"), "example.com");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn host_without_port_preserves_ipv6_brackets() {
+        assert_eq!(host_without_port("[::1]:8443"), "[::1]");
+        assert_eq!(host_without_port("[::1]"), "[::1]");
+        assert_eq!(host_without_port("[2001:db8::1]:443"), "[2001:db8::1]");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn resolve_redirect_host_echoes_unchecked_when_no_allow_list_is_known() {
+        // `start_all`/`start_all_inner` only have a cert, not a domain list — matches the
+        // long-standing behaviour there.
+        assert_eq!(
+            resolve_redirect_host("attacker.example:80", None),
+            "attacker.example"
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn resolve_redirect_host_accepts_a_matching_allowed_host() {
+        let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
+        assert_eq!(
+            resolve_redirect_host("EXAMPLE.com:80", Some(&allowed)),
+            "example.com",
+            "matching must be case-insensitive, and the request's own casing is dropped in \
+             favor of the configured domain"
+        );
+        assert_eq!(
+            resolve_redirect_host("www.example.com", Some(&allowed)),
+            "www.example.com"
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn resolve_redirect_host_falls_back_to_the_first_allowed_domain_on_a_mismatch() {
+        // The open-redirect regression test: an inbound `Host` naming an arbitrary origin must
+        // never be echoed back into a same-status `Location` header when a domain allow-list
+        // is known (e.g. `serve_all_acme`'s `domains`).
+        let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
+        assert_eq!(
+            resolve_redirect_host("evil.example:80", Some(&allowed)),
+            "example.com"
+        );
+    }
+
     #[test]
     fn is_resource_exhaustion_matches_only_known_codes() {
         for code in [23, 24, 10024] {
+            assert!(
+                is_resource_exhaustion(&std::io::Error::from_raw_os_error(code)),
+                "code: {code}"
+            );
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        for code in [12, 105] {
             assert!(
                 is_resource_exhaustion(&std::io::Error::from_raw_os_error(code)),
                 "code: {code}"

@@ -501,13 +501,12 @@ where
         let onion_host = service
             .onion_address()
             .map(|addr| addr.display_unredacted().to_string());
-        if let Some(host) = &onion_host {
-            tracing::info!("[tor] onion service published at {host}");
-        }
         tracing::info!(
+            onion_host = onion_host.as_deref().unwrap_or("<pending>"),
             vanguards = config.vanguards,
             tls = config.tls_enabled(),
-            "[tor] hardening posture: vanguards={}, tls={}",
+            "[tor] onion service published at {}; vanguards={}, tls={}",
+            onion_host.as_deref().unwrap_or("<pending>"),
             if config.vanguards { "on" } else { "off" },
             if config.tls_enabled() { "on" } else { "off" },
         );
@@ -520,6 +519,8 @@ where
             on_ready(host);
         }
 
+        #[cfg(feature = "tls")]
+        require_onion_host_for_redirect(config.redirect_http, onion_host.is_some())?;
         #[cfg(feature = "tls")]
         {
             let tls_acceptor = match &config.tls {
@@ -603,6 +604,26 @@ where
             Ok(())
         }
     }
+}
+
+/// `redirect_http` builds every plaintext response's `Location` from the published onion
+/// host, so an unknown host at this point would silently redirect every request to
+/// `https:///...` (a malformed URL) for the service's entire lifetime instead of failing
+/// loudly once at startup. Requires the `tls` feature (the only build where `redirect_http`
+/// can be `true` at all).
+#[cfg(feature = "tls")]
+fn require_onion_host_for_redirect(
+    redirect_http: bool,
+    has_onion_host: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if redirect_http && !has_onion_host {
+        return Err(
+            "onion address unavailable after reaching the network — cannot enable \
+                     `redirect_http` without a known .onion host"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Validates `nickname` as an [`HsNickname`], wrapping the error with the offending value —
@@ -785,6 +806,8 @@ fn redirect_response(req: &Request<hyper::body::Incoming>, onion_host: &str) -> 
 mod tests {
     #[cfg(feature = "tls")]
     use super::redirect_location;
+    #[cfg(feature = "tls")]
+    use super::require_onion_host_for_redirect;
     use super::{OnionAction, OnionConfig, parse_nickname, route_onion_request};
 
     #[test]
@@ -821,6 +844,15 @@ mod tests {
             route_onion_request(80, false, true),
             OnionAction::ServePlaintext
         );
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn require_onion_host_for_redirect_rejects_a_missing_host_only_when_redirecting() {
+        assert!(require_onion_host_for_redirect(true, false).is_err());
+        assert!(require_onion_host_for_redirect(true, true).is_ok());
+        assert!(require_onion_host_for_redirect(false, false).is_ok());
+        assert!(require_onion_host_for_redirect(false, true).is_ok());
     }
 
     #[test]

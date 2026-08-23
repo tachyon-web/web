@@ -101,6 +101,22 @@ struct PriorityScheduler {
 /// enough that a perpetually-busy high-urgency stream cannot starve the rest of a connection.
 const PRIORITY_STARVATION_BOUND: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// RAII guard used by [`PriorityScheduler::turn`] to decrement its waiting-count slot on every
+/// exit path, including cancellation — see that method's docs for why this matters.
+struct ReleaseOnDrop<'a> {
+    slot: &'a AtomicUsize,
+    cleared: &'a tokio::sync::Notify,
+}
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.slot.fetch_sub(1, Ordering::AcqRel);
+        // Lets any lower-urgency stream sitting in this same loop re-check immediately
+        // instead of waiting out the rest of its timeout.
+        self.cleared.notify_waiters();
+    }
+}
+
 impl PriorityScheduler {
     fn new() -> Self {
         Self {
@@ -119,13 +135,18 @@ impl PriorityScheduler {
             return;
         };
         slot.fetch_add(1, Ordering::AcqRel);
+        // Guarantees the slot is released and other waiters are woken even if this call is
+        // cancelled mid-wait (e.g. the response future is dropped because the peer reset the
+        // stream — see `handle_stream`'s `poll_reset` race). Without it a cancelled waiter
+        // would leave its slot incremented forever, permanently deprioritizing every
+        // lower-urgency stream on the connection.
+        let _release = ReleaseOnDrop {
+            slot,
+            cleared: &self.cleared,
+        };
         while self.higher_priority_waiting(urgency) {
             let _ = tokio::time::timeout(PRIORITY_STARVATION_BOUND, self.cleared.notified()).await;
         }
-        slot.fetch_sub(1, Ordering::AcqRel);
-        // Lets any lower-urgency stream sitting in this same loop re-check immediately
-        // instead of waiting out the rest of its timeout.
-        self.cleared.notify_waiters();
     }
 
     fn higher_priority_waiting(&self, urgency: usize) -> bool {

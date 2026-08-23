@@ -52,23 +52,34 @@ where
             Arc::new(tokio::sync::Semaphore::new(self.max_h3_concurrent_streams));
 
         loop {
-            let Ok(stream_permit) = stream_semaphore.clone().acquire_owned().await else {
-                break;
-            };
+            // `accept()` drives the whole connection (control stream, QPACK, GOAWAY), not
+            // just stream acceptance — mirroring the h2 driver's `connection.accept()`, it
+            // must be awaited unconditionally on every iteration rather than gated behind the
+            // stream semaphore. Acquiring the permit *first* (the previous ordering) meant a
+            // peer that opened `max_h3_concurrent_streams` streams and went quiet stalled
+            // this connection's control-plane processing for as long as those streams stayed
+            // open, since `accept()` would never be called again to service it.
             match h3_server.accept().await {
                 Ok(Some(resolver)) => {
-                    let state = self.clone();
-                    tokio::spawn(async move {
-                        state.handle_h3_request(resolver, peer).await;
-                        drop(stream_permit);
-                    });
+                    if let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() {
+                        let state = self.clone();
+                        tokio::spawn(async move {
+                            state.handle_h3_request(resolver, peer).await;
+                            drop(stream_permit);
+                        });
+                    } else {
+                        // At the connection's in-flight limit — matches h2's
+                        // `REFUSED_STREAM` response: drop the resolver without resolving it,
+                        // which cancels the stream, rather than processing it and starving
+                        // every other stream sharing this budget.
+                        tracing::debug!(
+                            "[h3] refusing stream: connection is at its in-flight limit"
+                        );
+                        drop(resolver);
+                    }
                 }
-                Ok(None) => {
-                    drop(stream_permit);
-                    break;
-                }
+                Ok(None) => break,
                 Err(e) => {
-                    drop(stream_permit);
                     let err_str = e.to_string();
                     if !err_str.contains("application error")
                         && !err_str.contains("ConnectionError")

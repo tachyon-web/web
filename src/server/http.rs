@@ -100,6 +100,11 @@ macro_rules! tune_http2 {
             .initial_connection_window_size(1024 * 1024)
             .max_frame_size(16384)
             .max_concurrent_streams(200)
+            // `keep_alive_timeout` alone does nothing — hyper only sends the pings (and
+            // enforces the timeout) once `keep_alive_interval` is also set. Without this, a
+            // dead or idle peer that completes the handshake and goes silent holds its
+            // connection permit forever.
+            .keep_alive_interval(REQUEST_TIMEOUT)
             .keep_alive_timeout(REQUEST_TIMEOUT);
         // RFC 8441: let `ws::WebSocketUpgrade` accept WebSocket-over-HTTP/2 requests.
         #[cfg(feature = "ws")]

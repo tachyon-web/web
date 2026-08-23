@@ -3,12 +3,21 @@
 //! negotiation logic exists exactly once instead of being duplicated per transport.
 
 use crate::http::response::Body;
+use crate::server::REQUEST_TIMEOUT;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Placeholder peer address used where the underlying transport has no real socket address to
 /// report (Tor/I2P both exist specifically to hide the client's real address).
+///
+/// Every request over Tor/I2P reports the *same* [`ConnectInfo`](crate::routing::extract::ConnectInfo)
+/// (`0.0.0.0:0`), so per-IP logic keyed on it degrades in two ways worth knowing about before
+/// relying on it: any per-peer rate limiter collapses to a single shared bucket for all
+/// anonymous traffic, and a "trust anything that isn't a global address" check (a common way
+/// to gate internal/trusted-network behaviour) will treat every one of these requests as
+/// trusted, since `0.0.0.0` is not a global address — a real hazard in a process that also
+/// serves a clearnet listener in the same router.
 pub(super) const NO_PEER_ADDR: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
@@ -31,12 +40,20 @@ where
 
     #[cfg(all(feature = "http1", feature = "http2"))]
     {
-        // Only the `ws` branch below needs `&mut`, so without that feature the binding is
-        // immutable — and `unused_mut` is denied crate-wide, which broke every `tor`/`i2p`
-        // build that didn't also enable `ws`.
-        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut builder =
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        // Without a `Timer`, hyper silently drops `header_read_timeout` (only a `warn!`, no
+        // error) — leaving a peer that opens a stream and never finishes its request line
+        // able to hold this connection's slot in `max_connections` forever (Slowloris).
+        let _ = builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(REQUEST_TIMEOUT);
+        let _ = builder
+            .http2()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(REQUEST_TIMEOUT)
+            .keep_alive_timeout(REQUEST_TIMEOUT);
         // RFC 8441: advertise support for the extended CONNECT bootstrap so `ws::WebSocketUpgrade`
         // can accept WebSocket-over-HTTP/2 requests.
         #[cfg(feature = "ws")]
@@ -46,6 +63,8 @@ where
     #[cfg(all(feature = "http1", not(feature = "http2")))]
     {
         hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(REQUEST_TIMEOUT)
             .serve_connection(io, svc)
             .with_upgrades()
             .await?;
@@ -56,6 +75,10 @@ where
         #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
         let mut builder =
             hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let _ = builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(REQUEST_TIMEOUT)
+            .keep_alive_timeout(REQUEST_TIMEOUT);
         #[cfg(feature = "ws")]
         let _ = builder.enable_connect_protocol();
         builder.serve_connection(io, svc).await?;
