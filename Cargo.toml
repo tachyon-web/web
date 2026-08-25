@@ -51,8 +51,9 @@ core_affinity = "0.8"
 rustc-hash = "2"
 smallvec = { version = "1", features = ["union"] }
 
-# Optional Tower interop (see the `tower` feature) — not used on the native hot path.
-tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
+# tower::Service/tower::Layer are the routing/middleware foundation (matching Axum's own
+# internals), not optional interop — see `routing::tower_compat`.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 # Optional WebSocket support (see the `ws` feature).
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
@@ -112,7 +113,7 @@ json = ["dep:serde_json"]
 cookies = ["dep:cookie"]
 matched-path = []
 original-uri = []
-tower-log = ["tower?/log"]
+tower-log = ["tower/log"]
 ws = ["dep:tungstenite", "dep:futures-util", "dep:flate2"]
 form = []
 query = []
@@ -129,7 +130,6 @@ lets-encrypt = [
     "dep:instant-acme", "dep:webpki", "dep:serde_json", "dep:hyper-rustls", "tls", "cert-gen",
     "hyper-util/client-legacy",
 ]
-tower = ["dep:tower"]
 sse = ["dep:futures-core", "dep:serde_json"]
 sfv = []
 tor = [

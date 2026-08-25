@@ -224,7 +224,6 @@
     feature = "http3",
     feature = "fips",
     feature = "lets-encrypt",
-    feature = "tower",
     feature = "sse",
     feature = "sfv",
     feature = "tor",
@@ -254,7 +253,8 @@ pub use http::early_hints::{self, EarlyHints, EarlyHintsConfig, Link};
 pub use http::error::{Error, Result};
 pub use http::response;
 pub use http::response::{
-    AppendHeaders, Html, IntoResponse, IntoResponseParts, Redirect, ResponseParts,
+    AppendHeaders, ErrorResponse, Html, IntoResponse, IntoResponseParts, NoContent, Redirect,
+    ResponseParts, to_bytes,
 };
 pub use routing::extract;
 #[cfg(feature = "cookies")]
@@ -268,10 +268,13 @@ pub use routing::extract::OriginalUri;
 #[cfg(feature = "query")]
 pub use routing::extract::Query;
 pub use routing::extract::{
-    ConnectInfo, Extension, FromRef, FromRequest, FromRequestParts, Host, Path, RawQuery, State,
+    ConnectInfo, Extension, FromRef, FromRequest, FromRequestParts, Host, Path, RawQuery,
+    RequestExt, RequestPartsExt, State,
 };
+pub use routing::error_handling;
 pub use routing::handler::{BoxedFuture, BoxedHandler, Handler};
-pub use routing::middleware::{MiddlewarePosition, Next};
+pub use routing::middleware;
+pub use routing::middleware::Next;
 pub use routing::static_dir::ServeDir;
 pub use routing::{
     MethodRouter, Router, RouterError, any, connect, delete, get, head, options, patch, post, put,

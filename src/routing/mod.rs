@@ -1,21 +1,26 @@
 //! Axum-compatible routing: [`Router`], [`MethodRouter`], and the per-verb builders.
+//!
+//! Every registered route ultimately becomes a [`tower_compat::Route`] — a
+//! type-erased, cloneable `tower::Service` — and middleware is applied by
+//! calling real `tower::Layer::layer()` on it (`.layer()`/`.route_layer()`),
+//! matching Axum's own internals rather than a separate bespoke system.
 
 use bytes::Bytes;
 use hyper::{Method, Request, Response, StatusCode};
-use std::future::Future;
 use std::sync::Arc;
 
+pub mod error_handling;
 pub mod extract;
 pub mod handler;
 pub mod middleware;
 pub mod static_dir;
-#[cfg(feature = "tower")]
 pub mod tower_compat;
 
-use crate::http::response::{Body, IntoResponse};
+use crate::http::response::Body;
 use crate::routing::extract::PathParams;
 
 pub use handler::{BoxedFuture, BoxedHandler, Handler};
+pub use tower_compat::Route;
 
 /// Emits a pre-rendered `103 Early Hints` block for `req`, if the transport wired one up.
 ///
@@ -62,10 +67,19 @@ const fn method_index(m: &Method) -> Option<usize> {
     }
 }
 
+/// Builds a [`Route`] once `state` is known — every method-router slot and
+/// router-level fallback is one of these until [`Router::compile`] (or
+/// [`Router::with_state`], which rebinds it) finally has a concrete state to
+/// call it with. Applying a `.layer()` before that point wraps this closure
+/// rather than a `Route` directly, deferring the actual `tower::Layer::layer()`
+/// call to materialization time — the same reason Axum's own `MethodRouter`
+/// keeps handlers boxed-but-unbound until `with_state`.
+type BoxedIntoRoute<S> = Arc<dyn Fn(Arc<S>) -> Route + Send + Sync>;
+
 /// Router that dispatches requests to different handlers based on the HTTP method.
 #[derive(Clone)]
 pub struct MethodRouter<S> {
-    handlers: [Option<middleware::MethodHandler<S>>; METHOD_COUNT],
+    handlers: [Option<BoxedIntoRoute<S>>; METHOD_COUNT],
     /// Path-parameter names in declaration order, populated by `Router::compile()`. Cloning
     /// an `Arc<str>` into `PathParams` is a refcount bump rather than a per-request
     /// allocation.
@@ -118,34 +132,14 @@ where
     fn set<H, T>(mut self, idx: usize, handler: H) -> Self
     where
         H: Handler<T, S>,
-        T: 'static,
+        T: Send + 'static,
     {
         if let Some(slot) = self.handlers.get_mut(idx) {
-            *slot = Some(middleware::MethodHandler::new(Arc::new(
-                move |req, state| handler.clone().call(req, state),
-            )));
+            *slot = Some(Arc::new(move |state: Arc<S>| {
+                Route::from_handler(handler.clone(), state)
+            }));
         }
         self
-    }
-
-    /// The `Allow` header value listing every registered method, in Axum's format
-    /// (comma-joined, no spaces). `HEAD` is listed whenever `GET` is, since a `GET` handler
-    /// answers `HEAD` when no explicit one is registered.
-    fn allow_header(&self) -> String {
-        let mut out = String::with_capacity(56);
-        let implicit_head = self.handlers[IDX_GET].is_some() && self.handlers[IDX_HEAD].is_none();
-        for (i, name) in METHOD_NAMES.iter().enumerate() {
-            if self.handlers.get(i).is_some_and(Option::is_some) {
-                if !out.is_empty() {
-                    out.push(',');
-                }
-                out.push_str(name);
-                if i == IDX_GET && implicit_head {
-                    out.push_str(",HEAD");
-                }
-            }
-        }
-        out
     }
 
     /// Merges `other`'s method handlers into `self`: registering the same path twice with
@@ -177,47 +171,31 @@ where
         Ok(self)
     }
 
-    /// Apply a middleware handler to all endpoints registered in this `MethodRouter`.
-    ///
-    /// Middleware takes a `Request` and a `Next<S>` continuation.
+    /// Apply a `tower::Layer` to every endpoint registered in this
+    /// `MethodRouter` **so far** — matching `axum::routing::MethodRouter::layer`.
+    /// Call this after the verb builders (`.get()`/`.post()`/...) it should cover.
     #[must_use]
-    pub fn hoop<F, Fut, Res>(self, middleware: F) -> Self
+    pub fn layer<L, RespBody>(mut self, layer: L) -> Self
     where
-        F: Fn(Request<Body>, middleware::Next<S>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = Res> + Send + 'static,
-        Res: IntoResponse + Send + 'static,
+        L: tower::Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<Request<Body>, Response = Response<RespBody>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Future: Send + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Error:
+            Into<crate::http::error::Error> + Send,
+        RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
+        RespBody::Error: Into<crate::http::error::Error>,
     {
-        self.hoop_at(middleware::MiddlewarePosition::First, middleware)
-    }
-
-    /// Apply a middleware handler to all endpoints registered in this `MethodRouter` at a specific position (First/Last).
-    #[must_use]
-    pub fn hoop_at<F, Fut, Res>(
-        mut self,
-        position: middleware::MiddlewarePosition,
-        middleware: F,
-    ) -> Self
-    where
-        F: Fn(Request<Body>, middleware::Next<S>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = Res> + Send + 'static,
-        Res: IntoResponse + Send + 'static,
-    {
-        let boxed: middleware::BoxedMiddleware<S> = Arc::new(move |req, next| {
-            let fut = middleware(req, next);
-            crate::routing::handler::ResponseFuture::Boxed(Box::pin(async move {
-                fut.await.into_response()
-            }))
-        });
-        for handler in self.handlers.iter_mut().flatten() {
-            match position {
-                middleware::MiddlewarePosition::First => {
-                    handler.middlewares.insert(0, boxed.clone());
-                }
-                middleware::MiddlewarePosition::Last => {
-                    handler.middlewares.push(boxed.clone());
-                }
+        for slot in &mut self.handlers {
+            if let Some(old) = slot.take() {
+                let layer = layer.clone();
+                *slot = Some(Arc::new(move |state: Arc<S>| {
+                    old(state).layer(layer.clone())
+                }));
             }
-            handler.compiled = None;
         }
         self
     }
@@ -255,19 +233,28 @@ where
         if headers.is_empty() {
             return self;
         }
-        self.hoop(move |req, next| {
+        self.layer(middleware::from_fn(move |req, next| {
             let headers = headers.clone();
             async move {
                 fire_early_hints(&req, headers);
                 next.run(req).await
             }
-        })
+        }))
     }
 
-    /// Compile all handler middleware chains in-place.
-    pub fn compile_in_place(&mut self) {
-        for handler in self.handlers.iter_mut().flatten() {
-            handler.compile_in_place();
+    /// Materializes every `BoxedIntoRoute<S>` slot into a concrete, state-free
+    /// [`Route`] by calling it with `state` — the one point any layers
+    /// applied so far actually run `tower::Layer::layer()`.
+    fn materialize(&self, state: &Arc<S>) -> CompiledMethodRouter {
+        let mut handlers: [Option<Route>; METHOD_COUNT] = [const { None }; METHOD_COUNT];
+        for (slot, into_route) in handlers.iter_mut().zip(self.handlers.iter()) {
+            *slot = into_route.as_ref().map(|f| f(state.clone()));
+        }
+        CompiledMethodRouter {
+            handlers,
+            param_names: self.param_names.clone(),
+            matched_path: self.matched_path.clone(),
+            nest_prefix: self.nest_prefix.clone(),
         }
     }
 
@@ -278,17 +265,15 @@ where
         S2: Clone + Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
     {
-        let mut new_handlers: [Option<middleware::MethodHandler<S2>>; METHOD_COUNT] =
+        let mut new_handlers: [Option<BoxedIntoRoute<S2>>; METHOD_COUNT] =
             [const { None }; METHOD_COUNT];
         for (slot, opt_handler) in new_handlers.iter_mut().zip(self.handlers.iter()) {
-            if let Some(handler) = opt_handler {
-                let mut compiled_h = handler.clone();
-                compiled_h.compile_in_place();
-                let compiled_raw = compiled_h.compiled.unwrap_or(compiled_h.raw);
+            if let Some(into_route) = opt_handler {
+                let into_route = into_route.clone();
                 let state = state.clone();
-                let new_h: BoxedHandler<S2> =
-                    Arc::new(move |req, _parent_state| compiled_raw(req, state.clone()));
-                *slot = Some(middleware::MethodHandler::new(new_h));
+                *slot = Some(Arc::new(move |_new_state: Arc<S2>| {
+                    into_route(state.clone())
+                }));
             }
         }
         MethodRouter {
@@ -297,6 +282,39 @@ where
             matched_path: self.matched_path,
             nest_prefix: self.nest_prefix,
         }
+    }
+}
+
+/// The fully state-bound form of [`MethodRouter`], produced by
+/// [`MethodRouter::materialize`] at [`Router::compile`] time. Every slot is a
+/// ready-to-call [`Route`] — no more state or further layering to apply.
+#[derive(Clone)]
+pub(crate) struct CompiledMethodRouter {
+    handlers: [Option<Route>; METHOD_COUNT],
+    param_names: Arc<[Arc<str>]>,
+    matched_path: Arc<str>,
+    nest_prefix: Option<Arc<str>>,
+}
+
+impl CompiledMethodRouter {
+    /// The `Allow` header value listing every registered method, in Axum's format
+    /// (comma-joined, no spaces). `HEAD` is listed whenever `GET` is, since a `GET` handler
+    /// answers `HEAD` when no explicit one is registered.
+    fn allow_header(&self) -> String {
+        let mut out = String::with_capacity(56);
+        let implicit_head = self.handlers[IDX_GET].is_some() && self.handlers[IDX_HEAD].is_none();
+        for (i, name) in METHOD_NAMES.iter().enumerate() {
+            if self.handlers.get(i).is_some_and(Option::is_some) {
+                if !out.is_empty() {
+                    out.push(',');
+                }
+                out.push_str(name);
+                if i == IDX_GET && implicit_head {
+                    out.push_str(",HEAD");
+                }
+            }
+        }
+        out
     }
 }
 
@@ -315,7 +333,7 @@ macro_rules! method_routes {
                 pub fn $name<H, T>(self, handler: H) -> Self
                 where
                     H: Handler<T, S>,
-                    T: 'static,
+                    T: Send + 'static,
                 {
                     self.set($idx, handler)
                 }
@@ -327,7 +345,7 @@ macro_rules! method_routes {
             pub fn $name<H, T, S>(handler: H) -> MethodRouter<S>
             where
                 H: Handler<T, S>,
-                T: 'static,
+                T: Send + 'static,
                 S: Clone + Send + Sync + 'static,
             {
                 MethodRouter::new().$name(handler)
@@ -338,7 +356,7 @@ macro_rules! method_routes {
         pub fn any<H, T, S>(handler: H) -> MethodRouter<S>
         where
             H: Handler<T, S>,
-            T: 'static,
+            T: Send + 'static,
             S: Clone + Send + Sync + 'static,
         {
             let router = MethodRouter::new();
@@ -364,8 +382,8 @@ method_routes! {
 #[derive(Clone)]
 pub struct Router<S = ()> {
     routes: Vec<(String, MethodRouter<S>)>,
-    fallback: Option<BoxedHandler<S>>,
-    method_not_allowed_fallback: Option<BoxedHandler<S>>,
+    fallback: Option<BoxedIntoRoute<S>>,
+    method_not_allowed_fallback: Option<BoxedIntoRoute<S>>,
     /// See [`Router::normalize_trailing_slash`].
     normalize_trailing_slash: bool,
     /// See [`Router::no_index`]. Applied at [`compile`](Router::compile) time, so route
@@ -375,7 +393,6 @@ pub struct Router<S = ()> {
     /// works without a separate `.compile()` call while still building the `matchit` tree only
     /// once. Every route-table-mutating builder method resets it to `None`, so mutating after
     /// serving can't dispatch against a stale tree.
-    #[cfg(feature = "tower")]
     compiled: Option<CompiledRouter<S>>,
 }
 
@@ -399,25 +416,6 @@ where
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Wraps a bare handler (a router's `fallback`/`method_not_allowed_fallback`) in
-/// `middleware`, so `.hoop()`/`.hoop_at()` cover them the same way they cover routes.
-fn wrap_handler<S, F, Fut, Res>(handler: BoxedHandler<S>, middleware: F) -> BoxedHandler<S>
-where
-    S: Send + Sync + 'static,
-    F: Fn(Request<Body>, middleware::Next<S>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-{
-    Arc::new(move |req, state| {
-        let next = middleware::Next {
-            handler: handler.clone(),
-            state,
-        };
-        let fut = middleware(req, next);
-        handler::ResponseFuture::Boxed(Box::pin(async move { fut.await.into_response() }))
-    })
 }
 
 /// Combines two optional per-router handlers (a `fallback` or
@@ -459,7 +457,6 @@ fn normalize_route_pattern(path: &str) -> String {
 /// Builds a `MethodRouter` that dispatches every HTTP method to the same handler —
 /// used to mount raw `tower::Service`s, which (unlike native handlers) typically do
 /// their own method matching rather than being registered per-verb.
-#[cfg(feature = "tower")]
 fn all_methods<H, S>(handler: H) -> MethodRouter<S>
 where
     H: Handler<tower_compat::TowerServiceMarker, S>,
@@ -481,7 +478,6 @@ where
             method_not_allowed_fallback: None,
             normalize_trailing_slash: false,
             no_index: false,
-            #[cfg(feature = "tower")]
             compiled: None,
         }
     }
@@ -542,14 +538,14 @@ where
                 get(|| async { "User-agent: *\nDisallow: /\n" }),
             );
         }
-        self.hoop(|req: Request<Body>, next: middleware::Next<S>| async move {
+        self.layer(middleware::from_fn(|req: Request<Body>, next: middleware::Next| async move {
             let mut resp = next.run(req).await;
             let _ = resp.headers_mut().insert(
                 hyper::header::HeaderName::from_static("x-robots-tag"),
                 hyper::header::HeaderValue::from_static("noindex, nofollow"),
             );
             resp
-        })
+        }))
     }
 
     /// Set the application state for this router, transitioning it to
@@ -575,9 +571,9 @@ where
             .map(|(path, method_router)| (path, method_router.with_state(&state_arc)))
             .collect();
 
-        let rebind = |handler: BoxedHandler<S>| -> BoxedHandler<S2> {
+        let rebind = |into_route: BoxedIntoRoute<S>| -> BoxedIntoRoute<S2> {
             let state_arc = state_arc.clone();
-            Arc::new(move |req, _parent_state| handler(req, state_arc.clone()))
+            Arc::new(move |_new_state: Arc<S2>| into_route(state_arc.clone()))
         };
         let new_fallback = self.fallback.map(rebind);
         let new_method_not_allowed_fallback = self.method_not_allowed_fallback.map(rebind);
@@ -588,7 +584,6 @@ where
             method_not_allowed_fallback: new_method_not_allowed_fallback,
             normalize_trailing_slash: self.normalize_trailing_slash,
             no_index: self.no_index,
-            #[cfg(feature = "tower")]
             compiled: None,
         }
     }
@@ -602,10 +597,7 @@ where
     /// matching Axum. A route conflict is a build-time bug, not a recoverable condition.
     #[allow(clippy::panic)]
     fn push_or_merge_route(&mut self, path: String, method_router: MethodRouter<S>) {
-        #[cfg(feature = "tower")]
-        {
-            self.compiled = None;
-        }
+        self.compiled = None;
         if let Some(pos) = self.routes.iter().position(|(p, _)| *p == path) {
             let (_, existing) = self.routes.remove(pos);
             let merged = existing
@@ -807,10 +799,7 @@ where
     /// matching Axum's `Router::merge`.
     #[must_use]
     pub fn merge(mut self, mut other: Self) -> Self {
-        #[cfg(feature = "tower")]
-        {
-            self.compiled = None;
-        }
+        self.compiled = None;
         for (path, method_router) in other.routes.drain(..) {
             self.push_or_merge_route(path, method_router);
         }
@@ -831,14 +820,13 @@ where
 
     /// Mount a raw `tower::Service` at `path`, handling every HTTP method.
     ///
-    /// Requires the `tower` feature. Prefer `.route(path, get(handler))` with a native
-    /// handler where possible — this exists to bridge in pre-built Tower/tower-http
-    /// services (e.g. `tower_http::services::ServeFile`) without a rewrite.
-    #[cfg(feature = "tower")]
+    /// Prefer `.route(path, get(handler))` with a native handler where possible —
+    /// this exists to bridge in pre-built Tower/tower-http services (e.g.
+    /// `tower_http::services::ServeFile`) without a rewrite.
     #[must_use]
     pub fn route_service<Svc, RespBody>(self, path: &str, service: Svc) -> Self
     where
-        Svc: tower::Service<Request<Bytes>, Response = Response<RespBody>>
+        Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
             + Clone
             + Send
             + Sync
@@ -857,13 +845,10 @@ where
 
     /// Nest a raw `tower::Service` under `prefix`, with the mounted path rewritten
     /// relative to `prefix` before the service sees it (matching Axum's `nest_service`).
-    ///
-    /// Requires the `tower` feature.
     #[must_use]
-    #[cfg(feature = "tower")]
     pub fn nest_service<Svc, RespBody>(self, prefix: &str, service: Svc) -> Self
     where
-        Svc: tower::Service<Request<Bytes>, Response = Response<RespBody>>
+        Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
             + Clone
             + Send
             + Sync
@@ -885,13 +870,10 @@ where
     }
 
     /// Set a raw `tower::Service` as the fallback for unmatched paths.
-    ///
-    /// Requires the `tower` feature.
     #[must_use]
-    #[cfg(feature = "tower")]
     pub fn fallback_service<Svc, RespBody>(mut self, service: Svc) -> Self
     where
-        Svc: tower::Service<Request<Bytes>, Response = Response<RespBody>>
+        Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
             + Clone
             + Send
             + Sync
@@ -905,56 +887,71 @@ where
             service,
             strip_prefix: None,
         };
-        self.fallback = Some(Arc::new(move |req, state| handler.clone().call(req, state)));
+        self.fallback = Some(Arc::new(move |state| {
+            Route::from_handler(handler.clone(), state)
+        }));
         self.compiled = None;
         self
     }
 
-    /// Apply a `tower::Layer` to every route **and** the fallback in this router.
-    ///
-    /// Requires the `tower` feature. Prefer `.hoop()`/`.hoop_at()` for new code — this
-    /// exists to bridge in existing Tower/tower-http layers (tracing, compression,
-    /// timeouts) without rewriting them as native middleware.
+    /// Apply a `tower::Layer` to every route **and** the fallback (and
+    /// [`method_not_allowed_fallback`](Self::method_not_allowed_fallback), a
+    /// tachyon addition Axum has no equivalent of) registered **so far** in
+    /// this router — matching `axum::Router::layer`.
     #[must_use]
-    #[cfg(feature = "tower")]
-    pub fn layer<L, RespBody>(self, layer: L) -> Self
+    pub fn layer<L, RespBody>(mut self, layer: L) -> Self
     where
-        L: tower::Layer<tower_compat::NextService<S>> + Clone + Send + Sync + 'static,
-        L::Service: tower::Service<Request<Bytes>, Response = Response<RespBody>> + Send + 'static,
-        <L::Service as tower::Service<Request<Bytes>>>::Future: Send + 'static,
-        <L::Service as tower::Service<Request<Bytes>>>::Error:
+        L: tower::Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<Request<Body>, Response = Response<RespBody>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Future: Send + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Error:
             Into<crate::http::error::Error> + Send,
         RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
         RespBody::Error: Into<crate::http::error::Error>,
     {
-        self.hoop_at(
-            middleware::MiddlewarePosition::First,
-            tower_compat::from_tower_layer(layer),
-        )
+        self.routes = self
+            .routes
+            .into_iter()
+            .map(|(path, mr)| (path, mr.layer(layer.clone())))
+            .collect();
+        if let Some(old) = self.fallback.take() {
+            let layer = layer.clone();
+            self.fallback = Some(Arc::new(move |state| old(state).layer(layer.clone())));
+        }
+        if let Some(old) = self.method_not_allowed_fallback.take() {
+            self.method_not_allowed_fallback =
+                Some(Arc::new(move |state| old(state).layer(layer.clone())));
+        }
+        self.compiled = None;
+        self
     }
 
     /// Apply a `tower::Layer` to every registered route, but *not* the fallback —
     /// matching Axum's distinction between `.layer()` and `.route_layer()`.
-    ///
-    /// Requires the `tower` feature.
     #[must_use]
-    #[cfg(feature = "tower")]
     pub fn route_layer<L, RespBody>(mut self, layer: L) -> Self
     where
-        L: tower::Layer<tower_compat::NextService<S>> + Clone + Send + Sync + 'static,
-        L::Service: tower::Service<Request<Bytes>, Response = Response<RespBody>> + Send + 'static,
-        <L::Service as tower::Service<Request<Bytes>>>::Future: Send + 'static,
-        <L::Service as tower::Service<Request<Bytes>>>::Error:
+        L: tower::Layer<Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<Request<Body>, Response = Response<RespBody>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Future: Send + 'static,
+        <L::Service as tower::Service<Request<Body>>>::Error:
             Into<crate::http::error::Error> + Send,
         RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
         RespBody::Error: Into<crate::http::error::Error>,
     {
-        let mw = tower_compat::from_tower_layer(layer);
-        for (_path, method_router) in &mut self.routes {
-            let m = mw.clone();
-            let old_mr = std::mem::take(method_router);
-            *method_router = old_mr.hoop_at(middleware::MiddlewarePosition::Last, m);
-        }
+        self.routes = self
+            .routes
+            .into_iter()
+            .map(|(path, mr)| (path, mr.layer(layer.clone())))
+            .collect();
         self.compiled = None;
         self
     }
@@ -964,16 +961,12 @@ where
     pub fn fallback<H, T>(mut self, handler: H) -> Self
     where
         H: Handler<T, S>,
-        T: 'static,
+        T: Send + 'static,
     {
-        self.fallback = Some(Arc::new(move |req, state| {
-            let handler = handler.clone();
-            handler.call(req, state)
+        self.fallback = Some(Arc::new(move |state| {
+            Route::from_handler(handler.clone(), state)
         }));
-        #[cfg(feature = "tower")]
-        {
-            self.compiled = None;
-        }
+        self.compiled = None;
         self
     }
 
@@ -984,69 +977,20 @@ where
     pub fn method_not_allowed_fallback<H, T>(mut self, handler: H) -> Self
     where
         H: Handler<T, S>,
-        T: 'static,
+        T: Send + 'static,
     {
-        self.method_not_allowed_fallback = Some(Arc::new(move |req, state| {
-            let handler = handler.clone();
-            handler.call(req, state)
+        self.method_not_allowed_fallback = Some(Arc::new(move |state| {
+            Route::from_handler(handler.clone(), state)
         }));
-        #[cfg(feature = "tower")]
-        {
-            self.compiled = None;
-        }
-        self
-    }
-
-    /// Apply a middleware handler to ALL routes and the fallback registered in this `Router`.
-    #[must_use]
-    pub fn hoop<F, Fut, Res>(self, middleware: F) -> Self
-    where
-        F: Fn(Request<Body>, middleware::Next<S>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = Res> + Send + 'static,
-        Res: IntoResponse + Send + 'static,
-    {
-        self.hoop_at(middleware::MiddlewarePosition::First, middleware)
-    }
-
-    /// Apply a middleware handler at a specific position (First/Last) to ALL routes and the fallback.
-    #[must_use]
-    pub fn hoop_at<F, Fut, Res>(
-        mut self,
-        position: middleware::MiddlewarePosition,
-        middleware: F,
-    ) -> Self
-    where
-        F: Fn(Request<Body>, middleware::Next<S>) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = Res> + Send + 'static,
-        Res: IntoResponse + Send + 'static,
-    {
-        #[cfg(feature = "tower")]
-        {
-            self.compiled = None;
-        }
-        for (_path, method_router) in &mut self.routes {
-            let mw = middleware.clone();
-            let old_mr = std::mem::take(method_router);
-            *method_router = old_mr.hoop_at(position, mw);
-        }
-
-        self.fallback = self
-            .fallback
-            .take()
-            .map(|h| wrap_handler(h, middleware.clone()));
-        self.method_not_allowed_fallback = self
-            .method_not_allowed_fallback
-            .take()
-            .map(|h| wrap_handler(h, middleware));
-
+        self.compiled = None;
         self
     }
 
     /// Sends a `103 Early Hints` response carrying `links` before the handler of any route
     /// registered on this router **so far**.
     ///
-    /// Like [`hoop`](Self::hoop), it wraps the current route table rather than a later one,
-    /// so call it after the routes it should cover. For per-route hints, use
+    /// Like [`layer`](Self::layer), it wraps the current route table rather than a later
+    /// one, so call it after the routes it should cover. For per-route hints, use
     /// [`MethodRouter::early_hints`] instead; for request-dependent hints, extract
     /// [`EarlyHints`](crate::http::early_hints::EarlyHints) in the handler.
     ///
@@ -1075,22 +1019,22 @@ where
         if headers.is_empty() {
             return self;
         }
-        self.hoop(move |req, next| {
+        self.layer(middleware::from_fn(move |req, next| {
             let headers = headers.clone();
             async move {
                 fire_early_hints(&req, headers);
                 next.run(req).await
             }
-        })
+        }))
     }
 
     /// Compresses responses from this router's routes, negotiating the coding against each
     /// request's `Accept-Encoding`.
     ///
-    /// Scoped to the routes registered **so far** — like [`hoop`](Self::hoop), it wraps the
-    /// current route table rather than a later one, so call it after the routes it should
-    /// cover. To compress everything a server produces regardless of which router answered,
-    /// use [`Server::compression`](crate::Server::compression) instead.
+    /// Scoped to the routes registered **so far** — like [`layer`](Self::layer), it wraps
+    /// the current route table rather than a later one, so call it after the routes it
+    /// should cover. To compress everything a server produces regardless of which router
+    /// answered, use [`Server::compression`](crate::Server::compression) instead.
     ///
     /// See [`http::compression`](crate::http::compression) for what is and is not
     /// compressed.
@@ -1108,7 +1052,7 @@ where
         // One `Arc` for the whole router rather than a `Compression` clone per request: the
         // config is read-only once built, so every request can share the same one.
         let compression = std::sync::Arc::new(compression);
-        self.hoop(move |req, next| {
+        self.layer(middleware::from_fn(move |req, next| {
             let compression = std::sync::Arc::clone(&compression);
             async move {
                 // Taken before `next.run` consumes the request; the response it returns is
@@ -1124,7 +1068,7 @@ where
                     None => response,
                 }
             }
-        })
+        }))
     }
 
     /// Route an incoming request directly, compiling the router on the fly.
@@ -1152,25 +1096,26 @@ where
         S: Default,
     {
         let this = self.apply_no_index();
-        let mut matcher: matchit::Router<MethodRouter<S>> = matchit::Router::new();
+        let state = Arc::new(S::default());
+        let mut matcher: matchit::Router<CompiledMethodRouter> = matchit::Router::new();
 
         let mut seen = std::collections::HashSet::new();
         for (path, mut method_router) in this.routes {
             if !seen.insert(path.clone()) {
                 return Err(RouterError::DuplicateRoute(path));
             }
-            method_router.compile_in_place();
             method_router.param_names = extract_param_names(&path);
             method_router.matched_path = Arc::from(path.as_str());
-            matcher.insert(path, method_router)?;
+            let compiled = method_router.materialize(&state);
+            matcher.insert(path, compiled)?;
         }
 
         Ok(CompiledRouter {
             matcher,
-            fallback: this.fallback,
-            method_not_allowed_fallback: this.method_not_allowed_fallback,
-            state: Arc::new(S::default()),
+            fallback: this.fallback.map(|f| f(state.clone())),
+            method_not_allowed_fallback: this.method_not_allowed_fallback.map(|f| f(state.clone())),
             normalize_trailing_slash: this.normalize_trailing_slash,
+            _marker: std::marker::PhantomData,
         })
     }
 }
@@ -1216,13 +1161,32 @@ impl From<matchit::InsertError> for RouterError {
 }
 
 /// A compiled routing table ready to serve requests.
-#[derive(Clone)]
+///
+/// Every route, the fallback, and the method-not-allowed fallback are already
+/// fully materialized [`Route`]s at this point — `S` is kept only as a
+/// phantom type parameter for API-shape continuity (`CompiledRouter<S>`);
+/// dispatch itself needs no further state, since it was bound once, here, at
+/// [`Router::compile`] time.
 pub struct CompiledRouter<S> {
-    matcher: matchit::Router<MethodRouter<S>>,
-    fallback: Option<BoxedHandler<S>>,
-    method_not_allowed_fallback: Option<BoxedHandler<S>>,
-    state: Arc<S>,
+    matcher: matchit::Router<CompiledMethodRouter>,
+    fallback: Option<Route>,
+    method_not_allowed_fallback: Option<Route>,
     normalize_trailing_slash: bool,
+    _marker: std::marker::PhantomData<fn() -> S>,
+}
+
+// Not `#[derive(Clone)]`: that would add a spurious `S: Clone` bound (the
+// derive macro doesn't know `S` is only ever used inside a `PhantomData`).
+impl<S> Clone for CompiledRouter<S> {
+    fn clone(&self) -> Self {
+        Self {
+            matcher: self.matcher.clone(),
+            fallback: self.fallback.clone(),
+            method_not_allowed_fallback: self.method_not_allowed_fallback.clone(),
+            normalize_trailing_slash: self.normalize_trailing_slash,
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<S> std::fmt::Debug for CompiledRouter<S> {
@@ -1364,10 +1328,22 @@ fn discard_body_for_head(resp: &mut Response<Body>) {
     }
 }
 
-impl<S> CompiledRouter<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+/// Runs `route` (a boxed, infallible `tower::Service`) against `req`, matching
+/// the plain `Response<Body>` shape every dispatch call site here wants.
+#[inline]
+async fn call_route(route: &Route, req: Request<Body>) -> Response<Body> {
+    use tower::{Service, ServiceExt};
+    let mut route = route.clone();
+    match route.ready().await {
+        Ok(ready) => match ready.call(req).await {
+            Ok(resp) => resp,
+            Err(never) => match never {},
+        },
+        Err(never) => match never {},
+    }
+}
+
+impl<S> CompiledRouter<S> {
     /// Route an incoming request, returning the resulting HTTP response.
     ///
     /// Routes match **exactly**, as in Axum: `/foo` and `/foo/` are distinct and neither falls
@@ -1401,11 +1377,11 @@ where
             }
         }
 
-        let (method_router, params): RouteResolution<'_, S> = match self.resolve(path) {
+        let (method_router, params): RouteResolution<'_> = match self.resolve(path) {
             Some(r) => r,
             None => {
                 return if let Some(fb) = &self.fallback {
-                    fb(req, self.state.clone()).await
+                    call_route(fb, req).await
                 } else {
                     Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -1456,11 +1432,11 @@ where
             idx
         };
 
-        let handler =
+        let route =
             effective_idx.and_then(|i| method_router.handlers.get(i).and_then(Option::as_ref));
 
-        if let Some(h) = handler {
-            let mut resp = h.call(req, self.state.clone()).await;
+        if let Some(route) = route {
+            let mut resp = call_route(route, req).await;
             // Per HTTP semantics, a HEAD response must never carry a body,
             // regardless of whether it came from an explicit HEAD handler or
             // the implicit GET fallback.
@@ -1471,7 +1447,7 @@ where
         } else if let Some(fb) = &self.method_not_allowed_fallback {
             // Route exists but this method has no handler, and a custom fallback
             // was configured for that case via `Router::method_not_allowed_fallback`.
-            fb(req, self.state.clone()).await
+            call_route(fb, req).await
         } else {
             // Route exists but this method has no handler → 405 with Allow header.
             let allow = method_router.allow_header();
@@ -1485,7 +1461,7 @@ where
 
     /// Internal: attempt to match `path`, returning `RouteResolution`.
     #[inline]
-    fn resolve(&self, path: &str) -> Option<RouteResolution<'_, S>> {
+    fn resolve(&self, path: &str) -> Option<RouteResolution<'_>> {
         let m = self.matcher.at(path).ok()?;
         let params = if m.params.is_empty() {
             extract::PathParamsVec::new()
@@ -1504,7 +1480,7 @@ where
 }
 
 /// Type alias for matched route results to keep signatures clean.
-pub type RouteResolution<'a, S> = (&'a MethodRouter<S>, extract::PathParamsVec);
+pub(crate) type RouteResolution<'a> = (&'a CompiledMethodRouter, extract::PathParamsVec);
 
 #[cfg(test)]
 mod tests {
@@ -1831,7 +1807,7 @@ mod tests {
         // Directly exercising the extractor without going through the router at
         // all (no `MatchedPath` extension present) must reject with 500.
         let mut parts = Request::builder().uri("/").body(()).unwrap().into_parts().0;
-        let res = MatchedPath::from_request_parts(&mut parts, &());
+        let res = MatchedPath::from_request_parts(&mut parts, &()).await;
         assert!(res.is_err());
     }
 
@@ -2081,23 +2057,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_method_router_hoop_installs_middleware() {
+    async fn test_method_router_layer_installs_middleware() {
         async fn handler() -> &'static str {
             "hi"
         }
-        async fn tag_response(req: Request<Body>, next: middleware::Next<()>) -> Response<Body> {
+        async fn tag_response(req: Request<Body>, next: middleware::Next) -> Response<Body> {
             let mut resp = next.run(req).await;
             let _ = resp.headers_mut().insert(
-                hyper::header::HeaderName::from_static("x-mr-hoop"),
+                hyper::header::HeaderName::from_static("x-mr-layer"),
                 hyper::header::HeaderValue::from_static("yes"),
             );
             resp
         }
 
-        // `.hoop()` on a bare `MethodRouter` — distinct from `Router::hoop`,
-        // which never calls through to `MethodRouter::hoop`; it calls
-        // `MethodRouter::hoop_at` directly on every registered route instead.
-        let mr = get(handler).hoop(tag_response);
+        // `.layer()` on a bare `MethodRouter` — distinct from `Router::layer`,
+        // which wraps every registered route's `MethodRouter` the same way,
+        // plus the fallback.
+        let mr = get(handler).layer(middleware::from_fn(tag_response));
         let app = Router::new()
             .route("/x", mr)
             .with_state::<()>(())
@@ -2106,7 +2082,7 @@ mod tests {
 
         let resp = app.handle_request(make_req("GET", "/x")).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("x-mr-hoop").expect("header set"), "yes");
+        assert_eq!(resp.headers().get("x-mr-layer").expect("header set"), "yes");
     }
 
     #[tokio::test]
@@ -2289,7 +2265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hoop_wraps_fallback_and_method_not_allowed_fallback() {
+    async fn test_layer_wraps_fallback_and_method_not_allowed_fallback() {
         async fn get_handler() -> &'static str {
             "got"
         }
@@ -2299,23 +2275,23 @@ mod tests {
         async fn custom_405() -> &'static str {
             "custom-405"
         }
-        async fn tag_response(req: Request<Body>, next: middleware::Next<()>) -> Response<Body> {
+        async fn tag_response(req: Request<Body>, next: middleware::Next) -> Response<Body> {
             let mut resp = next.run(req).await;
             let _ = resp.headers_mut().insert(
-                hyper::header::HeaderName::from_static("x-hoop"),
+                hyper::header::HeaderName::from_static("x-layer"),
                 hyper::header::HeaderValue::from_static("wrapped"),
             );
             resp
         }
 
         // `.fallback()`/`.method_not_allowed_fallback()` must be set *before*
-        // `.hoop()`, since `Router::hoop_at` only wraps whichever of the two
-        // is already installed at the time it runs.
+        // `.layer()`, since it only wraps whichever of the two is already
+        // installed at the time it runs.
         let app = Router::new()
             .route("/x", get(get_handler))
             .fallback(custom_fallback)
             .method_not_allowed_fallback(custom_405)
-            .hoop(tag_response)
+            .layer(middleware::from_fn(tag_response))
             .with_state::<()>(())
             .compile()
             .expect("compile");
@@ -2324,7 +2300,7 @@ mod tests {
         let resp = app.handle_request(make_req("GET", "/x")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("x-hoop").expect("wraps route"),
+            resp.headers().get("x-layer").expect("wraps route"),
             "wrapped"
         );
 
@@ -2332,7 +2308,7 @@ mod tests {
         let resp = app.handle_request(make_req("GET", "/missing")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("x-hoop").expect("wraps fallback"),
+            resp.headers().get("x-layer").expect("wraps fallback"),
             "wrapped"
         );
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -2345,7 +2321,7 @@ mod tests {
         let resp = app.handle_request(make_req("POST", "/x")).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("x-hoop").expect("wraps 405 fallback"),
+            resp.headers().get("x-layer").expect("wraps 405 fallback"),
             "wrapped"
         );
         let body = http_body_util::BodyExt::collect(resp.into_body())
@@ -2377,7 +2353,6 @@ mod tests {
             method_not_allowed_fallback: None,
             normalize_trailing_slash: false,
             no_index: false,
-            #[cfg(feature = "tower")]
             compiled: None,
         };
 

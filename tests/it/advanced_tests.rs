@@ -110,11 +110,11 @@ fn test_custom_crypto_provider() {
 }
 
 #[tokio::test]
-async fn test_hoop_middleware() {
+async fn test_layer_middleware() {
     use hyper::{Request, Response};
-    use tachyon_web::routing::middleware::Next;
+    use tachyon_web::middleware::{self, Next};
 
-    async fn add_header(req: Request<Body>, next: Next<()>) -> Response<Body> {
+    async fn add_header(req: Request<Body>, next: Next) -> Response<Body> {
         let mut res = next.run(req).await;
         let _ = res.headers_mut().insert(
             hyper::header::SERVER,
@@ -127,7 +127,9 @@ async fn test_hoop_middleware() {
         "hello"
     }
 
-    let app = Router::new().route("/hello", get(handler)).hoop(add_header);
+    let app = Router::new()
+        .route("/hello", get(handler))
+        .layer(middleware::from_fn(add_header));
     let server = TestServer::spawn(app).await;
 
     let res = server.get("/hello").send().await.unwrap();
@@ -137,34 +139,40 @@ async fn test_hoop_middleware() {
 }
 
 #[tokio::test]
-async fn test_hoop_at_ordering_and_state() {
+async fn test_layer_ordering_and_state() {
     use hyper::{Request, Response};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tachyon_web::MiddlewarePosition;
-    use tachyon_web::routing::middleware::Next;
+    use tachyon_web::middleware::{self, Next};
 
-    #[derive(Clone)]
-    struct OrderState {
+    // `Next` carries no state (matching Axum's real, state-erased `Next`), so
+    // middleware that needs shared state closes over it directly — the same
+    // pattern any Axum middleware written with a plain closure (rather than
+    // `middleware::from_fn_with_state`) already uses.
+    async fn first_mw(
         counter: Arc<AtomicUsize>,
-    }
-
-    async fn first_mw(req: Request<Body>, next: Next<OrderState>) -> Response<Body> {
-        let counter = next.state().counter.fetch_add(1, Ordering::SeqCst);
+        req: Request<Body>,
+        next: Next,
+    ) -> Response<Body> {
+        let order = counter.fetch_add(1, Ordering::SeqCst);
         let mut res = next.run(req).await;
         let _ = res.headers_mut().insert(
             hyper::header::HeaderName::from_static("x-first-order"),
-            hyper::header::HeaderValue::from_str(&counter.to_string()).unwrap(),
+            hyper::header::HeaderValue::from_str(&order.to_string()).unwrap(),
         );
         res
     }
 
-    async fn last_mw(req: Request<Body>, next: Next<OrderState>) -> Response<Body> {
-        let counter = next.state().counter.fetch_add(1, Ordering::SeqCst);
+    async fn last_mw(
+        counter: Arc<AtomicUsize>,
+        req: Request<Body>,
+        next: Next,
+    ) -> Response<Body> {
+        let order = counter.fetch_add(1, Ordering::SeqCst);
         let mut res = next.run(req).await;
         let _ = res.headers_mut().insert(
             hyper::header::HeaderName::from_static("x-last-order"),
-            hyper::header::HeaderValue::from_str(&counter.to_string()).unwrap(),
+            hyper::header::HeaderValue::from_str(&order.to_string()).unwrap(),
         );
         res
     }
@@ -173,15 +181,12 @@ async fn test_hoop_at_ordering_and_state() {
         "hello"
     }
 
-    let state = OrderState {
-        counter: Arc::new(AtomicUsize::new(0)),
-    };
+    let counter = Arc::new(AtomicUsize::new(0));
 
-    let app = Router::new()
+    let app = Router::<()>::new()
         .route("/hello", get(handler))
-        .hoop_at(MiddlewarePosition::First, first_mw)
-        .hoop_at(MiddlewarePosition::Last, last_mw)
-        .with_state(state);
+        .layer(middleware::from_fn_with_state(counter.clone(), last_mw))
+        .layer(middleware::from_fn_with_state(counter, first_mw));
     let server = TestServer::spawn(app).await;
 
     let res = server.get("/hello").send().await.unwrap();

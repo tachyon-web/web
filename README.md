@@ -60,11 +60,14 @@ The router, extractors (`Path`, `Query`, `Json`, `State`) and `IntoResponse` wor
 in Axum, and the Cargo feature names and defaults match Axum's where the capability is
 shared, so porting a handler or a `Cargo.toml` should be uneventful.
 
-Middleware is the deliberate departure: Tachyon uses its own `.hoop()` rather than
-`tower::Layer`, to avoid the overhead Tower's generic `Service` abstraction adds on the hot
-path. The `tower` feature bridges `tower::Service`/`tower::Layer` back in when reusing an
-existing `tower-http` layer is worth that cost, and also implements `tower::Service` for
-`CompiledRouter` so `app.oneshot(req)` works.
+Middleware is built on `tower::Layer`/`tower::Service` — the same foundation Axum itself
+uses, not a separate bespoke system. `Router::layer`/`route_layer` and
+`MethodRouter::layer` apply any `tower::Layer` (including `tower-http`'s), and
+`middleware::from_fn`/`from_fn_with_state`/`map_request`/`map_response`/`from_extractor`
+mirror `axum::middleware`'s free functions for the common case of writing one without hand-rolling
+a `Layer`/`Service` pair. `tower` is a normal (non-optional) dependency for exactly this
+reason, and `CompiledRouter`/`Router<()>` implement `tower::Service` directly, so
+`app.oneshot(req)` works the same way it does in Axum.
 
 On performance: routing allocates nothing for the common case (arity-0 handlers, no path
 params), static files are served zero-copy from an in-memory cache, and workers are per-core
@@ -311,7 +314,7 @@ Flags shared with Axum keep Axum's name and default:
 | `form` | on | the `Form` extractor |
 | `query` | on | the `Query` extractor |
 | `cookies` | | request `Cookie` parsing and the `Cookies` extractor/`IntoResponseParts` jar (matching `axum-extra`'s `CookieJar`), and the `cookie` dependency |
-| `tower-log` | on | `tower`'s own `log` feature; no effect without `tower` |
+| `tower-log` | on | `tower`'s own `log` feature |
 | `ws` | | WebSocket support (RFC 6455) |
 | `compression-gzip` | | `gzip` response compression |
 | `compression-deflate` | | `deflate` response compression |
@@ -330,7 +333,6 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `sse` | | Server-Sent Events (`response::sse::{Event, Sse, KeepAlive}`) |
 | `sfv` | | Structured Field Values (RFC 9651): the `StructuredHeader` extractor, `sfv_dictionary!`, and the raw `sfv` model re-exports |
 | `early-hints` | | `103 Early Hints` (RFC 8297), plus the native HTTP/2 driver that emits them; needs `tls` |
-| `tower` | | `tower::Service`/`tower::Layer` interop, plus `tower::Service` for `CompiledRouter` |
 | `fips` | | enforce FIPS-mode cryptography at startup; refuses to start otherwise; needs `tls` |
 | `tor` | | Tor v3 `.onion` support (`Server::serve_tor`/`serve_onion`) via `arti-client` |
 | `i2p` | | I2P `.b32.i2p` support (`Server::serve_i2p`/`serve_i2p_config`) via an embedded `libi2pd`. Links `unsafe` FFI — see [Tor and I2P](#tor-and-i2p) |

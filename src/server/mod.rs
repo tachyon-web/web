@@ -60,10 +60,12 @@ mod http;
 #[cfg(feature = "i2p")]
 pub mod i2p;
 mod multi;
+pub mod serve;
 #[cfg(feature = "tor")]
 pub mod tor;
 
 pub use multi::MultiServer;
+pub use serve::{Serve, WithGracefulShutdown};
 
 use crate::routing::CompiledRouter;
 use std::future::Future;
@@ -1415,6 +1417,13 @@ pub async fn serve_http_redirect_and_challenges(
 /// This resolves the listener's local address, automatically compiles the router,
 /// and runs the high-performance worker pool.
 ///
+/// Matches `axum::serve`'s shape: the returned [`Serve`] implements
+/// [`IntoFuture`](std::future::IntoFuture), so `serve(listener, router).await`
+/// behaves exactly like the old `async fn` version did, while
+/// `serve(listener, router).with_graceful_shutdown(signal).await` is now also
+/// available — see [`Serve::with_graceful_shutdown`] for the one real
+/// behavioral difference from Axum's version.
+///
 /// # `listener` is rebound, not adopted
 ///
 /// The worker pool binds one `SO_REUSEPORT` socket per core, so `listener` is read for its
@@ -1424,20 +1433,8 @@ pub async fn serve_http_redirect_and_challenges(
 /// to port `0` resolves to a concrete port first, so the workers all land on the same one.
 /// Pass the address to [`Server::start_http`]/[`Server::start_http_addr`] instead if you'd
 /// rather never hold the binding twice.
-///
-/// # Errors
-///
-/// Returns an error if compiling the router fails, or if binding/running the server workers fails.
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    router: crate::routing::Router<()>,
-) -> Result<(), std::io::Error> {
-    let addr = listener.local_addr()?;
-    // drop the listener so the port is free to bind SO_REUSEPORT sockets in the worker pool
-    drop(listener);
-
-    let server = Server::new(router);
-    server.start_http_addr(addr).await
+pub const fn serve(listener: tokio::net::TcpListener, router: crate::routing::Router<()>) -> Serve {
+    Serve { listener, router }
 }
 
 /// Configuration for custom rustls server.

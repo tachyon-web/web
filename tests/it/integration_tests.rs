@@ -319,7 +319,7 @@ async fn test_default_body_limit_override_is_stricter_than_server_default() {
     // Server-wide limit is generous (1 MiB); the route overrides it down to 10 bytes.
     let app = Router::new()
         .route("/upload", post(handler))
-        .hoop(DefaultBodyLimit::max(10).into_middleware())
+        .layer(DefaultBodyLimit::max(10))
         .with_state(());
     let server = TestServer::spawn_with(app, |s| s.max_body_size(1024 * 1024)).await;
 
@@ -348,7 +348,7 @@ async fn test_default_body_limit_disable_allows_large_body() {
     // Server-wide limit is tiny; the route disables it entirely.
     let app = Router::new()
         .route("/upload", post(handler))
-        .hoop(DefaultBodyLimit::disable().into_middleware())
+        .layer(DefaultBodyLimit::disable())
         .with_state(());
     let server = TestServer::spawn_with(app, |s| s.max_body_size(10)).await;
 

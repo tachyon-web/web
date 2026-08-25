@@ -46,7 +46,7 @@ struct EchoUriService {
     last_uri: Arc<Mutex<String>>,
 }
 
-impl Service<Request<Bytes>> for EchoUriService {
+impl Service<Request<Body>> for EchoUriService {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -55,7 +55,7 @@ impl Service<Request<Bytes>> for EchoUriService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: Request<Bytes>) -> Self::Future {
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
         let uri = req.uri().to_string();
         self.last_uri.lock().unwrap().clone_from(&uri);
         Box::pin(async move { Ok(Response::new(Full::new(Bytes::from(uri)))) })
@@ -131,7 +131,7 @@ async fn test_compiled_router_oneshot() {
 #[derive(Clone)]
 struct AlwaysFailsReady;
 
-impl Service<Request<Bytes>> for AlwaysFailsReady {
+impl Service<Request<Body>> for AlwaysFailsReady {
     type Response = Response<Full<Bytes>>;
     type Error = std::io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -140,7 +140,7 @@ impl Service<Request<Bytes>> for AlwaysFailsReady {
         Poll::Ready(Err(std::io::Error::other("never ready")))
     }
 
-    fn call(&mut self, _req: Request<Bytes>) -> Self::Future {
+    fn call(&mut self, _req: Request<Body>) -> Self::Future {
         unreachable!("poll_ready always errors, so ready() never lets call() run")
     }
 }
@@ -151,7 +151,7 @@ impl Service<Request<Bytes>> for AlwaysFailsReady {
 #[derive(Clone)]
 struct AlwaysFailsCall;
 
-impl Service<Request<Bytes>> for AlwaysFailsCall {
+impl Service<Request<Body>> for AlwaysFailsCall {
     type Response = Response<Full<Bytes>>;
     type Error = std::io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -160,7 +160,7 @@ impl Service<Request<Bytes>> for AlwaysFailsCall {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _req: Request<Bytes>) -> Self::Future {
+    fn call(&mut self, _req: Request<Body>) -> Self::Future {
         Box::pin(async { Err(std::io::Error::other("call always fails")) })
     }
 }
@@ -292,12 +292,15 @@ async fn test_layer_surfaces_service_call_failure_as_500() {
 }
 
 /// `ServiceHandler::call` (the `route_service`/`nest_service`/
-/// `fallback_service` path) must reject an oversized body with 413 rather
-/// than buffering it unbounded — the same `collect_bytes(limit)` err branch
-/// `from_tower_layer` also has.
+/// `fallback_service` path) hands the mounted service the request body as a
+/// live stream, with no implicit size limit or forced buffering — matching
+/// Axum exactly (Axum's own mounted `tower::Service`s aren't auto-buffered
+/// either; a service that never reads the body is never charged for its
+/// size, and one that does is responsible for its own limit, e.g. via
+/// `http_body_util::Limited`).
 #[tokio::test]
-async fn test_route_service_rejects_oversized_body() {
-    let (svc, _last_uri) = echo_service();
+async fn test_route_service_streams_an_oversized_body_through_unbuffered() {
+    let (svc, last_uri) = echo_service();
     let router = compile(Router::new().route_service("/echo", svc));
 
     let oversized = vec![0u8; 2 * 1024 * 1024 + 1];
@@ -307,7 +310,11 @@ async fn test_route_service_rejects_oversized_body() {
         .body(Body::full(Bytes::from(oversized)))
         .unwrap();
     let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // `EchoUriService` never reads the body at all, so an oversized one is
+    // no obstacle — exactly as it wouldn't be for the same service mounted
+    // under a real Axum `Router`.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(*last_uri.lock().unwrap(), "/echo");
 }
 
 /// A raw `tower::Service` mounted via `route_service` whose `poll_ready`

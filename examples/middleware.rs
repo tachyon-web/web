@@ -1,12 +1,14 @@
-//! `hoop` middleware: global vs nested scope, ordering via `hoop_at`, and reading shared
-//! state from inside a middleware with `next.state()`.
+//! Middleware via `tower::Layer` (`Router::layer`): global vs nested scope,
+//! ordering, and reading shared state from inside a middleware bound via
+//! `middleware::from_fn_with_state`.
 
 use std::net::SocketAddr;
 use std::time::Instant;
 use tachyon_web::http::header::AUTHORIZATION;
 use tachyon_web::http::{Request, StatusCode};
 use tachyon_web::{
-    MiddlewarePosition, Next, Router,
+    Next, Router,
+    middleware::{from_fn, from_fn_with_state},
     response::{Body, IntoResponse},
     routing::get,
 };
@@ -16,7 +18,7 @@ struct AppState {
     expected_token: String,
 }
 
-async fn request_timer(req: Request<Body>, next: Next<AppState>) -> impl IntoResponse {
+async fn request_timer(req: Request<Body>, next: Next) -> impl IntoResponse {
     let start = Instant::now();
     let path = req.uri().path().to_owned();
 
@@ -26,8 +28,7 @@ async fn request_timer(req: Request<Body>, next: Next<AppState>) -> impl IntoRes
     response
 }
 
-async fn mock_auth(req: Request<Body>, next: Next<AppState>) -> impl IntoResponse {
-    let state = next.state();
+async fn mock_auth(state: AppState, req: Request<Body>, next: Next) -> impl IntoResponse {
     let expected_auth_header = format!("Bearer {}", state.expected_token);
 
     let is_authorized = req
@@ -64,13 +65,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let secure_router = Router::new()
         .route("/data", get(secure_data))
-        .hoop_at(MiddlewarePosition::First, mock_auth);
+        .layer(from_fn_with_state(state.clone(), mock_auth));
 
-    // `.hoop` is shorthand for `.hoop_at(MiddlewarePosition::First, ...)`.
+    // `Next` carries no state (matching Axum): `mock_auth` gets it bound via
+    // `from_fn_with_state` instead of reading it off `Next`.
     let app = Router::new()
         .route("/", get(index))
         .nest("/secure", secure_router)
-        .hoop(request_timer)
+        .layer(from_fn(request_timer))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));

@@ -140,18 +140,19 @@ macro_rules! impl_handler {
         {
             #[allow(non_snake_case, unused_mut)]
             fn call(self, req: Request<Body>, state: Arc<S>) -> BoxedFuture {
-                let (mut parts, body) = req.into_parts();
-                $(
-                    let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &*state) {
-                        Ok(v) => v,
-                        Err(r) => return ResponseFuture::Ready(Some(r.into_response())),
-                    };
-                )*
-                // The last extractor is `FromRequest`, which is `async` (it may need to
-                // await the body being streamed in) — so, unlike the parts extractors
-                // above, it can't be resolved before deciding Ready vs. Boxed. Every
-                // handler with at least one argument therefore goes through `Boxed`.
+                // Both `FromRequestParts` and the last `FromRequest` extractor are
+                // `async` (parts extractors may now await too, matching Axum's
+                // `FromRequestParts`), so none of them can be resolved before deciding
+                // Ready vs. Boxed. Every handler with at least one argument therefore
+                // goes through `Boxed` regardless of which extractor rejects first.
                 ResponseFuture::Boxed(Box::pin(async move {
+                    let (mut parts, body) = req.into_parts();
+                    $(
+                        let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &*state).await {
+                            Ok(v) => v,
+                            Err(r) => return r.into_response(),
+                        };
+                    )*
                     let req = Request::from_parts(parts, body);
                     let $last = match <$last as FromRequest<S>>::from_request(req, &*state).await {
                         Ok(v) => v,
@@ -173,15 +174,15 @@ macro_rules! impl_handler {
         {
             #[allow(non_snake_case, unused_mut)]
             fn call(self, req: Request<Body>, state: Arc<S>) -> BoxedFuture {
-                let (mut parts, body) = req.into_parts();
-                $(
-                    let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &*state) {
-                        Ok(v) => v,
-                        Err(r) => return ResponseFuture::Ready(Some(r.into_response())),
-                    };
-                )*
                 // See the async version above for why this can't stay on the `Ready` path.
                 ResponseFuture::Boxed(Box::pin(async move {
+                    let (mut parts, body) = req.into_parts();
+                    $(
+                        let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &*state).await {
+                            Ok(v) => v,
+                            Err(r) => return r.into_response(),
+                        };
+                    )*
                     let req = Request::from_parts(parts, body);
                     let $last = match <$last as FromRequest<S>>::from_request(req, &*state).await {
                         Ok(v) => v,
@@ -217,16 +218,16 @@ mod tests {
     use super::*;
 
     struct FailParts;
-    impl<S> FromRequestParts<S> for FailParts {
+    impl<S: Sync> FromRequestParts<S> for FailParts {
         type Rejection = crate::http::error::Error;
         fn from_request_parts(
             _parts: &mut hyper::http::request::Parts,
             _state: &S,
-        ) -> Result<Self, Self::Rejection> {
-            Err(crate::http::error::Error::Rejection {
+        ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+            std::future::ready(Err(crate::http::error::Error::Rejection {
                 status: hyper::StatusCode::BAD_REQUEST,
                 message: "parts fail".to_string(),
-            })
+            }))
         }
     }
 
@@ -245,13 +246,13 @@ mod tests {
     }
 
     struct SucceedParts;
-    impl<S> FromRequestParts<S> for SucceedParts {
+    impl<S: Sync> FromRequestParts<S> for SucceedParts {
         type Rejection = crate::http::error::Error;
         fn from_request_parts(
             _parts: &mut hyper::http::request::Parts,
             _state: &S,
-        ) -> Result<Self, Self::Rejection> {
-            Ok(Self)
+        ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+            std::future::ready(Ok(Self))
         }
     }
 

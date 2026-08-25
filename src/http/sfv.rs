@@ -724,7 +724,7 @@ fn join_header<'a>(
 }
 
 #[cfg(feature = "sfv")]
-impl<S, T> crate::routing::extract::FromRequestParts<S> for StructuredHeader<T>
+impl<S: Sync, T> crate::routing::extract::FromRequestParts<S> for StructuredHeader<T>
 where
     T: FromStructuredHeader + Send,
 {
@@ -733,17 +733,20 @@ where
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> std::result::Result<Self, Self::Rejection> {
+    ) -> impl std::future::Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
         let mut buf = JoinBuf::new();
-        let bytes = join_header(&parts.headers, T::HEADER_NAME, &mut buf).ok_or_else(|| {
-            crate::http::error::Error::Rejection {
-                status: hyper::StatusCode::BAD_REQUEST,
-                message: format!("missing `{}` header", T::HEADER_NAME),
-            }
-        })??;
-        T::parse_field(bytes)
-            .map(Self)
-            .map_err(crate::http::error::Error::from)
+        let result = (|| {
+            let bytes = join_header(&parts.headers, T::HEADER_NAME, &mut buf).ok_or_else(|| {
+                crate::http::error::Error::Rejection {
+                    status: hyper::StatusCode::BAD_REQUEST,
+                    message: format!("missing `{}` header", T::HEADER_NAME),
+                }
+            })??;
+            T::parse_field(bytes)
+                .map(Self)
+                .map_err(crate::http::error::Error::from)
+        })();
+        std::future::ready(result)
     }
 }
 
@@ -954,25 +957,31 @@ mod tests {
         req.into_parts().0
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "sfv")]
-    fn extractor_parses_rejects_and_joins() {
+    async fn extractor_parses_rejects_and_joins() {
         let mut parts = parts_with(&["u=1, i"]);
         let StructuredHeader(p) =
-            StructuredHeader::<Priority>::from_request_parts(&mut parts, &()).unwrap();
+            StructuredHeader::<Priority>::from_request_parts(&mut parts, &())
+                .await
+                .unwrap();
         assert_eq!(p.urgency(), 1);
         assert!(p.incremental);
 
         // Repeated lines are joined into one field.
         let mut parts = parts_with(&["u=2", "i"]);
         let StructuredHeader(p) =
-            StructuredHeader::<Priority>::from_request_parts(&mut parts, &()).unwrap();
+            StructuredHeader::<Priority>::from_request_parts(&mut parts, &())
+                .await
+                .unwrap();
         assert_eq!(p.urgency(), 2);
         assert!(p.incremental);
 
         // Missing header and malformed field both reject with 400.
         for parts in [&mut parts_with(&[]), &mut parts_with(&["u=$$$"])] {
-            let err = StructuredHeader::<Priority>::from_request_parts(parts, &()).unwrap_err();
+            let err = StructuredHeader::<Priority>::from_request_parts(parts, &())
+                .await
+                .unwrap_err();
             assert!(matches!(
                 err,
                 crate::http::error::Error::Rejection { status, .. }
@@ -981,12 +990,16 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "sfv")]
-    fn extractor_rejects_oversized_joined_headers() {
+    async fn extractor_rejects_oversized_joined_headers() {
         let chunk = "u=1".to_string() + &";p=1".repeat(1000);
         let values = vec![chunk.as_str(); 64];
         let mut parts = parts_with(&values);
-        assert!(StructuredHeader::<Priority>::from_request_parts(&mut parts, &()).is_err());
+        assert!(
+            StructuredHeader::<Priority>::from_request_parts(&mut parts, &())
+                .await
+                .is_err()
+        );
     }
 }

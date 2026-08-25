@@ -761,19 +761,19 @@ impl EarlyHints {
     }
 }
 
-impl<S> crate::routing::extract::FromRequestParts<S> for EarlyHints {
+impl<S: Sync> crate::routing::extract::FromRequestParts<S> for EarlyHints {
     /// Extraction cannot fail — an unsupported transport yields a no-op handle.
     type Rejection = std::convert::Infallible;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(parts
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Ok(parts
             .extensions
             .get::<Self>()
             .cloned()
-            .unwrap_or_else(Self::disabled))
+            .unwrap_or_else(Self::disabled)))
     }
 }
 

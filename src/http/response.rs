@@ -12,7 +12,7 @@ use http_body_util::Full;
 use http_body_util::combinators::UnsyncBoxBody as BoxBody;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use hyper::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
-use hyper::{Response, StatusCode};
+use hyper::{Response as HttpResponse, StatusCode};
 #[cfg(feature = "json")]
 use serde::Serialize;
 use std::pin::Pin;
@@ -101,6 +101,16 @@ impl Body {
     }
 }
 
+/// Buffers `body` into a single [`Bytes`], rejecting bodies over `limit`.
+/// Free-function form of [`Body::collect_bytes`], matching `axum::body::to_bytes`.
+///
+/// # Errors
+///
+/// Returns an error if `body` exceeds `limit` or otherwise fails to read.
+pub async fn to_bytes(body: Body, limit: usize) -> Result<Bytes, crate::http::error::Error> {
+    body.collect_bytes(limit).await
+}
+
 impl HyperBody for Body {
     type Data = Bytes;
     type Error = crate::http::error::Error;
@@ -140,28 +150,31 @@ impl HyperBody for Body {
     }
 }
 
+/// A Tachyon HTTP response, named to match `axum::response::Response` exactly.
+pub type Response = HttpResponse<Body>;
+
 /// Trait for generating an HTTP response.
 pub trait IntoResponse {
-    /// Convert the type into a `Response<Body>`.
-    fn into_response(self) -> Response<Body>;
+    /// Convert the type into a [`Response`].
+    fn into_response(self) -> Response;
 }
 
-impl IntoResponse for Response<Body> {
+impl IntoResponse for Response {
     fn into_response(self) -> Self {
         self
     }
 }
 
-impl IntoResponse for Response<Full<Bytes>> {
-    fn into_response(self) -> Response<Body> {
+impl IntoResponse for HttpResponse<Full<Bytes>> {
+    fn into_response(self) -> Response {
         let (parts, body) = self.into_parts();
-        Response::from_parts(parts, Body::Full(body))
+        HttpResponse::from_parts(parts, Body::Full(body))
     }
 }
 
 impl IntoResponse for StatusCode {
-    fn into_response(self) -> Response<Body> {
-        let mut res = Response::new(Body::empty());
+    fn into_response(self) -> Response {
+        let mut res = HttpResponse::new(Body::empty());
         *res.status_mut() = self;
         res
     }
@@ -173,8 +186,8 @@ const OCTET_STREAM: &str = "application/octet-stream";
 
 /// A `200 OK` response carrying `bytes` under a fixed `Content-Type` — the shape every
 /// body-only [`IntoResponse`] impl below produces.
-pub(crate) fn with_content_type(bytes: Bytes, content_type: &'static str) -> Response<Body> {
-    let mut res = Response::new(Body::full(bytes));
+pub(crate) fn with_content_type(bytes: Bytes, content_type: &'static str) -> Response {
+    let mut res = HttpResponse::new(Body::full(bytes));
     let _ = res
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -182,25 +195,25 @@ pub(crate) fn with_content_type(bytes: Bytes, content_type: &'static str) -> Res
 }
 
 impl IntoResponse for String {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         with_content_type(Bytes::from(self), TEXT_PLAIN)
     }
 }
 
 impl IntoResponse for &'static str {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         with_content_type(Bytes::from_static(self.as_bytes()), TEXT_PLAIN)
     }
 }
 
 impl IntoResponse for Vec<u8> {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         with_content_type(Bytes::from(self), OCTET_STREAM)
     }
 }
 
 impl IntoResponse for &'static [u8] {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         with_content_type(Bytes::from_static(self), OCTET_STREAM)
     }
 }
@@ -213,7 +226,7 @@ impl<T> IntoResponse for Html<T>
 where
     T: Into<Bytes>,
 {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         with_content_type(self.0.into(), TEXT_HTML)
     }
 }
@@ -250,7 +263,7 @@ impl<T> IntoResponse for Json<T>
 where
     T: Serialize,
 {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         match serialize_json(&self.0) {
             Ok(bytes) => with_content_type(bytes, "application/json"),
             Err(err) => (
@@ -305,7 +318,7 @@ impl<R> IntoResponse for (StatusCode, R)
 where
     R: IntoResponse,
 {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         let (status, res) = self;
         let mut response = res.into_response();
         *response.status_mut() = status;
@@ -325,7 +338,7 @@ where
 /// so implementors can attach headers/extensions without unpacking the whole response.
 #[derive(Debug)]
 pub struct ResponseParts {
-    res: Response<Body>,
+    res: Response,
 }
 
 impl ResponseParts {
@@ -452,7 +465,7 @@ macro_rules! impl_into_response_for_parts_tuples {
             R: IntoResponse,
             $( $T: IntoResponseParts, )+
         {
-            fn into_response(self) -> Response<Body> {
+            fn into_response(self) -> Response {
                 #[allow(non_snake_case)]
                 let ($($T,)+ res) = self;
                 let mut parts = ResponseParts { res: res.into_response() };
@@ -471,7 +484,7 @@ macro_rules! impl_into_response_for_parts_tuples {
             R: IntoResponse,
             $( $T: IntoResponseParts, )+
         {
-            fn into_response(self) -> Response<Body> {
+            fn into_response(self) -> Response {
                 #[allow(non_snake_case)]
                 let (status, $($T,)+ res) = self;
                 let mut response = <($($T,)+ R) as IntoResponse>::into_response(($($T,)+ res));
@@ -492,11 +505,11 @@ impl_into_response_for_parts_tuples!(T1, T2, T3, T4, T5, T6, T7);
 impl_into_response_for_parts_tuples!(T1, T2, T3, T4, T5, T6, T7, T8);
 
 impl IntoResponse for () {
-    fn into_response(self) -> Response<Body> {
-        Response::builder()
+    fn into_response(self) -> Response {
+        HttpResponse::builder()
             .status(StatusCode::OK)
             .body(Body::empty())
-            .unwrap_or_else(|_| Response::new(Body::empty()))
+            .unwrap_or_else(|_| HttpResponse::new(Body::empty()))
     }
 }
 
@@ -505,7 +518,7 @@ where
     T: IntoResponse,
     E: IntoResponse,
 {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         match self {
             Ok(value) => value.into_response(),
             Err(err) => err.into_response(),
@@ -514,12 +527,69 @@ where
 }
 
 impl IntoResponse for std::convert::Infallible {
-    fn into_response(self) -> Response<Body> {
+    fn into_response(self) -> Response {
         match self {}
     }
 }
 
-/// Response that redirects the client to another location.
+/// A `204 No Content` response with no body. Matches `axum::response::NoContent`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoContent;
+
+impl IntoResponse for NoContent {
+    fn into_response(self) -> Response {
+        StatusCode::NO_CONTENT.into_response()
+    }
+}
+
+/// A type-erased response, for `?`-based error handling.
+///
+/// Lets handlers return one of several unrelated error types via `?`
+/// (anything implementing [`IntoResponse`] converts into this automatically).
+/// Matches `axum_core::response::ErrorResponse`.
+///
+/// ```rust
+/// use tachyon_web::response::ErrorResponse;
+/// use hyper::StatusCode;
+///
+/// fn handler(fail: bool) -> Result<&'static str, ErrorResponse> {
+///     if fail {
+///         return Err(StatusCode::BAD_REQUEST.into());
+///     }
+///     Ok("ok")
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ErrorResponse(Response);
+
+impl<T> From<T> for ErrorResponse
+where
+    T: IntoResponse,
+{
+    fn from(value: T) -> Self {
+        Self(value.into_response())
+    }
+}
+
+// Deliberately *not* a generic `impl IntoResponse for ErrorResponse`: that
+// would collide with core's blanket `impl<T> From<T> for T` against the
+// `From<T: IntoResponse>` impl above (`T = ErrorResponse` would satisfy
+// both). Matching `axum_core`'s own resolution: give `Result<T,
+// ErrorResponse>` its own concrete `IntoResponse` impl instead of routing
+// through the generic `Result<T, E: IntoResponse>` one below.
+impl<T> IntoResponse for Result<T, ErrorResponse>
+where
+    T: IntoResponse,
+{
+    fn into_response(self) -> Response {
+        match self {
+            Ok(value) => value.into_response(),
+            Err(ErrorResponse(resp)) => resp,
+        }
+    }
+}
+
+/// A response that redirects the client to another location.
 #[derive(Debug, Clone)]
 pub struct Redirect {
     status_code: StatusCode,
@@ -567,8 +637,8 @@ impl Redirect {
 }
 
 impl IntoResponse for Redirect {
-    fn into_response(self) -> Response<Body> {
-        let mut resp = Response::new(Body::empty());
+    fn into_response(self) -> Response {
+        let mut resp = HttpResponse::new(Body::empty());
         *resp.status_mut() = self.status_code;
         let _ = resp
             .headers_mut()
@@ -583,6 +653,36 @@ mod tests {
     #[cfg(feature = "cookies")]
     use crate::routing::extract::Cookies;
     use hyper::HeaderMap;
+
+    #[test]
+    fn no_content_is_204_with_empty_body() {
+        let resp = NoContent.into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn error_response_carries_through_status_and_message() {
+        fn handler(fail: bool) -> Result<&'static str, ErrorResponse> {
+            if fail {
+                return Err(StatusCode::IM_A_TEAPOT.into());
+            }
+            Ok("ok")
+        }
+
+        let ok_resp = handler(false).into_response();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+
+        let err_resp = handler(true).into_response();
+        assert_eq!(err_resp.status(), StatusCode::IM_A_TEAPOT);
+    }
+
+    #[tokio::test]
+    async fn to_bytes_free_function_matches_method_form() {
+        let body = Body::full(Bytes::from("hello"));
+        let bytes = to_bytes(body, 1024).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"hello");
+    }
 
     #[test]
     fn test_body_debug_and_size_hint() {
@@ -636,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_into_response_implementations() {
-        let full_resp = Response::new(Full::new(Bytes::from("abc")));
+        let full_resp = HttpResponse::new(Full::new(Bytes::from("abc")));
         let r1 = full_resp.into_response();
         assert_eq!(r1.status(), StatusCode::OK);
 
@@ -716,7 +816,7 @@ mod tests {
     #[test]
     fn response_parts_extensions_mut_is_reachable_directly() {
         let mut parts = ResponseParts {
-            res: Response::new(Body::empty()),
+            res: HttpResponse::new(Body::empty()),
         };
         let _ = parts.extensions_mut().insert(7u32);
         assert_eq!(parts.res.extensions().get::<u32>(), Some(&7));

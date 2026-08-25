@@ -49,7 +49,6 @@ mod i2p_tests;
 mod tls_h3_tests;
 #[cfg(feature = "tor")]
 mod tor_tests;
-#[cfg(feature = "tower")]
 mod tower_tests;
 #[cfg(feature = "ws")]
 mod ws_tests;

@@ -56,6 +56,42 @@ pub use deflate::DeflateConfig;
 pub use socket::{Message, WebSocket};
 pub use tungstenite::protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode};
 
+/// Named WebSocket close-code constants (RFC 6455 §7.4).
+///
+/// Matches `axum::extract::ws::close_code`. tachyon's [`CloseCode`] is
+/// `tungstenite`'s own enum rather than axum's bare `u16` alias (see the
+/// module-level `[DIFFERS]` entry in `AXUM_PARITY_GAPS.md`), so these are
+/// plain `u16` constants for direct comparison against a raw close-frame
+/// code, exactly as in axum.
+pub mod close_code {
+    /// Normal, successful closure — the purpose the connection was opened for has been fulfilled.
+    pub const NORMAL: u16 = 1000;
+    /// The endpoint is going away (server shutdown, browser navigating away).
+    pub const AWAY: u16 = 1001;
+    /// The endpoint is terminating the connection due to a protocol error.
+    pub const PROTOCOL: u16 = 1002;
+    /// The endpoint received data it can't accept (e.g. non-UTF-8 text).
+    pub const UNSUPPORTED: u16 = 1003;
+    /// Reserved: no status code was present, even though one was expected.
+    pub const STATUS: u16 = 1005;
+    /// Reserved: the connection was closed abnormally, without a close frame.
+    pub const ABNORMAL: u16 = 1006;
+    /// The endpoint received data inconsistent with the message type (e.g. non-UTF-8 in a text message).
+    pub const INVALID: u16 = 1007;
+    /// The endpoint received a message violating its policy.
+    pub const POLICY: u16 = 1008;
+    /// The endpoint received a message too large to process.
+    pub const SIZE: u16 = 1009;
+    /// The client expected the server to negotiate one or more extensions it didn't.
+    pub const EXTENSION: u16 = 1010;
+    /// The server encountered an unexpected condition preventing it from fulfilling the request.
+    pub const ERROR: u16 = 1011;
+    /// Reserved: the connection was closed due to a failure to perform a TLS handshake.
+    pub const RESTART: u16 = 1012;
+    /// The service is restarting.
+    pub const AGAIN: u16 = 1013;
+}
+
 /// Extractor for establishing a WebSocket connection out of an HTTP/1.1 (or, with the `http2`
 /// feature, HTTP/2 extended-`CONNECT`) request.
 ///

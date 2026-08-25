@@ -1,5 +1,8 @@
 //! Type-safe request extractors.
 
+/// Per-extractor rejection types, matching `axum::extract::rejection`.
+pub mod rejection;
+
 /// WebSocket upgrade extractor and connection types (`WebSocketUpgrade`,
 /// `WebSocket`, `Message`, ...) — re-exported here at the same path Axum uses
 /// (`axum::extract::ws`), so `use tachyon_web::extract::ws::*;` matches
@@ -30,9 +33,13 @@ use std::convert::Infallible;
 use std::future::Future;
 
 /// Trait for extracting data from request parts (metadata).
-pub trait FromRequestParts<S>: Sized + Send {
+///
+/// `async fn`, matching `axum::extract::FromRequestParts` exactly — most built-in
+/// impls here don't need to await anything and resolve immediately, but a user
+/// extractor that needs to (e.g. a database round trip keyed off a header) can.
+pub trait FromRequestParts<S: Sync>: Sized + Send {
     /// The rejection type returned if extraction fails.
-    type Rejection: crate::http::response::IntoResponse + Send + 'static;
+    type Rejection: crate::http::response::IntoResponse;
 
     /// Extract this type from the request parts and state.
     ///
@@ -42,7 +49,7 @@ pub trait FromRequestParts<S>: Sized + Send {
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         state: &S,
-    ) -> Result<Self, Self::Rejection>;
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send;
 }
 
 /// Trait for extracting data from a request (possibly consuming the body).
@@ -54,7 +61,7 @@ pub trait FromRequestParts<S>: Sized + Send {
 /// which stays synchronous and is cheaper to call.
 pub trait FromRequest<S: Sync>: Sized + Send {
     /// The rejection type returned if extraction fails.
-    type Rejection: crate::http::response::IntoResponse + Send + 'static;
+    type Rejection: crate::http::response::IntoResponse;
 
     /// Extract this type from the request and state.
     ///
@@ -91,19 +98,10 @@ pub(crate) fn max_body_size(extensions: &hyper::http::Extensions) -> usize {
 }
 
 /// Overrides the request-body size limit enforced by the `Bytes`/`String`/
-/// `Json`/`Form` extractors, for a specific set of routes. Mirrors
-/// `axum::extract::DefaultBodyLimit`.
+/// `Json`/`Form` extractors, for a specific set of routes.
 ///
-/// # Applying it
-///
-/// Axum applies this as a `tower::Layer`: `.layer(DefaultBodyLimit::max(n))`.
-/// Tachyon's body-size check is a plain extension read rather than a
-/// byte-buffering Tower layer (buffering happens lazily, only when an
-/// extractor that needs the body actually runs) — bridging this through
-/// `.layer()` would buffer the body under the *old* limit before the layer
-/// ever got a chance to install the new one, silently defeating the override.
-/// Apply it the native way instead, via [`DefaultBodyLimit::into_middleware`]
-/// and [`crate::routing::Router::hoop`]/[`crate::routing::MethodRouter::hoop`]:
+/// Mirrors `axum::extract::DefaultBodyLimit`, including how it's applied —
+/// as a real `tower::Layer`:
 ///
 /// ```rust,no_run
 /// use tachyon_web::extract::DefaultBodyLimit;
@@ -113,8 +111,13 @@ pub(crate) fn max_body_size(extensions: &hyper::http::Extensions) -> usize {
 ///
 /// let _app: Router<()> = Router::new()
 ///     .route("/upload", get(upload))
-///     .hoop(DefaultBodyLimit::max(50 * 1024 * 1024).into_middleware());
+///     .layer(DefaultBodyLimit::max(50 * 1024 * 1024));
 /// ```
+///
+/// Unlike a foreign Tower body-limit layer, this never buffers the body
+/// itself — it only sets an extension the `Bytes`/`String`/`Json`/`Form`
+/// extractors read lazily, when (and if) they actually buffer the body
+/// themselves — so layering order relative to *this* layer doesn't matter.
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultBodyLimit {
     /// `None` means disabled (`usize::MAX`).
@@ -135,30 +138,46 @@ impl DefaultBodyLimit {
     pub const fn disable() -> Self {
         Self { limit: None }
     }
+}
 
-    /// Turns this into native middleware, for use with `.hoop()`/`.hoop_at()`.
-    pub fn into_middleware<S>(
-        self,
-    ) -> impl Fn(hyper::Request<Body>, crate::routing::middleware::Next<S>) -> BoxedResponseFuture
-    + Clone
-    + Send
-    + Sync
-    + 'static
-    where
-        S: Send + Sync + 'static,
-    {
-        let limit = self.limit.unwrap_or(usize::MAX);
-        move |mut req: hyper::Request<Body>, next: crate::routing::middleware::Next<S>| {
-            let _ = req.extensions_mut().insert(MaxBodySize(limit));
-            let future: BoxedResponseFuture = Box::pin(next.run(req));
-            future
+impl tower::Layer<crate::routing::Route> for DefaultBodyLimit {
+    type Service = DefaultBodyLimitService;
+
+    fn layer(&self, inner: crate::routing::Route) -> Self::Service {
+        DefaultBodyLimitService {
+            limit: self.limit.unwrap_or(usize::MAX),
+            inner,
         }
     }
 }
 
-/// A boxed future resolving to an HTTP response, used by
-/// [`DefaultBodyLimit::into_middleware`]'s returned closure.
-type BoxedResponseFuture = std::pin::Pin<Box<dyn Future<Output = hyper::Response<Body>> + Send>>;
+/// The `tower::Service` produced by [`DefaultBodyLimit`]'s `tower::Layer` impl.
+#[derive(Debug, Clone)]
+pub struct DefaultBodyLimitService {
+    limit: usize,
+    inner: crate::routing::Route,
+}
+
+impl tower::Service<hyper::Request<Body>> for DefaultBodyLimitService {
+    type Response = hyper::Response<Body>;
+    type Error = Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn Future<Output = Result<hyper::Response<Body>, Infallible>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: hyper::Request<Body>) -> Self::Future {
+        let _ = req.extensions_mut().insert(MaxBodySize(self.limit));
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await })
+    }
+}
 
 /// Derives sub-state from the app state, matching `axum::extract::FromRef`.
 pub trait FromRef<S> {
@@ -176,7 +195,7 @@ impl<T: Clone> FromRef<T> for T {
 #[derive(Debug, Clone, Copy)]
 pub struct State<T>(pub T);
 
-impl<S, T> FromRequestParts<S> for State<T>
+impl<S: Sync, T> FromRequestParts<S> for State<T>
 where
     T: FromRef<S> + Send + Sync + 'static,
 {
@@ -185,8 +204,10 @@ where
     fn from_request_parts(
         _parts: &mut hyper::http::request::Parts,
         state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         Ok(Self(T::from_ref(state)))
+        })
     }
 }
 
@@ -649,16 +670,17 @@ impl<'de> serde::de::Deserializer<'de> for PathDeserializer<'de> {
     }
 }
 
-impl<S, T> FromRequestParts<S> for Path<T>
+impl<S: Sync, T> FromRequestParts<S> for Path<T>
 where
     T: DeserializeOwned + Send + Sync + 'static,
 {
-    type Rejection = Error;
+    type Rejection = rejection::PathRejection;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         // Routes with no path parameters never insert a `PathParams`
         // extension (see `CompiledRouter::handle_request`'s parameterless
         // fast path), so a missing extension means "zero params" rather than
@@ -671,10 +693,13 @@ where
 
         T::deserialize(PathDeserializer { params })
             .map(Path)
-            .map_err(|e: serde::de::value::Error| Error::Rejection {
-                status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to deserialize path parameters: {e}"),
+            .map_err(|e: serde::de::value::Error| {
+                rejection::FailedToDeserializePathParams(format!(
+                    "Failed to deserialize path parameters: {e}"
+                ))
+                .into()
             })
+        })
     }
 }
 
@@ -684,25 +709,29 @@ where
 pub struct Query<T>(pub T);
 
 #[cfg(feature = "query")]
-impl<S, T> FromRequestParts<S> for Query<T>
+impl<S: Sync, T> FromRequestParts<S> for Query<T>
 where
     T: DeserializeOwned + Send + Sync + 'static,
 {
-    type Rejection = Error;
+    type Rejection = rejection::QueryRejection;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         let query_str = parts.uri.query().unwrap_or("");
         let iter = QueryIter { input: query_str };
         let map_de = serde::de::value::MapDeserializer::new(iter);
         T::deserialize(map_de)
             .map(Query)
-            .map_err(|e: serde::de::value::Error| Error::Rejection {
-                status: StatusCode::BAD_REQUEST,
-                message: format!("Failed to deserialize query parameters: {e}"),
+            .map_err(|e: serde::de::value::Error| {
+                rejection::FailedToDeserializeQueryString(format!(
+                    "Failed to deserialize query parameters: {e}"
+                ))
+                .into()
             })
+        })
     }
 }
 
@@ -712,14 +741,16 @@ where
 #[derive(Debug, Clone)]
 pub struct RawQuery(pub Option<String>);
 
-impl<S> FromRequestParts<S> for RawQuery {
+impl<S: Sync> FromRequestParts<S> for RawQuery {
     type Rejection = std::convert::Infallible;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         Ok(Self(parts.uri.query().map(str::to_string)))
+        })
     }
 }
 
@@ -756,7 +787,7 @@ where
     S: Sync,
     T: DeserializeOwned + Send + Sync + 'static,
 {
-    type Rejection = Error;
+    type Rejection = rejection::JsonRejection;
 
     async fn from_request(req: hyper::Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
         // Validate Content-Type: must be a JSON media type (`application/json`, optionally
@@ -767,87 +798,99 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !is_json_content_type(ct) {
-            return Err(Error::Rejection {
-                status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                message: format!("Expected Content-Type: application/json, got: '{ct}'"),
-            });
+            return Err(rejection::MissingJsonContentType(format!(
+                "Expected Content-Type: application/json, got: '{ct}'"
+            ))
+            .into());
         }
         let limit = max_body_size(req.extensions());
-        let body = req.into_body().collect_bytes(limit).await?;
+        let body = req
+            .into_body()
+            .collect_bytes(limit)
+            .await
+            .map_err(rejection::BytesRejection::from)?;
         serde_json::from_slice::<T>(&body).map(Json).map_err(|e| {
             // Matches Axum's `JsonRejection`: malformed JSON (unbalanced braces,
             // trailing commas, invalid escapes, truncated input, ...) is a client
             // syntax error (`400`), while well-formed JSON that doesn't match the
             // target type's shape (wrong field types, missing required fields) is
             // `422` — the payload was understood but semantically rejected.
-            let status = match e.classify() {
+            let message = format!("Failed to deserialize JSON payload: {e}");
+            match e.classify() {
                 serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-                    StatusCode::BAD_REQUEST
+                    rejection::JsonSyntaxError(message).into()
                 }
                 serde_json::error::Category::Data | serde_json::error::Category::Io => {
-                    StatusCode::UNPROCESSABLE_ENTITY
+                    rejection::JsonDataError(message).into()
                 }
-            };
-            Error::Rejection {
-                status,
-                message: format!("Failed to deserialize JSON payload: {e}"),
             }
         })
     }
 }
 
-impl<S> FromRequestParts<S> for HeaderMap {
+impl<S: Sync> FromRequestParts<S> for HeaderMap {
     type Rejection = Infallible;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         Ok(parts.headers.clone())
+        })
     }
 }
 
-impl<S> FromRequestParts<S> for Method {
+impl<S: Sync> FromRequestParts<S> for Method {
     type Rejection = Infallible;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         Ok(parts.method.clone())
+        })
     }
 }
 
-impl<S> FromRequestParts<S> for Uri {
+impl<S: Sync> FromRequestParts<S> for Uri {
     type Rejection = Infallible;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         Ok(parts.uri.clone())
+        })
     }
 }
 
 impl<S: Sync> FromRequest<S> for Bytes {
-    type Rejection = Error;
+    type Rejection = rejection::BytesRejection;
 
     async fn from_request(req: hyper::Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
         let limit = max_body_size(req.extensions());
-        req.into_body().collect_bytes(limit).await
+        req.into_body()
+            .collect_bytes(limit)
+            .await
+            .map_err(Into::into)
     }
 }
 
 impl<S: Sync> FromRequest<S> for String {
-    type Rejection = Error;
+    type Rejection = rejection::StringRejection;
 
     async fn from_request(req: hyper::Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
         let limit = max_body_size(req.extensions());
-        let body = req.into_body().collect_bytes(limit).await?;
-        Self::from_utf8(body.to_vec()).map_err(|e| Error::Rejection {
-            status: StatusCode::BAD_REQUEST,
-            message: format!("Request body is not valid UTF-8: {e}"),
-        })
+        let body = req
+            .into_body()
+            .collect_bytes(limit)
+            .await
+            .map_err(rejection::BytesRejection::from)?;
+        Self::from_utf8(body.to_vec())
+            .map_err(|e| rejection::InvalidUtf8(format!("Request body is not valid UTF-8: {e}")).into())
     }
 }
 
@@ -857,11 +900,11 @@ impl<S: Sync> FromRequest<S> for String {
 pub struct Form<T>(pub T);
 
 #[cfg(feature = "form")]
-impl<S, T> FromRequestParts<S> for Form<T>
+impl<S: Sync, T> FromRequestParts<S> for Form<T>
 where
     T: DeserializeOwned + Send + Sync + 'static,
 {
-    type Rejection = Error;
+    type Rejection = rejection::FormRejection;
 
     /// Deserializes from the URL query string — matches Axum's `Form` extractor,
     /// which reads `GET`/`HEAD` requests from the query string rather than the
@@ -869,16 +912,20 @@ where
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         let query_str = parts.uri.query().unwrap_or("");
         let iter = QueryIter { input: query_str };
         let map_de = serde::de::value::MapDeserializer::new(iter);
         T::deserialize(map_de)
             .map(Form)
-            .map_err(|e: serde::de::value::Error| Error::Rejection {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: format!("Failed to deserialize form payload: {e}"),
+            .map_err(|e: serde::de::value::Error| {
+                rejection::FailedToDeserializeForm(format!(
+                    "Failed to deserialize form payload: {e}"
+                ))
+                .into()
             })
+        })
     }
 }
 
@@ -888,7 +935,7 @@ where
     S: Sync,
     T: DeserializeOwned + Send + Sync + 'static,
 {
-    type Rejection = Error;
+    type Rejection = rejection::FormRejection;
 
     async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
         // Matches Axum: `GET`/`HEAD` requests are read from the query string (no
@@ -896,7 +943,7 @@ where
         // every other method reads and deserializes the request body.
         if req.method() == hyper::Method::GET || req.method() == hyper::Method::HEAD {
             let (mut parts, _body) = req.into_parts();
-            return Self::from_request_parts(&mut parts, state);
+            return Self::from_request_parts(&mut parts, state).await;
         }
 
         // Validate Content-Type: must be application/x-www-form-urlencoded.
@@ -907,27 +954,27 @@ where
             .unwrap_or("");
         let essence = ct.split(';').next().unwrap_or("").trim();
         if !essence.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
-            return Err(Error::Rejection {
-                status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                message: format!(
-                    "Expected Content-Type: application/x-www-form-urlencoded, got: '{ct}'"
-                ),
-            });
+            return Err(rejection::InvalidFormContentType(format!(
+                "Expected Content-Type: application/x-www-form-urlencoded, got: '{ct}'"
+            ))
+            .into());
         }
         let limit = max_body_size(req.extensions());
-        let body = req.into_body().collect_bytes(limit).await?;
-        let body_str = std::str::from_utf8(&body).map_err(|_| Error::Rejection {
-            status: StatusCode::BAD_REQUEST,
-            message: "Form body is not valid UTF-8".to_string(),
-        })?;
+        let body = req
+            .into_body()
+            .collect_bytes(limit)
+            .await
+            .map_err(rejection::BytesRejection::from)?;
+        let body_str = std::str::from_utf8(&body)
+            .map_err(|_| rejection::FailedToDeserializeFormBody("Form body is not valid UTF-8".to_string()))?;
         let iter = QueryIter { input: body_str };
         let map_de = serde::de::value::MapDeserializer::new(iter);
-        T::deserialize(map_de)
-            .map(Form)
-            .map_err(|e: serde::de::value::Error| Error::Rejection {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: format!("Failed to deserialize form payload: {e}"),
-            })
+        T::deserialize(map_de).map(Form).map_err(|e: serde::de::value::Error| {
+            rejection::FailedToDeserializeFormBody(format!(
+                "Failed to deserialize form payload: {e}"
+            ))
+            .into()
+        })
     }
 }
 
@@ -935,25 +982,30 @@ where
 #[derive(Debug, Clone, Copy)]
 pub struct Extension<T>(pub T);
 
-impl<S, T> FromRequestParts<S> for Extension<T>
+impl<S: Sync, T> FromRequestParts<S> for Extension<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    type Rejection = Error;
+    type Rejection = rejection::ExtensionRejection;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         parts
             .extensions
             .get::<T>()
             .cloned()
             .map(Extension)
-            .ok_or_else(|| Error::Rejection {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("Missing extension: {}", std::any::type_name::<T>()),
+            .ok_or_else(|| {
+                rejection::MissingExtension(format!(
+                    "Missing extension: {}",
+                    std::any::type_name::<T>()
+                ))
+                .into()
             })
+        })
     }
 }
 
@@ -1013,13 +1065,14 @@ impl Default for Cookies {
 }
 
 #[cfg(feature = "cookies")]
-impl<S> FromRequestParts<S> for Cookies {
+impl<S: Sync> FromRequestParts<S> for Cookies {
     type Rejection = Infallible;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         let mut jar = CookieJar::new();
         if let Some(cookie_header) = parts.headers.get(hyper::header::COOKIE)
             && let Ok(cookie_str) = cookie_header.to_str()
@@ -1029,6 +1082,7 @@ impl<S> FromRequestParts<S> for Cookies {
             }
         }
         Ok(Self { jar })
+        })
     }
 }
 
@@ -1079,13 +1133,14 @@ impl<S: Sync> FromRequest<S> for hyper::Request<Body> {
 #[derive(Debug, Clone)]
 pub struct Host(pub String);
 
-impl<S> FromRequestParts<S> for Host {
+impl<S: Sync> FromRequestParts<S> for Host {
     type Rejection = Error;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         if let Some(host) = parts
             .headers
             .get(hyper::header::HOST)
@@ -1100,6 +1155,7 @@ impl<S> FromRequestParts<S> for Host {
                 message: "Missing Host header or authority in URI".to_string(),
             })
         }
+        })
     }
 }
 
@@ -1109,18 +1165,20 @@ impl<S> FromRequestParts<S> for Host {
 pub struct OriginalUri(pub Uri);
 
 #[cfg(feature = "original-uri")]
-impl<S> FromRequestParts<S> for OriginalUri {
+impl<S: Sync> FromRequestParts<S> for OriginalUri {
     type Rejection = Infallible;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         let uri = parts
             .extensions
             .get::<Self>()
             .map_or_else(|| parts.uri.clone(), |ou| ou.0.clone());
         Ok(Self(uri))
+        })
     }
 }
 
@@ -1146,21 +1204,25 @@ impl MatchedPath {
 }
 
 #[cfg(feature = "matched-path")]
-impl<S> FromRequestParts<S> for MatchedPath {
-    type Rejection = Error;
+impl<S: Sync> FromRequestParts<S> for MatchedPath {
+    type Rejection = rejection::MatchedPathRejection;
 
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         parts
             .extensions
             .get::<Self>()
             .cloned()
-            .ok_or_else(|| Error::Rejection {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: "No matched path found in request extensions".to_string(),
+            .ok_or_else(|| {
+                rejection::MatchedPathMissing(
+                    "No matched path found in request extensions".to_string(),
+                )
+                .into()
             })
+        })
     }
 }
 
@@ -1168,7 +1230,7 @@ impl<S> FromRequestParts<S> for MatchedPath {
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectInfo<T>(pub T);
 
-impl<S, T> FromRequestParts<S> for ConnectInfo<T>
+impl<S: Sync, T> FromRequestParts<S> for ConnectInfo<T>
 where
     T: Clone + Send + Sync + 'static,
 {
@@ -1177,7 +1239,8 @@ where
     fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready({
         parts
             .extensions
             .get::<Self>()
@@ -1189,6 +1252,7 @@ where
                     std::any::type_name::<T>()
                 ),
             })
+        })
     }
 }
 
@@ -1213,14 +1277,12 @@ macro_rules! impl_from_request_via_parts {
         {
             type Rejection = <Self as FromRequestParts<S>>::Rejection;
 
-            fn from_request(
+            async fn from_request(
                 req: hyper::Request<Body>,
                 state: &S,
-            ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+            ) -> Result<Self, Self::Rejection> {
                 let (mut parts, _) = req.into_parts();
-                std::future::ready(<Self as FromRequestParts<S>>::from_request_parts(
-                    &mut parts, state,
-                ))
+                <Self as FromRequestParts<S>>::from_request_parts(&mut parts, state).await
             }
         }
     };
@@ -1247,12 +1309,213 @@ impl_from_request_via_parts!(Query<T>, T: DeserializeOwned + Send + Sync + 'stat
 impl_from_request_via_parts!(Extension<T>, T: Clone + Send + Sync + 'static);
 impl_from_request_via_parts!(ConnectInfo<T>, T: Clone + Send + Sync + 'static);
 
+/// `Option<T>` succeeds with `None` wherever `T` would fail, for any
+/// extractor. Matches the effect of Axum's `OptionalFromRequestParts`/
+/// `OptionalFromRequest` blanket impls, simplified: Axum lets an individual
+/// extractor override *which* rejections become `None` versus a real error
+/// (e.g. `Query`'s override still hard-errors on malformed query strings,
+/// only treating "no query string at all" as `None`). This collapses every
+/// rejection to `None` uniformly instead, which is simpler but less precise —
+/// most consumers of `Option<Extractor>` just want "was it there or not"
+/// and don't rely on the distinction.
+impl<S: Sync, T> FromRequestParts<S> for Option<T>
+where
+    T: FromRequestParts<S>,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut hyper::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(T::from_request_parts(parts, state).await.ok())
+    }
+}
+
+/// See [`FromRequestParts` for `Option<T>`](#impl-FromRequestParts%3CS%3E-for-Option%3CT%3E)
+/// — same simplification relative to Axum's real `OptionalFromRequest`.
+impl<S: Sync, T> FromRequest<S> for Option<T>
+where
+    T: FromRequest<S>,
+{
+    type Rejection = Infallible;
+
+    async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
+        Ok(T::from_request(req, state).await.ok())
+    }
+}
+
+/// Sugar for running an extractor against request *parts* (headers, method,
+/// URI, extensions — no body) outside of a handler's argument list. Matches
+/// `axum_core::RequestPartsExt`.
+pub trait RequestPartsExt {
+    /// Runs `T::from_request_parts` against unit state (`S = ()`).
+    fn extract<T>(&mut self) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequestParts<()>;
+
+    /// Runs `T::from_request_parts` against `state`.
+    fn extract_with_state<'a, T, S>(
+        &'a mut self,
+        state: &'a S,
+    ) -> impl Future<Output = Result<T, T::Rejection>> + Send + 'a
+    where
+        T: FromRequestParts<S> + 'a,
+        S: Sync;
+}
+
+impl RequestPartsExt for hyper::http::request::Parts {
+    fn extract<T>(&mut self) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequestParts<()>,
+    {
+        T::from_request_parts(self, &())
+    }
+
+    fn extract_with_state<'a, T, S>(
+        &'a mut self,
+        state: &'a S,
+    ) -> impl Future<Output = Result<T, T::Rejection>> + Send + 'a
+    where
+        T: FromRequestParts<S> + 'a,
+        S: Sync,
+    {
+        T::from_request_parts(self, state)
+    }
+}
+
+/// Sugar for running an extractor against an owned [`hyper::Request`]
+/// outside of a handler's argument list. Matches `axum_core::RequestExt`.
+pub trait RequestExt: Sized {
+    /// Runs `T::from_request` against unit state (`S = ()`), consuming `self`.
+    fn extract<T>(self) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequest<()>;
+
+    /// Runs `T::from_request` against `state`, consuming `self`.
+    fn extract_with_state<T, S>(
+        self,
+        state: &S,
+    ) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequest<S>,
+        S: Sync;
+
+    /// Runs `T::from_request_parts` against unit state, without consuming the body.
+    fn extract_parts<T>(&mut self) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequestParts<()>;
+
+    /// Runs `T::from_request_parts` against `state`, without consuming the body.
+    fn extract_parts_with_state<'a, T, S>(
+        &'a mut self,
+        state: &'a S,
+    ) -> impl Future<Output = Result<T, T::Rejection>> + Send + 'a
+    where
+        T: FromRequestParts<S> + 'a,
+        S: Sync;
+}
+
+impl RequestExt for hyper::Request<Body> {
+    fn extract<T>(self) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequest<()>,
+    {
+        T::from_request(self, &())
+    }
+
+    fn extract_with_state<T, S>(
+        self,
+        state: &S,
+    ) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequest<S>,
+        S: Sync,
+    {
+        T::from_request(self, state)
+    }
+
+    fn extract_parts<T>(&mut self) -> impl Future<Output = Result<T, T::Rejection>> + Send
+    where
+        T: FromRequestParts<()>,
+    {
+        let (mut parts, body) = std::mem::replace(self, Self::new(Body::empty())).into_parts();
+        async move {
+            let result = T::from_request_parts(&mut parts, &()).await;
+            *self = Self::from_parts(parts, body);
+            result
+        }
+    }
+
+    fn extract_parts_with_state<'a, T, S>(
+        &'a mut self,
+        state: &'a S,
+    ) -> impl Future<Output = Result<T, T::Rejection>> + Send + 'a
+    where
+        T: FromRequestParts<S> + 'a,
+        S: Sync,
+    {
+        let (mut parts, body) = std::mem::replace(self, Self::new(Body::empty())).into_parts();
+        async move {
+            let result = T::from_request_parts(&mut parts, state).await;
+            *self = Self::from_parts(parts, body);
+            result
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use hyper::http::Request;
     use serde::Deserialize;
+
+    #[tokio::test]
+    async fn option_extractor_is_some_on_success_and_none_on_rejection() {
+        let mut present = Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        present.extensions.insert(7u32);
+        let ext_or_none = Option::<Extension<u32>>::from_request_parts(&mut present, &())
+            .await
+            .unwrap();
+        assert_eq!(ext_or_none.map(|Extension(v)| v), Some(7));
+
+        let mut absent = Request::builder().body(()).unwrap().into_parts().0;
+        let none = Option::<Extension<u32>>::from_request_parts(&mut absent, &())
+            .await
+            .unwrap();
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn request_ext_extract_parts_preserves_the_body() {
+        let req = Request::builder()
+            .uri("/x?a=1")
+            .body(Body::full(Bytes::from("payload")))
+            .unwrap();
+        let mut req = req;
+        let RawQuery(q) = req.extract_parts::<RawQuery>().await.unwrap();
+        assert_eq!(q.as_deref(), Some("a=1"));
+        // The body must still be there after `extract_parts` returns.
+        let bytes = req.into_body().collect_bytes(1024).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn request_parts_ext_extract_runs_against_unit_state() {
+        let mut parts = Request::builder()
+            .uri("/x?a=1")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let RawQuery(q) = parts.extract::<RawQuery>().await.unwrap();
+        assert_eq!(q.as_deref(), Some("a=1"));
+    }
 
     #[cfg(any(feature = "query", feature = "form"))]
     #[derive(Deserialize, Debug)]
@@ -1359,15 +1622,15 @@ mod tests {
         let (mut parts, body) = req.into_parts();
 
         // HeaderMap
-        let headers = HeaderMap::from_request_parts(&mut parts, &()).unwrap();
+        let headers = HeaderMap::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(headers.get("x-test").unwrap(), "hello");
 
         // Method
-        let method = Method::from_request_parts(&mut parts, &()).unwrap();
+        let method = Method::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(method, "POST");
 
         // Uri
-        let uri = Uri::from_request_parts(&mut parts, &()).unwrap();
+        let uri = Uri::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(uri.path(), "/path");
 
         // Bytes
@@ -1391,17 +1654,17 @@ mod tests {
         assert!(cookies.get("foo").is_none());
     }
 
-    #[test]
-    fn test_host_missing() {
+    #[tokio::test]
+    async fn test_host_missing() {
         let mut parts = Request::builder().uri("/").body(()).unwrap().into_parts().0;
-        let res = Host::from_request_parts(&mut parts, &());
+        let res = Host::from_request_parts(&mut parts, &()).await;
         assert!(res.is_err());
     }
 
-    #[test]
-    fn test_connect_info_missing() {
+    #[tokio::test]
+    async fn test_connect_info_missing() {
         let mut parts = Request::builder().uri("/").body(()).unwrap().into_parts().0;
-        let res = ConnectInfo::<std::net::SocketAddr>::from_request_parts(&mut parts, &());
+        let res = ConnectInfo::<std::net::SocketAddr>::from_request_parts(&mut parts, &()).await;
         assert!(res.is_err());
     }
 
@@ -1450,8 +1713,8 @@ mod tests {
     }
 
     #[cfg(feature = "form")]
-    #[test]
-    fn test_form_from_request_parts_deserialize_error() {
+    #[tokio::test]
+    async fn test_form_from_request_parts_deserialize_error() {
         #[derive(Deserialize, Debug)]
         #[allow(dead_code)]
         struct FormPayload {
@@ -1467,7 +1730,7 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
-        let result = Form::<FormPayload>::from_request_parts(&mut parts, &());
+        let result = Form::<FormPayload>::from_request_parts(&mut parts, &()).await;
         assert!(result.is_err());
     }
 
@@ -1494,8 +1757,8 @@ mod tests {
     }
 
     #[cfg(feature = "query")]
-    #[test]
-    fn test_query_deserialize_error() {
+    #[tokio::test]
+    async fn test_query_deserialize_error() {
         #[derive(Deserialize, Debug)]
         #[allow(dead_code)]
         struct QueryPayload {
@@ -1508,19 +1771,21 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
-        let result = Query::<QueryPayload>::from_request_parts(&mut parts, &());
+        let result = Query::<QueryPayload>::from_request_parts(&mut parts, &()).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_raw_query_present_and_absent() {
+    #[tokio::test]
+    async fn test_raw_query_present_and_absent() {
         let mut with_query = Request::builder()
             .uri("/path?a=1&b=2")
             .body(())
             .unwrap()
             .into_parts()
             .0;
-        let RawQuery(q) = RawQuery::from_request_parts(&mut with_query, &()).unwrap();
+        let RawQuery(q) = RawQuery::from_request_parts(&mut with_query, &())
+            .await
+            .unwrap();
         assert_eq!(q.as_deref(), Some("a=1&b=2"));
 
         let mut without_query = Request::builder()
@@ -1529,7 +1794,9 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
-        let RawQuery(q2) = RawQuery::from_request_parts(&mut without_query, &()).unwrap();
+        let RawQuery(q2) = RawQuery::from_request_parts(&mut without_query, &())
+            .await
+            .unwrap();
         assert!(q2.is_none());
     }
 
@@ -1570,102 +1837,121 @@ mod tests {
         parts
     }
 
-    #[test]
-    fn test_path_tuple_success_and_length_mismatch() {
+    #[tokio::test]
+    async fn test_path_tuple_success_and_length_mismatch() {
         let mut ok_parts = make_path_parts(vec![("id", "42"), ("name", "hello")]);
-        let Path((id, name)) =
-            Path::<(u32, String)>::from_request_parts(&mut ok_parts, &()).unwrap();
+        let Path((id, name)) = Path::<(u32, String)>::from_request_parts(&mut ok_parts, &())
+            .await
+            .unwrap();
         assert_eq!(id, 42);
         assert_eq!(name, "hello");
 
         // Too many params for a 2-tuple.
         let mut too_many = make_path_parts(vec![("a", "1"), ("b", "2"), ("c", "3")]);
-        assert!(Path::<(u32, String)>::from_request_parts(&mut too_many, &()).is_err());
+        assert!(
+            Path::<(u32, String)>::from_request_parts(&mut too_many, &())
+                .await
+                .is_err()
+        );
 
         // Too few params for a 2-tuple.
         let mut too_few = make_path_parts(vec![("a", "1")]);
-        assert!(Path::<(u32, String)>::from_request_parts(&mut too_few, &()).is_err());
+        assert!(
+            Path::<(u32, String)>::from_request_parts(&mut too_few, &())
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn test_path_vec_seq_target() {
+    #[tokio::test]
+    async fn test_path_vec_seq_target() {
         // `Vec<T>` reaches `deserialize_seq` directly (not via tuple delegation),
         // and its `Deserialize` impl calls `SeqAccess::size_hint` to preallocate.
         let mut parts = make_path_parts(vec![("a", "x"), ("b", "y"), ("c", "z")]);
-        let Path(values) = Path::<Vec<String>>::from_request_parts(&mut parts, &()).unwrap();
+        let Path(values) = Path::<Vec<String>>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(
             values,
             vec!["x".to_string(), "y".to_string(), "z".to_string()]
         );
     }
 
-    #[test]
-    fn test_path_scalar_wrong_param_count() {
+    #[tokio::test]
+    async fn test_path_scalar_wrong_param_count() {
         // Zero params for a bare scalar target.
         let mut zero = make_path_parts(vec![]);
-        assert!(Path::<u32>::from_request_parts(&mut zero, &()).is_err());
+        assert!(Path::<u32>::from_request_parts(&mut zero, &()).await.is_err());
 
         // More than one param for a bare scalar target.
         let mut two = make_path_parts(vec![("a", "1"), ("b", "2")]);
-        assert!(Path::<u32>::from_request_parts(&mut two, &()).is_err());
+        assert!(Path::<u32>::from_request_parts(&mut two, &()).await.is_err());
 
         // Exactly one param succeeds.
         let mut one = make_path_parts(vec![("id", "7")]);
-        let Path(v) = Path::<u32>::from_request_parts(&mut one, &()).unwrap();
+        let Path(v) = Path::<u32>::from_request_parts(&mut one, &()).await.unwrap();
         assert_eq!(v, 7);
     }
 
-    #[test]
-    fn test_path_option_top_level_target() {
+    #[tokio::test]
+    async fn test_path_option_top_level_target() {
         // `Path<Option<T>>` makes `Option<T>` the *whole* deserialization target, so
         // `T::deserialize` dispatches straight to `PathDeserializer::deserialize_option`
         // (as opposed to a struct field being `Option<T>`, which is handled entirely by
         // `MapDeserializer`/`CoercingCowDeserializer` without ever calling back into
         // `PathDeserializer::deserialize_option`).
         let mut parts = make_path_parts(vec![("id", "9")]);
-        let Path(v) = Path::<Option<u32>>::from_request_parts(&mut parts, &()).unwrap();
+        let Path(v) = Path::<Option<u32>>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(v, Some(9));
     }
 
-    #[test]
-    fn test_path_enum_target() {
+    #[tokio::test]
+    async fn test_path_enum_target() {
         let mut parts = make_path_parts(vec![("color", "Red")]);
-        let Path(c) = Path::<Color>::from_request_parts(&mut parts, &()).unwrap();
+        let Path(c) = Path::<Color>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(c, Color::Red);
     }
 
-    #[test]
-    fn test_path_unit_and_unit_struct_targets() {
+    #[tokio::test]
+    async fn test_path_unit_and_unit_struct_targets() {
         #[derive(Deserialize, PartialEq, Debug)]
         struct UnitStruct;
 
         // `()` as the whole target reaches `deserialize_unit` and ignores any params.
         let mut parts = make_path_parts(vec![("a", "1"), ("b", "2")]);
-        let Path(unit_val) = Path::<()>::from_request_parts(&mut parts, &()).unwrap();
+        let Path(unit_val) = Path::<()>::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(unit_val, ());
 
         // A derived unit struct reaches `deserialize_unit_struct`.
         let mut empty_parts = make_path_parts(vec![]);
-        let Path(u) = Path::<UnitStruct>::from_request_parts(&mut empty_parts, &()).unwrap();
+        let Path(u) = Path::<UnitStruct>::from_request_parts(&mut empty_parts, &())
+            .await
+            .unwrap();
         assert_eq!(u, UnitStruct);
     }
 
-    #[test]
-    fn test_path_newtype_struct_target() {
+    #[tokio::test]
+    async fn test_path_newtype_struct_target() {
         #[derive(Deserialize, PartialEq, Debug)]
         struct Wrapper(u32);
 
         let mut parts = make_path_parts(vec![("id", "77")]);
-        let Path(Wrapper(v)) = Path::<Wrapper>::from_request_parts(&mut parts, &()).unwrap();
+        let Path(Wrapper(v)) = Path::<Wrapper>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(v, 77);
     }
 
-    #[test]
-    fn test_path_ignored_any_top_level_target() {
+    #[tokio::test]
+    async fn test_path_ignored_any_top_level_target() {
         // `IgnoredAny`'s `Deserialize` impl calls `deserialize_ignored_any` directly on the
         // top-level deserializer.
         let mut parts = make_path_parts(vec![("a", "1"), ("b", "2")]);
-        let result = Path::<serde::de::IgnoredAny>::from_request_parts(&mut parts, &());
+        let result = Path::<serde::de::IgnoredAny>::from_request_parts(&mut parts, &()).await;
         assert!(result.is_ok());
     }
 

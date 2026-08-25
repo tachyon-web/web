@@ -1451,8 +1451,9 @@ mod tests {
             .uri("/style.css")
             .body(Body::empty())
             .unwrap();
-        let h = router.handlers[super::super::IDX_GET].as_ref().unwrap();
-        let resp = h.call(req, Arc::new(())).await;
+        let into_route = router.handlers[super::super::IDX_GET].as_ref().unwrap();
+        let route = into_route(Arc::new(()));
+        let resp = tower::ServiceExt::oneshot(route, req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
