@@ -318,11 +318,12 @@ impl CompiledMethodRouter {
     }
 }
 
-/// Generates the nine per-verb `MethodRouter` builder methods (`.get()`, `.post()`, …)
-/// and their matching free-function shortcuts (`get(h)`, `post(h)`, …) — one pair per
-/// HTTP method, all structurally identical apart from which slot of `handlers` they fill.
+/// Generates the nine per-verb `MethodRouter` builder methods (`.get()`, `.post()`, …), their
+/// raw-`tower::Service` counterparts (`.get_service()`, `.post_service()`, …), and matching
+/// free-function shortcuts of both (`get(h)`, `get_service(svc)`, …) — one set per HTTP method,
+/// all structurally identical apart from which slot of `handlers` they fill.
 macro_rules! method_routes {
-    ($( ($name:ident, $idx:ident, $verb:literal) ),+ $(,)?) => {
+    ($( ($name:ident, $svc_name:ident, $idx:ident, $verb:literal) ),+ $(,)?) => {
         impl<S> MethodRouter<S>
         where
             S: Clone + Send + Sync + 'static,
@@ -337,6 +338,32 @@ macro_rules! method_routes {
                 {
                     self.set($idx, handler)
                 }
+
+                #[doc = concat!(
+                    "Add a raw `tower::Service` handler for HTTP ", $verb,
+                    " requests, matching `axum::routing::method_routing::", stringify!($svc_name), "`."
+                )]
+                #[must_use]
+                pub fn $svc_name<Svc, RespBody>(self, service: Svc) -> Self
+                where
+                    Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
+                        + Clone
+                        + Send
+                        + Sync
+                        + 'static,
+                    Svc::Future: Send + 'static,
+                    Svc::Error: Into<crate::http::error::Error> + Send,
+                    RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
+                    RespBody::Error: Into<crate::http::error::Error>,
+                {
+                    self.set(
+                        $idx,
+                        tower_compat::ServiceHandler {
+                            service,
+                            strip_prefix: None,
+                        },
+                    )
+                }
             )+
         }
 
@@ -349,6 +376,26 @@ macro_rules! method_routes {
                 S: Clone + Send + Sync + 'static,
             {
                 MethodRouter::new().$name(handler)
+            }
+
+            #[doc = concat!(
+                "Helper to construct a ", $verb,
+                "-only route from a raw `tower::Service`."
+            )]
+            pub fn $svc_name<Svc, RespBody, S>(service: Svc) -> MethodRouter<S>
+            where
+                Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
+                    + Clone
+                    + Send
+                    + Sync
+                    + 'static,
+                Svc::Future: Send + 'static,
+                Svc::Error: Into<crate::http::error::Error> + Send,
+                RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
+                RespBody::Error: Into<crate::http::error::Error>,
+                S: Clone + Send + Sync + 'static,
+            {
+                MethodRouter::new().$svc_name(service)
             }
         )+
 
@@ -363,19 +410,169 @@ macro_rules! method_routes {
             $( let router = router.$name(handler.clone()); )+
             router
         }
+
+        /// A route dispatching every HTTP method to a raw `tower::Service`, matching
+        /// `axum::routing::any_service`.
+        pub fn any_service<Svc, RespBody, S>(service: Svc) -> MethodRouter<S>
+        where
+            Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
+                + Clone
+                + Send
+                + Sync
+                + 'static,
+            Svc::Future: Send + 'static,
+            Svc::Error: Into<crate::http::error::Error> + Send,
+            RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
+            RespBody::Error: Into<crate::http::error::Error>,
+            S: Clone + Send + Sync + 'static,
+        {
+            let router = MethodRouter::new();
+            $( let router = router.$svc_name(service.clone()); )+
+            router
+        }
     };
 }
 
 method_routes! {
-    (get, IDX_GET, "GET"),
-    (post, IDX_POST, "POST"),
-    (put, IDX_PUT, "PUT"),
-    (delete, IDX_DELETE, "DELETE"),
-    (options, IDX_OPTIONS, "OPTIONS"),
-    (head, IDX_HEAD, "HEAD"),
-    (patch, IDX_PATCH, "PATCH"),
-    (trace, IDX_TRACE, "TRACE"),
-    (connect, IDX_CONNECT, "CONNECT"),
+    (get, get_service, IDX_GET, "GET"),
+    (post, post_service, IDX_POST, "POST"),
+    (put, put_service, IDX_PUT, "PUT"),
+    (delete, delete_service, IDX_DELETE, "DELETE"),
+    (options, options_service, IDX_OPTIONS, "OPTIONS"),
+    (head, head_service, IDX_HEAD, "HEAD"),
+    (patch, patch_service, IDX_PATCH, "PATCH"),
+    (trace, trace_service, IDX_TRACE, "TRACE"),
+    (connect, connect_service, IDX_CONNECT, "CONNECT"),
+}
+
+/// A bitmask of HTTP methods, matching `axum::routing::MethodFilter`.
+///
+/// Used by [`on`] and [`on_service`]/`MethodRouter::on`/`MethodRouter::on_service` to register
+/// a handler against more than one method at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodFilter(u16);
+
+impl MethodFilter {
+    /// Matches `CONNECT` requests.
+    pub const CONNECT: Self = Self(1u16 << IDX_CONNECT);
+    /// Matches `DELETE` requests.
+    pub const DELETE: Self = Self(1u16 << IDX_DELETE);
+    /// Matches `GET` requests.
+    pub const GET: Self = Self(1u16 << IDX_GET);
+    /// Matches `HEAD` requests.
+    pub const HEAD: Self = Self(1u16 << IDX_HEAD);
+    /// Matches `OPTIONS` requests.
+    pub const OPTIONS: Self = Self(1u16 << IDX_OPTIONS);
+    /// Matches `PATCH` requests.
+    pub const PATCH: Self = Self(1u16 << IDX_PATCH);
+    /// Matches `POST` requests.
+    pub const POST: Self = Self(1u16 << IDX_POST);
+    /// Matches `PUT` requests.
+    pub const PUT: Self = Self(1u16 << IDX_PUT);
+    /// Matches `TRACE` requests.
+    pub const TRACE: Self = Self(1u16 << IDX_TRACE);
+
+    #[must_use]
+    const fn contains_idx(self, idx: usize) -> bool {
+        self.0 & (1u16 << idx) != 0
+    }
+}
+
+impl std::ops::BitOr for MethodFilter {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl<S> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    /// Add a handler for every HTTP method set in `filter`, matching
+    /// `axum::routing::MethodRouter::on`.
+    #[must_use]
+    pub fn on<H, T>(mut self, filter: MethodFilter, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: Send + 'static,
+    {
+        let indices: Vec<usize> = (0..METHOD_COUNT).filter(|&idx| filter.contains_idx(idx)).collect();
+        let Some((&last, init)) = indices.split_last() else {
+            return self;
+        };
+        for &idx in init {
+            self = self.set(idx, handler.clone());
+        }
+        self.set(last, handler)
+    }
+
+    /// Add a raw `tower::Service` handler for every HTTP method set in `filter`, matching
+    /// `axum::routing::MethodRouter::on_service`.
+    #[must_use]
+    pub fn on_service<Svc, RespBody>(mut self, filter: MethodFilter, service: Svc) -> Self
+    where
+        Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        Svc::Future: Send + 'static,
+        Svc::Error: Into<crate::http::error::Error> + Send,
+        RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
+        RespBody::Error: Into<crate::http::error::Error>,
+    {
+        let indices: Vec<usize> = (0..METHOD_COUNT).filter(|&idx| filter.contains_idx(idx)).collect();
+        let Some((&last, init)) = indices.split_last() else {
+            return self;
+        };
+        for &idx in init {
+            self = self.set(
+                idx,
+                tower_compat::ServiceHandler {
+                    service: service.clone(),
+                    strip_prefix: None,
+                },
+            );
+        }
+        self.set(
+            last,
+            tower_compat::ServiceHandler {
+                service,
+                strip_prefix: None,
+            },
+        )
+    }
+}
+
+/// Helper to construct a route for every HTTP method set in `filter`, matching
+/// `axum::routing::on`.
+pub fn on<H, T, S>(filter: MethodFilter, handler: H) -> MethodRouter<S>
+where
+    H: Handler<T, S>,
+    T: Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    MethodRouter::new().on(filter, handler)
+}
+
+/// Helper to construct a route for every HTTP method set in `filter` from a raw
+/// `tower::Service`, matching `axum::routing::on_service`.
+pub fn on_service<Svc, RespBody, S>(filter: MethodFilter, service: Svc) -> MethodRouter<S>
+where
+    Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    Svc::Future: Send + 'static,
+    Svc::Error: Into<crate::http::error::Error> + Send,
+    RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
+    RespBody::Error: Into<crate::http::error::Error>,
+    S: Clone + Send + Sync + 'static,
+{
+    MethodRouter::new().on_service(filter, service)
 }
 
 /// Axum-like routing table using `matchit` under the hood.

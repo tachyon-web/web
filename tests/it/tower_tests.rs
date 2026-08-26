@@ -365,3 +365,94 @@ async fn test_fallback_service_routes_unmatched_requests() {
     assert_eq!(body, "/no/such/route?x=1");
     assert_eq!(*last_uri.lock().unwrap(), "/no/such/route?x=1");
 }
+
+/// `MethodRouter::get_service`/the `get_service` free function must mount a raw
+/// `tower::Service` for exactly one HTTP method, matching `axum::routing::get_service`.
+#[tokio::test]
+async fn test_get_service_mounts_a_raw_service_for_one_method() {
+    let (svc, _last_uri) = echo_service();
+    let router = compile(Router::new().route("/echo", tachyon_web::get_service(svc)));
+
+    let (status, body) = send_get(&router, "/echo?x=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "/echo?x=1");
+
+    // POST wasn't registered, so it 405s rather than reaching the service.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/echo")
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.handle_request(req).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// `MethodRouter::on_service`/the `on_service` free function must mount a raw
+/// `tower::Service` for every method set in the given `MethodFilter`, matching
+/// `axum::routing::on_service`.
+#[tokio::test]
+async fn test_on_service_mounts_a_raw_service_for_every_filtered_method() {
+    use tachyon_web::MethodFilter;
+
+    let (svc, _last_uri) = echo_service();
+    let router = compile(Router::new().route(
+        "/echo",
+        tachyon_web::on_service(MethodFilter::GET | MethodFilter::POST, svc),
+    ));
+
+    let (status, body) = send_get(&router, "/echo").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "/echo");
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/echo")
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.handle_request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/echo")
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.handle_request(req).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// `MethodRouter::on`/the `on` free function must dispatch a native handler for every
+/// method set in the given `MethodFilter`, matching `axum::routing::on`.
+#[tokio::test]
+async fn test_on_dispatches_a_handler_for_every_filtered_method() {
+    use tachyon_web::MethodFilter;
+
+    async fn handler() -> &'static str {
+        "handled"
+    }
+
+    let router = compile(Router::new().route(
+        "/x",
+        tachyon_web::on(MethodFilter::GET | MethodFilter::DELETE, handler),
+    ));
+
+    let (status, body) = send_get(&router, "/x").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "handled");
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/x")
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.handle_request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/x")
+        .body(Body::empty())
+        .expect("build request");
+    let resp = router.handle_request(req).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}

@@ -15,6 +15,7 @@ use hyper::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Response as HttpResponse, StatusCode};
 #[cfg(feature = "json")]
 use serde::Serialize;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -389,6 +390,81 @@ where
             Some(parts) => parts.into_response_parts(res),
             None => Ok(res),
         }
+    }
+}
+
+/// A single `(name, value)` header pair, attached directly without a `HeaderMap`
+/// or [`AppendHeaders`] wrapper — e.g. `(("x-request-id", id), Json(body))`.
+impl<K, V> IntoResponseParts for (K, V)
+where
+    K: TryInto<HeaderName>,
+    K::Error: std::error::Error + Send + Sync + 'static,
+    V: TryInto<HeaderValue>,
+    V::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Error = TryIntoHeaderError<K, V>;
+
+    fn into_response_parts(self, mut res: ResponseParts) -> Result<ResponseParts, Self::Error> {
+        let (key, value) = self;
+        let key = key
+            .try_into()
+            .map_err(|e| TryIntoHeaderError::name(Box::new(e)))?;
+        let value = value
+            .try_into()
+            .map_err(|e| TryIntoHeaderError::value(Box::new(e)))?;
+        res.headers_mut().append(key, value);
+        Ok(res)
+    }
+}
+
+/// The error produced when a `(K, V)` pair fails to convert into a header name/value,
+/// matching `axum_core::response::TryIntoHeaderError`.
+pub struct TryIntoHeaderError<K, V> {
+    kind: TryIntoHeaderErrorKind,
+    _marker: PhantomData<fn() -> (K, V)>,
+}
+
+enum TryIntoHeaderErrorKind {
+    Name(crate::http::error::BoxError),
+    Value(crate::http::error::BoxError),
+}
+
+impl<K, V> TryIntoHeaderError<K, V> {
+    fn name(source: crate::http::error::BoxError) -> Self {
+        Self {
+            kind: TryIntoHeaderErrorKind::Name(source),
+            _marker: PhantomData,
+        }
+    }
+
+    fn value(source: crate::http::error::BoxError) -> Self {
+        Self {
+            kind: TryIntoHeaderErrorKind::Value(source),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<K, V> std::fmt::Debug for TryIntoHeaderError<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TryIntoHeaderError").finish_non_exhaustive()
+    }
+}
+
+impl<K, V> std::fmt::Display for TryIntoHeaderError<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            TryIntoHeaderErrorKind::Name(e) => write!(f, "failed to convert header name: {e}"),
+            TryIntoHeaderErrorKind::Value(e) => write!(f, "failed to convert header value: {e}"),
+        }
+    }
+}
+
+impl<K, V> std::error::Error for TryIntoHeaderError<K, V> {}
+
+impl<K, V> IntoResponse for TryIntoHeaderError<K, V> {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
     }
 }
 
@@ -853,6 +929,24 @@ mod tests {
     #[test]
     fn append_headers_rejects_an_invalid_header_value() {
         let resp = (AppendHeaders([("x-ok-name", "bad\nvalue")]), "body").into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn bare_header_tuple_attaches_a_single_header() {
+        let resp = (("x-request-id", "abc123"), "body").into_response();
+        assert_eq!(resp.headers().get("x-request-id").unwrap(), "abc123");
+    }
+
+    #[test]
+    fn bare_header_tuple_rejects_an_invalid_header_name() {
+        let resp = (("bad header name", "value"), "body").into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn bare_header_tuple_rejects_an_invalid_header_value() {
+        let resp = (("x-ok-name", "bad\nvalue"), "body").into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

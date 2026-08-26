@@ -250,11 +250,11 @@ pub mod ws;
 pub use http::compression::{self, Compression, CompressionLevel, Encoding};
 #[cfg(feature = "early-hints")]
 pub use http::early_hints::{self, EarlyHints, EarlyHintsConfig, Link};
-pub use http::error::{Error, Result};
+pub use http::error::{BoxError, Error, Result};
 pub use http::response;
 pub use http::response::{
     AppendHeaders, ErrorResponse, Html, IntoResponse, IntoResponseParts, NoContent, Redirect,
-    ResponseParts, to_bytes,
+    ResponseParts, TryIntoHeaderError, to_bytes,
 };
 pub use routing::extract;
 #[cfg(feature = "cookies")]
@@ -277,8 +277,10 @@ pub use routing::middleware;
 pub use routing::middleware::Next;
 pub use routing::static_dir::ServeDir;
 pub use routing::{
-    MethodRouter, Router, RouterError, any, connect, delete, get, head, options, patch, post, put,
-    trace,
+    MethodFilter, MethodRouter, Router, RouterError, any, any_service, connect, connect_service,
+    delete, delete_service, get, get_service, head, head_service, on, on_service, options,
+    options_service, patch, patch_service, post, post_service, put, put_service, trace,
+    trace_service,
 };
 #[cfg(feature = "tls")]
 pub use server::{HttpsServer, RustlsConfig, bind_rustls};

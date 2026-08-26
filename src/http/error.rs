@@ -8,6 +8,9 @@ use crate::http::response::IntoResponse;
 /// A specialized Result type for Tachyon-Web operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A type-erased, boxed `std::error::Error`. Matches `axum_core::BoxError`.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Represents errors that can occur during request processing, routing, or extraction.
 #[derive(Debug, Clone)]
 pub enum Error {

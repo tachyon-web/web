@@ -50,9 +50,6 @@ cookie = { version = "0.18", features = ["percent-encode"], optional = true }
 core_affinity = "0.8"
 rustc-hash = "2"
 smallvec = { version = "1", features = ["union"] }
-
-# tower::Service/tower::Layer are the routing/middleware foundation (matching Axum's own
-# internals), not optional interop — see `routing::tower_compat`.
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
 # Optional WebSocket support (see the `ws` feature).
