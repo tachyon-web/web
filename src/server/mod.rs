@@ -51,6 +51,8 @@
 //! ```
 
 #[cfg(any(feature = "tor", feature = "i2p"))]
+mod anon_tls;
+#[cfg(any(feature = "tor", feature = "i2p"))]
 pub(crate) mod conn;
 #[cfg(feature = "early-hints")]
 mod h2;
@@ -1418,7 +1420,7 @@ pub async fn serve_http_redirect_and_challenges(
 /// and runs the high-performance worker pool.
 ///
 /// Matches `axum::serve`'s shape: the returned [`Serve`] implements
-/// [`IntoFuture`](std::future::IntoFuture), so `serve(listener, router).await`
+/// [`IntoFuture`], so `serve(listener, router).await`
 /// behaves exactly like the old `async fn` version did, while
 /// `serve(listener, router).with_graceful_shutdown(signal).await` is now also
 /// available — see [`Serve::with_graceful_shutdown`] for the one real
@@ -1461,7 +1463,7 @@ impl RustlsConfig {
     /// Previously this built from `rustls::ServerConfig::builder()`'s process-wide default
     /// provider instead: besides not respecting `fips`, that provider depends on load order —
     /// whichever crate first called `CryptoProvider::install_default()` (for example,
-    /// `Server::serve_tor`/`serve_onion` install this crate's [`TlsPolicy`] process-wide for
+    /// `Server::serve_tor`/`serve_onion` install this crate's [`TlsPolicy`](crate::tls::TlsPolicy) process-wide for
     /// arti's benefit) determined the actual cipher suites in effect. Going through
     /// [`TlsPolicy`](crate::tls::TlsPolicy) removes that nondeterminism. Use
     /// [`Server::tls_policy`](crate::server::Server::tls_policy) plus a hand-built

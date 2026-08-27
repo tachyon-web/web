@@ -11,7 +11,7 @@ where
     /// Serve HTTP/3 over QUIC using the given s2n-quic server.
     ///
     /// Under the `fips` feature, this only checks that the crypto *backend* is in FIPS mode
-    /// (via [`enforce_fips_compliance`](crate::server::enforce_fips_compliance)) — unlike
+    /// (via `enforce_fips_compliance`) — unlike
     /// [`serve_https`](Server::serve_https), it can't additionally verify that
     /// `quic_server`'s own TLS config negotiates FIPS-approved algorithms: `s2n_quic::Server`
     /// doesn't expose the `rustls::ServerConfig` it was built with. Build `quic_server` from a

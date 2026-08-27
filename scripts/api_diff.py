@@ -11,40 +11,32 @@ rustdoc JSON trees, not from reading tachyon-web's source and deciding what
 "should" be covered. axum-extra is out of scope simply because it is a
 separate crate this script is never pointed at.
 
-Setup (nightly needed for `--output-format json`; `--cap-lints=warn` is required
-because this crate denies warnings and rustdoc trips broken-link lints on
-feature-gated intra-doc links when only a subset of features is enabled):
+End-to-end usage (this is what CI runs -- no arguments, no manual setup):
 
-    # 1. tachyon-web's own JSON, from the crate root:
-    RUSTDOCFLAGS="--cap-lints=warn" cargo +nightly rustdoc --lib \\
-        --no-default-features \\
-        --features "json,cookies,matched-path,original-uri,http1,http2,tower-log,ws,form,query,sse,tower" \\
-        -- -Z unstable-options --output-format json
-    # -> target/doc/tachyon_web.json
+    python3 scripts/api_diff.py
 
-    # 2. axum + axum-core's JSON: axum-core's items (FromRequest, IntoResponse,
-    #    FromRef, ...) are re-exported by axum but NOT inlined into axum's own
-    #    rustdoc JSON, so both files are needed. Build them from a throwaway
-    #    crate (NOT inside ~/.cargo/registry -- that tree is shared/read-only)
-    #    that depends on axum with a broad feature set (ws, macros, multipart, ...):
-    mkdir -p /tmp/axum-probe/src && cd /tmp/axum-probe
-    cat > Cargo.toml <<'EOF'
-    [package]
-    name = "axum-probe"
-    version = "0.0.0"
-    edition = "2021"
-    [dependencies]
-    axum = { version = "=<match Cargo.lock>", features = ["json","query","form","ws","macros","tokio","http1","http2","tracing","multipart"] }
-    tokio = { version = "1", features = ["full"] }
-    [workspace]
-    EOF
-    echo 'fn main() {}' > src/main.rs
-    RUSTDOCFLAGS="--cap-lints=warn" cargo +nightly rustdoc -p axum --lib -- -Z unstable-options --output-format json
-    RUSTDOCFLAGS="--cap-lints=warn" cargo +nightly rustdoc -p axum-core --lib -- -Z unstable-options --output-format json
-    # -> target/doc/axum.json, target/doc/axum_core.json
+This builds both sides' rustdoc JSON itself:
+  1. tachyon-web's own JSON, built in place from the crate root with the
+     broadest non-exotic feature set (everything except `tor`/`i2p`, which
+     pull in vendored C++ toolchains, and `fips`, which is a build-mode
+     modifier rather than additive API surface).
+  2. axum + axum-core's JSON, built from a throwaway probe crate in a temp
+     directory that depends on axum pinned to the exact version in this
+     repo's Cargo.lock, with every non-private axum feature enabled (so nothing
+     feature-gated on axum's side is invisible to the diff). axum-core's items
+     (FromRequest, IntoResponse, FromRef, ...) are re-exported by axum but NOT
+     inlined into axum's own rustdoc JSON, so both crates are documented
+     separately and unioned.
 
-Usage:
-    python3 api_diff.py tachyon_web.json axum.json axum_core.json [--show-matches]
+The process exits non-zero -- deliberately failing CI -- whenever the public
+surfaces don't line up: anything MISSING in tachyon-web, anything that
+DIFFERS in signature, or any ARITY case (ambiguous multi-candidate pairing)
+that hasn't been manually reviewed away. TACHYON-ONLY additions do not fail
+the build; axum parity does not forbid tachyon-web from having more.
+
+Manual / debugging usage (skips the build, diffs pre-built JSON files):
+
+    python3 scripts/api_diff.py tachyon_web.json axum.json axum_core.json [--show-matches]
 
 Notes / known limitations (read before trusting a verdict blindly):
 - Rustdoc JSON item ids are only valid within their own file -- never merge
@@ -76,14 +68,111 @@ Notes / known limitations (read before trusting a verdict blindly):
   field (public/crate/restricted/default) is used, matching what actually
   shows up in `cargo doc` for a downstream consumer.
 """
+import argparse
 import json
+import re
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Every tachyon-web feature except `tor`/`i2p` (vendored C++ toolchains,
+# not relevant to public API shape) and `fips` (a build-mode modifier, not
+# additive API surface). Kept in sync with the CI "full (no tor/i2p)" build
+# matrix entry so this never needs a toolchain/system-dep the parity job
+# doesn't already have.
+TACHYON_FEATURES = (
+    "json,cookies,matched-path,original-uri,http1,http2,tower-log,ws,form,query,"
+    "sse,sfv,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints"
+)
+
+# Every non-private, non-doc-only axum 0.8 feature, so nothing feature-gated
+# on axum's side is invisible to the diff.
+AXUM_FEATURES = (
+    "form,http1,http2,json,macros,multipart,query,tokio,tracing,ws,"
+    "matched-path,original-uri,tower-log"
+)
 
 
 def load(path):
     with open(path) as f:
         return json.load(f)
+
+
+def run(cmd, cwd=None, env=None):
+    print(f"$ {' '.join(cmd)}", file=sys.stderr)
+    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+
+
+def rustdoc_env():
+    import os
+    env = dict(os.environ)
+    env["RUSTDOCFLAGS"] = "--cap-lints=warn"
+    return env
+
+
+def axum_lock_version(repo_root: Path) -> str:
+    lock = (repo_root / "Cargo.lock").read_text()
+    m = re.search(r'name = "axum"\nversion = "([^"]+)"', lock)
+    if not m:
+        raise RuntimeError("could not find axum's pinned version in Cargo.lock")
+    return m.group(1)
+
+
+def build_tachyon_json(repo_root: Path) -> Path:
+    run(
+        [
+            "cargo", "+nightly", "rustdoc", "--lib", "-p", "tachyon-web",
+            "--no-default-features", "--features", TACHYON_FEATURES,
+            "--", "-Z", "unstable-options", "--output-format", "json",
+        ],
+        cwd=repo_root,
+        env=rustdoc_env(),
+    )
+    out = repo_root / "target" / "doc" / "tachyon_web.json"
+    if not out.exists():
+        raise RuntimeError(f"expected rustdoc output at {out}, not found")
+    return out
+
+
+def build_axum_json(axum_version: str, tmp_dir: Path) -> tuple[Path, Path]:
+    probe = tmp_dir / "axum-probe"
+    (probe / "src").mkdir(parents=True)
+    (probe / "Cargo.toml").write_text(
+        f"""[package]
+name = "axum-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+axum = {{ version = "={axum_version}", features = [{", ".join(f'"{f}"' for f in AXUM_FEATURES.split(","))}] }}
+tokio = {{ version = "1", features = ["full"] }}
+
+[workspace]
+"""
+    )
+    (probe / "src" / "main.rs").write_text("fn main() {}\n")
+
+    for crate_name in ("axum", "axum-core"):
+        run(
+            [
+                "cargo", "+nightly", "rustdoc", "-p", crate_name, "--lib",
+                "--", "-Z", "unstable-options", "--output-format", "json",
+            ],
+            cwd=probe,
+            env=rustdoc_env(),
+        )
+
+    axum_json = probe / "target" / "doc" / "axum.json"
+    axum_core_json = probe / "target" / "doc" / "axum_core.json"
+    for p in (axum_json, axum_core_json):
+        if not p.exists():
+            raise RuntimeError(f"expected rustdoc output at {p}, not found")
+    return axum_json, axum_core_json
 
 
 class Crate:
@@ -462,16 +551,10 @@ def merge_axum_group(crates):
     return merged
 
 
-def main():
-    if len(sys.argv) < 4:
-        print(f"usage: {sys.argv[0]} tachyon_web.json axum.json axum_core.json [--show-matches]", file=sys.stderr)
-        sys.exit(2)
-    show_matches = "--show-matches" in sys.argv
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-
-    tach = Crate(load(args[0]), "tachyon-web")
-    axum_crates = [Crate(load(p), p.rsplit("/", 1)[-1].removesuffix(".json")) for p in args[1:]]
-
+def diff(tach: Crate, axum_crates: list[Crate], show_matches: bool) -> int:
+    """Runs the full diff and prints a report. Returns a process exit code:
+    0 if tachyon-web's public surface is a strict superset of axum's (modulo
+    signature-identical matches), non-zero otherwise."""
     tach_api = collect_public_api(tach)
     axum_api = merge_axum_group(axum_crates)
 
@@ -540,6 +623,42 @@ def main():
     if not show_matches and matches:
         print(f"(matched names hidden; pass --show-matches to list them -- {n_match} total)")
     print("=" * 100)
+
+    failing = n_missing + n_differs + n_arity
+    if failing:
+        print(
+            f"\nPARITY CHECK FAILED: {failing} item(s) block drop-in replaceability "
+            f"({n_missing} missing, {n_differs} differing, {n_arity} unresolved arity). "
+            "tachyon-web is not yet a full axum substitute.",
+            file=sys.stderr,
+        )
+        return 1
+    print("\nPARITY CHECK PASSED: every axum(+axum-core) public item has an identical tachyon-web counterpart.")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("json_files", nargs="*", help="tachyon_web.json axum.json axum_core.json (manual mode; omit all three to build+diff end-to-end)")
+    parser.add_argument("--show-matches", action="store_true")
+    args = parser.parse_args()
+
+    if args.json_files:
+        if len(args.json_files) != 3:
+            parser.error("manual mode requires exactly 3 paths: tachyon_web.json axum.json axum_core.json")
+        tach = Crate(load(args.json_files[0]), "tachyon-web")
+        axum_crates = [
+            Crate(load(p), Path(p).stem) for p in args.json_files[1:]
+        ]
+        sys.exit(diff(tach, axum_crates, args.show_matches))
+
+    print("No JSON files given -- building both sides from source (this is the CI path).", file=sys.stderr)
+    tachyon_json = build_tachyon_json(REPO_ROOT)
+    with tempfile.TemporaryDirectory(prefix="tachyon-api-diff-") as tmp:
+        axum_json, axum_core_json = build_axum_json(axum_lock_version(REPO_ROOT), Path(tmp))
+        tach = Crate(load(tachyon_json), "tachyon-web")
+        axum_crates = [Crate(load(axum_json), "axum"), Crate(load(axum_core_json), "axum_core")]
+        sys.exit(diff(tach, axum_crates, args.show_matches))
 
 
 if __name__ == "__main__":

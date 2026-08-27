@@ -67,16 +67,14 @@ async fn test_start_all_invalid_address() {
     assert!(res.is_err());
 }
 
-// Bodies are streamed lazily (not eagerly buffered) — a handler only pays the cost of
-// waiting for the body if it actually extracts it. A `413`/timeout can only surface once
-// something reads the body, so this route uses `Bytes` (rather than an arity-0 handler)
-// to exercise the read path.
+/// Spawns `router` on plaintext HTTP, sends a `POST /` with a declared `Content-Length: 10`
+/// but no body, and returns the connected stream plus the server task handle — the setup
+/// the two body-read tests below both need before they diverge on what they wait for.
 #[cfg(feature = "http1")]
-#[tokio::test(start_paused = true)]
-async fn test_server_request_timeout() {
-    let router = Router::new().route("/", post(|_body: Bytes| async { "ok" }));
+async fn post_with_undelivered_body(
+    router: Router<()>,
+) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
     let server = Server::new(router);
-
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -88,6 +86,19 @@ async fn test_server_request_timeout() {
     let req_headers = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n\r\n";
     stream.write_all(req_headers.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
+
+    (stream, server_handle)
+}
+
+// Bodies are streamed lazily (not eagerly buffered) — a handler only pays the cost of
+// waiting for the body if it actually extracts it. A `413`/timeout can only surface once
+// something reads the body, so this route uses `Bytes` (rather than an arity-0 handler)
+// to exercise the read path.
+#[cfg(feature = "http1")]
+#[tokio::test(start_paused = true)]
+async fn test_server_request_timeout() {
+    let router = Router::new().route("/", post(|_body: Bytes| async { "ok" }));
+    let (mut stream, server_handle) = post_with_undelivered_body(router).await;
 
     tokio::time::advance(Duration::from_secs(32)).await;
 
@@ -106,19 +117,7 @@ async fn test_server_request_timeout() {
 #[tokio::test]
 async fn test_server_ignores_unread_body_for_bodyless_handler() {
     let router = Router::new().route("/", post(|| async { "ok" }));
-    let server = Server::new(router);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let server_handle = tokio::spawn(async move {
-        let _ = server.serve_http(listener).await;
-    });
-
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let req_headers = "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n\r\n";
-    stream.write_all(req_headers.as_bytes()).await.unwrap();
-    stream.flush().await.unwrap();
+    let (mut stream, server_handle) = post_with_undelivered_body(router).await;
 
     // No body is ever sent. The handler doesn't need it, so the response should arrive
     // promptly rather than after any body-read timeout.

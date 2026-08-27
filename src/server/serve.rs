@@ -79,7 +79,8 @@ pub struct WithGracefulShutdown<F> {
 
 impl<F> std::fmt::Debug for WithGracefulShutdown<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WithGracefulShutdown").finish_non_exhaustive()
+        f.debug_struct("WithGracefulShutdown")
+            .finish_non_exhaustive()
     }
 }
 

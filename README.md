@@ -54,27 +54,6 @@ Path/query/JSON extraction, middleware, shared state, static files, sync handler
 serving over Tor/I2P each have an example in [`examples/`](examples/), run with
 `cargo run --example <name>`. Some need extra features; the example file says which.
 
-## Differences from Axum
-
-The router, extractors (`Path`, `Query`, `Json`, `State`) and `IntoResponse` work as they do
-in Axum, and the Cargo feature names and defaults match Axum's where the capability is
-shared, so porting a handler or a `Cargo.toml` should be uneventful.
-
-Middleware is built on `tower::Layer`/`tower::Service` — the same foundation Axum itself
-uses, not a separate bespoke system. `Router::layer`/`route_layer` and
-`MethodRouter::layer` apply any `tower::Layer` (including `tower-http`'s), and
-`middleware::from_fn`/`from_fn_with_state`/`map_request`/`map_response`/`from_extractor`
-mirror `axum::middleware`'s free functions for the common case of writing one without hand-rolling
-a `Layer`/`Service` pair. `tower` is a normal (non-optional) dependency for exactly this
-reason, and `CompiledRouter`/`Router<()>` implement `tower::Service` directly, so
-`app.oneshot(req)` works the same way it does in Axum.
-
-On performance: routing allocates nothing for the common case (arity-0 handlers, no path
-params), static files are served zero-copy from an in-memory cache, and workers are per-core
-with `SO_REUSEPORT`. `benches/` measures against Axum and Actix-Web directly. Actix is still
-ahead on the trivial-handler benchmark — roughly 320k (Actix-Web) vs 300k (Tachyon-Web) vs 280k (Axum) 
-req/sec on the same hardware, see `benches/optimistic`.
-
 ## HTTPS
 
 Throwaway self-signed certificate, for development:
@@ -140,166 +119,6 @@ clearnet listener, via `MultiServer`. See
 it sits outside the crate's `#![forbid(unsafe_code)]` guarantee. Read the
 `tachyon_web::server::i2p` module docs before using it for anything security-sensitive.
 
-## WebSockets
-
-```rust,no_run
-use tachyon_web::ws::{WebSocket, WebSocketUpgrade};
-use tachyon_web::http::Response;
-use tachyon_web::http::response::Body;
-use tachyon_web::{Router, get};
-
-async fn handler(ws: WebSocketUpgrade) -> Response<Body> {
-    ws.on_upgrade(handle_socket)
-}
-
-async fn handle_socket(mut socket: WebSocket) {
-    while let Some(Ok(msg)) = socket.recv().await {
-        if socket.send(msg).await.is_err() {
-            break;
-        }
-    }
-}
-
-let _app: Router<()> = Router::new().route("/ws", get(handler));
-```
-
-Requires the `ws` feature.
-
-## Compression
-
-`Accept-Encoding` negotiation and response coding for `zstd`, `br`, `gzip` and `deflate`,
-applied to every transport at once:
-
-```rust,no_run
-use tachyon_web::{Router, Server, get};
-use tachyon_web::http::compression::{Compression, CompressionLevel};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app: Router = Router::new().route("/", get(|| async { "hello" }));
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-
-    Server::new(app)
-        .compression(
-            Compression::new()                       // every codec this build has, zstd first
-                .quality(CompressionLevel::Fastest), // encode speed, for per-request bodies
-        )
-        .serve_http(listener)
-        .await?;
-    Ok(())
-}
-```
-
-Or scoped to one router with `Router::compression(..)`. The codec feature names match
-`tower-http`'s (`compression-gzip`, `compression-br`, …, `compression-full`), so migrating
-from a `CompressionLayer` is a `Cargo.toml` search-and-replace.
-
-Negotiation is RFC 9110 §12.5.3: q-values are honoured, `q=0` is a refusal rather than a low
-ranking, and `*` resolves as a wildcard. Beyond that it does the things a compression layer
-is usually expected to do and usually doesn't: `Vary: Accept-Encoding` is appended even to
-the responses it leaves uncompressed, strong `ETag`s are weakened because a coded body is a
-different representation, `Cache-Control: no-transform` is honoured, `Content-Length` is
-rewritten to the coded length, output that came out larger than the input is discarded in
-favour of the original, and zstd's window is clamped to the 8 MiB every browser decoder caps
-at — the usual way to ship a `Content-Encoding: zstd` that works in `curl` and fails in
-Chrome. See the [`http::compression`] module docs for the full list of what is never
-compressed.
-
-`ServeDir` picks up pre-compressed `.zst` sidecars alongside the `.br` and `.gz` it already
-served, and negotiates among the ones each asset actually has.
-
-## Structured Field Values
-
-RFC 9651 gives most headers standardised since 2019 (`Priority`, `Cache-Status`,
-`Signature-Input`, …) a real data model instead of a string to regex. `sfv_dictionary!`
-declares a typed header that parses itself, rejecting a malformed field with `400 Bad
-Request` before your handler runs:
-
-```rust,no_run
-use tachyon_web::http::sfv::StructuredHeader;
-use tachyon_web::sfv_dictionary;
-use tachyon_web::{Router, get};
-
-sfv_dictionary! {
-    /// A made-up session header.
-    pub struct SessionState for "secure-session-state" {
-        "id" => id: String,
-        "ttl" => ttl: i64 = 0,
-    }
-}
-
-async fn handler(StructuredHeader(session): StructuredHeader<SessionState>) -> String {
-    format!("session {} (ttl {})", session.id, session.ttl)
-}
-
-let _app: Router<()> = Router::new().route("/", get(handler));
-```
-
-Requires the `sfv` feature. RFC 9218 `Priority`-based HTTP/2 stream scheduling works without
-it — it's built on the same machinery internally, just not exposed as public API.
-
-## 103 Early Hints
-
-[RFC 8297]. An informational response sent *during* handler think-time, telling the browser
-what to fetch before the HTML exists:
-
-```rust,no_run
-use tachyon_web::{Html, Router, Server, get};
-use tachyon_web::http::early_hints::{EarlyHints, EarlyHintsConfig, Link};
-
-async fn load() -> String {
-    "some data".to_string()
-}
-
-fn render(data: &str) -> String {
-    format!("<p>{data}</p>")
-}
-
-async fn page(hints: EarlyHints) -> Html<String> {
-    hints.send([
-        Link::preload("/static/app.css").as_style(),
-        Link::preconnect("https://cdn.example.com"),
-    ]); // returns immediately, nothing to await
-
-    let data = load().await; // the think-time this exists to overlap
-    Html(render(&data))
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let app: Router = Router::new().route("/", get(page));
-    let cert = tachyon_web::tls::generate_self_signed_cert(vec!["localhost".into()])?;
-
-    Server::new(app)
-        .early_hints(EarlyHintsConfig::new())
-        .start_all("0.0.0.0:443", None, cert.cert_pem, cert.key_pem)
-        .await?;
-    Ok(())
-}
-```
-
-There is also a declarative form — `get(page).early_hints([..])` on a route, or
-`Router::early_hints([..])` — which renders the `Link` block once at startup and sends it
-before the handler is even called.
-
-This is the one feature here that cannot be a middleware in any framework built on
-`Service<Request> -> Response`: an informational response is a *second* response, and that
-signature returns one. `hyper` refuses a 1xx status outright and never calls `h2`'s
-`send_informational`, so enabling `early-hints` moves HTTPS connections that negotiate `h2`
-onto Tachyon's own `h2`-based driver. HTTP/3 needs no such thing — Tachyon already owns that
-dispatch loop.
-
-Hints go out over HTTP/2-over-TLS and HTTP/3. HTTP/1.1, h2c, Tor and I2P hand handlers a
-no-op handle instead, so a handler never needs a fallback path. By default only requests
-carrying `Sec-Fetch-Mode: navigate` are hinted, which is both what browsers act on and what
-keeps an unexpected 1xx away from clients that mishandle one. The native HTTP/2 driver does
-not support RFC 8441 WebSockets-over-HTTP/2; no browser uses them, but read
-[`http::early_hints`] before enabling it if a non-browser client of yours does.
-
-[RFC 8297]: https://www.rfc-editor.org/rfc/rfc8297
-[`http::compression`]: https://docs.rs/tachyon-web/latest/tachyon_web/http/compression/
-[`http::early_hints`]: https://docs.rs/tachyon-web/latest/tachyon_web/http/early_hints/
-
 ## Feature flags
 
 Flags shared with Axum keep Axum's name and default:
@@ -346,10 +165,6 @@ the server peeks at each connection's first bytes and switches to the HTTP/2 sta
 sees the client preface, falling back to HTTP/1.1 otherwise. Browsers won't use it — they
 only negotiate HTTP/2 via TLS ALPN — but `curl --http2-prior-knowledge`, gRPC clients, and
 service meshes that terminate TLS upstream will.
-
-## Minimum supported Rust version
-
-Rust 1.92, edition 2024. MSRV bumps are not breaking changes while the crate is pre-1.0.
 
 ## Acknowledgements
 

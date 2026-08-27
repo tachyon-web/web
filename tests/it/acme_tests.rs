@@ -8,57 +8,30 @@ use tachyon_web::tls::acme::{
     AcmeError, AcmeManager, AcmeResolver, get_challenge, register_challenge, unregister_challenge,
 };
 
+/// Covers the challenge store's basic CRUD contract in one pass: register/retrieve,
+/// overwrite-on-reregister, unregistering a nonexistent token is a no-op, two tokens don't
+/// interfere, and removing one leaves the other intact.
 #[tokio::test]
-async fn test_challenge_register_and_retrieve() {
-    let token = "basic-token-aaa".to_string();
-    let auth = "basic-auth-bbb".to_string();
+async fn test_challenge_store_lifecycle() {
+    unregister_challenge("does-not-exist");
+    assert_eq!(get_challenge("does-not-exist"), None, "unregister of a nonexistent token is a no-op");
 
-    register_challenge(token.clone(), auth.clone());
-    assert_eq!(get_challenge(&token), Some(auth),);
+    let (token_a, token_b) = ("lifecycle-tok-a".to_string(), "lifecycle-tok-b".to_string());
+    register_challenge(token_a.clone(), "first-auth".to_string());
+    assert_eq!(get_challenge(&token_a), Some("first-auth".to_string()));
 
-    unregister_challenge(&token);
-    assert_eq!(get_challenge(&token), None);
-}
-
-#[tokio::test]
-async fn test_challenge_overwrite() {
-    let token = "overwrite-tok".to_string();
-
-    register_challenge(token.clone(), "first-auth".to_string());
-    register_challenge(token.clone(), "second-auth".to_string());
-
+    register_challenge(token_a.clone(), "second-auth".to_string());
     assert_eq!(
-        get_challenge(&token),
+        get_challenge(&token_a),
         Some("second-auth".to_string()),
         "second registration must overwrite the first"
     );
-    unregister_challenge(&token);
-}
 
-#[tokio::test]
-async fn test_challenge_unregister_nonexistent_is_noop() {
-    unregister_challenge("this-token-does-not-exist");
-    assert_eq!(get_challenge("this-token-does-not-exist"), None);
-}
-
-#[tokio::test]
-async fn test_challenge_isolation() {
-    let token_a = "isolation-tok-a".to_string();
-    let token_b = "isolation-tok-b".to_string();
-
-    register_challenge(token_a.clone(), "auth-a".to_string());
     register_challenge(token_b.clone(), "auth-b".to_string());
-
-    assert_eq!(get_challenge(&token_a), Some("auth-a".to_string()));
     assert_eq!(get_challenge(&token_b), Some("auth-b".to_string()));
 
     unregister_challenge(&token_a);
-
-    assert_eq!(
-        get_challenge(&token_a),
-        None,
-        "removing token_a must not affect token_b"
-    );
+    assert_eq!(get_challenge(&token_a), None, "removing token_a must not affect token_b");
     assert_eq!(
         get_challenge(&token_b),
         Some("auth-b".to_string()),
@@ -66,6 +39,7 @@ async fn test_challenge_isolation() {
     );
 
     unregister_challenge(&token_b);
+    assert_eq!(get_challenge(&token_b), None);
 }
 
 #[tokio::test]
@@ -101,6 +75,17 @@ async fn test_concurrent_challenge_operations() {
     );
 }
 
+/// `GET path` through `router`, with the well-known-path prefix conveniences the ACME tests
+/// below all need: an absolute-form URI (the challenge interceptor keys off the raw request
+/// path) and an empty body.
+async fn get_through(router: &Router<()>, path: &str) -> hyper::Response<Body> {
+    let req = Request::builder()
+        .uri(format!("http://localhost{path}"))
+        .body(Body::empty())
+        .unwrap();
+    router.handle_request(req).await
+}
+
 #[tokio::test]
 async fn test_router_intercepts_acme_challenge() {
     let token = "router-intercept-tok".to_string();
@@ -108,15 +93,7 @@ async fn test_router_intercepts_acme_challenge() {
     register_challenge(token.clone(), auth.clone());
 
     let router = Router::new().with_state::<()>(());
-
-    let req = Request::builder()
-        .uri(format!(
-            "http://localhost/.well-known/acme-challenge/{token}"
-        ))
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = router.handle_request(req).await;
+    let resp = get_through(&router, &format!("/.well-known/acme-challenge/{token}")).await;
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
@@ -136,13 +113,7 @@ async fn test_router_intercepts_acme_challenge() {
 #[tokio::test]
 async fn test_router_challenge_not_registered_falls_through_to_404() {
     let router = Router::new().with_state::<()>(());
-
-    let req = Request::builder()
-        .uri("http://localhost/.well-known/acme-challenge/unregistered-token")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = router.handle_request(req).await;
+    let resp = get_through(&router, "/.well-known/acme-challenge/unregistered-token").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -155,13 +126,7 @@ async fn test_router_normal_routes_not_affected_by_acme() {
     }
 
     let router = Router::new().route("/", get(index)).with_state::<()>(());
-
-    let req = Request::builder()
-        .uri("http://localhost/")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = router.handle_request(req).await;
+    let resp = get_through(&router, "/").await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -319,13 +284,7 @@ fn test_acme_error_display() {
 #[tokio::test]
 async fn test_challenge_empty_token_not_served() {
     let router = Router::new().with_state::<()>(());
-
-    let req = Request::builder()
-        .uri("http://localhost/.well-known/acme-challenge/")
-        .body(Body::empty())
-        .unwrap();
-
-    let resp = router.handle_request(req).await;
+    let resp = get_through(&router, "/.well-known/acme-challenge/").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -342,13 +301,8 @@ async fn test_challenge_path_prefix_not_intercepted_as_challenge() {
 
     register_challenge("other-token".to_string(), "other-auth".to_string());
 
-    let req = Request::builder()
-        .uri("http://localhost/.well-known/acme-challenge/custom")
-        .body(Body::empty())
-        .unwrap();
-
     // "custom" isn't in the challenge store, so it falls through to the registered route.
-    let resp = router.handle_request(req).await;
+    let resp = get_through(&router, "/.well-known/acme-challenge/custom").await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     unregister_challenge("other-token");

@@ -99,7 +99,7 @@ leaf_rejection! {
 /// chunked transfer, a body-read deadline expiring, ...). Matches
 /// `axum_core::extract::rejection::FailedToBufferBody`.
 ///
-/// Unlike a [`leaf_rejection!`]-generated type, this carries its own status
+/// Unlike a `leaf_rejection!`-generated type, this carries its own status
 /// code rather than a fixed one: the underlying [`CoreError`] this is built
 /// from can legitimately be any status (e.g. a `408 Request Timeout` from a
 /// body-read deadline, not just a generic `400`), and collapsing that to a

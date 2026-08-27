@@ -140,40 +140,32 @@ async fn test_ws_protocol_negotiation() {
     );
 }
 
+/// A well-formed upgrade request needs both a `POST`-excluding method and the `Upgrade`
+/// header present; missing either must be rejected.
 #[tokio::test]
-async fn test_ws_upgrade_rejects_non_get() {
+async fn test_ws_upgrade_rejects_malformed_requests() {
     use hyper::{Method, Request};
     use tachyon_web::http::response::Body;
 
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/ws")
-        .header(hyper::header::CONNECTION, "upgrade")
-        .header(hyper::header::UPGRADE, "websocket")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .body(Body::empty())
-        .unwrap();
-    let (mut parts, _) = req.into_parts();
-    let result = WebSocketUpgrade::from_request_parts(&mut parts, &());
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_ws_upgrade_rejects_missing_upgrade_header() {
-    use hyper::{Method, Request};
-    use tachyon_web::http::response::Body;
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/ws")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .body(Body::empty())
-        .unwrap();
-    let (mut parts, _) = req.into_parts();
-    let result = WebSocketUpgrade::from_request_parts(&mut parts, &());
-    assert!(result.is_err());
+    for (label, method, with_upgrade_header) in [
+        ("non-GET method", Method::POST, true),
+        ("missing Upgrade header", Method::GET, false),
+    ] {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri("/ws")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if with_upgrade_header {
+            builder = builder
+                .header(hyper::header::CONNECTION, "upgrade")
+                .header(hyper::header::UPGRADE, "websocket");
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let (mut parts, _) = req.into_parts();
+        let result = WebSocketUpgrade::from_request_parts(&mut parts, &());
+        assert!(result.is_err(), "{label} must be rejected");
+    }
 }
 
 /// An established WebSocket outlives the HTTP connection it was upgraded from, so it escapes

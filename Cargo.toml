@@ -164,7 +164,7 @@ axum-server = "0.8"
 actix-web = "4"
 actix-files = "0.7"
 rocket = "0.5"
-salvo = "0.95"
+salvo = "0.96"
 tower-http = "0.7"
 rustls = { version = "0.23", default-features = false }
 rustls-pki-types = "1"

@@ -272,7 +272,7 @@ where
     ///
     /// Returns an error if FIPS compliance enforcement fails, or — under the `fips` feature —
     /// if `acceptor`'s `rustls::ServerConfig` doesn't itself negotiate FIPS-approved
-    /// algorithms (see [`crate::server::assert_fips_server_config`]; this catches a config
+    /// algorithms (see `assert_fips_server_config`; this catches a config
     /// built without going through [`TlsPolicy`](crate::tls::TlsPolicy)). Per-connection I/O
     /// errors (accept failures, handshake failures, etc.) are logged and do not terminate the
     /// accept loop.

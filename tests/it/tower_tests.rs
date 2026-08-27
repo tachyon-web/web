@@ -248,6 +248,13 @@ async fn test_route_layer_does_not_wrap_the_fallback() {
     assert_eq!(miss_body, "fallback");
 }
 
+/// A `tower::Layer`/`route_service`-mounted service that fails must surface as a 500,
+/// whichever stage the failure comes from.
+async fn assert_mounted_service_failure_is_500(router: &CompiledRouter<()>, path: &str) {
+    let (status, _body) = send_get(router, path).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
 /// A `tower::Layer` whose wrapped service's `poll_ready` errors must surface
 /// as a 500, driven through `from_tower_layer`'s `service.ready().await` err
 /// branch.
@@ -264,9 +271,7 @@ async fn test_layer_surfaces_service_not_ready_as_500() {
             .route("/", get(hello))
             .layer(AlwaysFailsReadyLayer),
     );
-
-    let (status, _body) = send_get(&router, "/").await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_mounted_service_failure_is_500(&router, "/").await;
 }
 
 /// A `tower::Layer` whose wrapped service's `call` future errors must also
@@ -285,10 +290,7 @@ async fn test_layer_surfaces_service_call_failure_as_500() {
             .route("/", get(hello))
             .layer(AlwaysFailsCallLayer),
     );
-
-    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
-    let resp = router.handle_request(req).await;
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_mounted_service_failure_is_500(&router, "/").await;
 }
 
 /// `ServiceHandler::call` (the `route_service`/`nest_service`/
@@ -323,9 +325,7 @@ async fn test_route_service_streams_an_oversized_body_through_unbuffered() {
 #[tokio::test]
 async fn test_route_service_surfaces_service_not_ready_as_500() {
     let router = compile(Router::new().route_service("/svc", AlwaysFailsReady));
-
-    let (status, _body) = send_get(&router, "/svc").await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_mounted_service_failure_is_500(&router, "/svc").await;
 }
 
 /// A raw `tower::Service` mounted via `route_service` whose `call` future
@@ -334,9 +334,7 @@ async fn test_route_service_surfaces_service_not_ready_as_500() {
 #[tokio::test]
 async fn test_route_service_surfaces_service_call_failure_as_500() {
     let router = compile(Router::new().route_service("/svc", AlwaysFailsCall));
-
-    let (status, _body) = send_get(&router, "/svc").await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_mounted_service_failure_is_500(&router, "/svc").await;
 }
 
 /// `Router::fallback_service` must route any request that doesn't match a
