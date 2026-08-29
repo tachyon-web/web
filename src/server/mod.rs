@@ -63,63 +63,50 @@ mod http;
 pub mod i2p;
 mod listener;
 mod multi;
+mod redirect;
 pub mod serve;
+#[cfg(feature = "tls")]
+mod tls_config;
 #[cfg(feature = "tor")]
 pub mod tor;
+mod worker_pool;
 
 pub use listener::{Listener, ListenerExt, TapIo};
 pub use multi::MultiServer;
 pub use serve::{Serve, WithGracefulShutdown};
+#[cfg(feature = "tls")]
+pub use tls_config::{HttpsServer, RustlsConfig, bind_rustls};
 
 use crate::routing::CompiledRouter;
-use std::future::Future;
+#[cfg(any(feature = "ws", feature = "tls"))]
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
 use crate::http::response::Body;
-#[cfg(feature = "tls")]
-use hyper::service::service_fn;
 use hyper::{Request, Response};
 #[cfg(any(feature = "cert-gen", feature = "lets-encrypt", feature = "http3"))]
 use tokio_rustls::TlsAcceptor;
+
+use redirect::parse_addr;
+#[cfg(feature = "tls")]
+pub use redirect::{REDIRECT_MAX_CONNECTIONS, serve_http_redirect_and_challenges};
+#[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+use redirect::{RedirectInfo, parse_port};
+#[cfg(any(feature = "cert-gen", feature = "lets-encrypt", feature = "http3"))]
+pub(crate) use tls_config::alpn_protocols;
+#[cfg(feature = "fips")]
+use tls_config::assert_fips_server_config;
+#[cfg(any(feature = "lets-encrypt", feature = "cert-gen"))]
+use tls_config::tls_config_builder;
+use worker_pool::IS_LOCAL_WORKER;
+use worker_pool::run_worker_pool;
 
 /// Default read timeout for both plaintext and TLS connections.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default handshake timeout for TLS connections.
 #[cfg(feature = "tls")]
 pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Per-worker connection ceiling for the plaintext port-80 redirect listener.
-///
-/// Far below [`Server::max_connections`] on purpose: every connection here gets a bodyless
-/// `308` or a challenge token and closes, so the queue drains fast.
-#[cfg(feature = "tls")]
-pub const REDIRECT_MAX_CONNECTIONS: usize = 2048;
-/// Parameters for the plaintext port-80 redirect/ACME-challenge listener spawned alongside a
-/// TLS listener — see [`serve_http_redirect_and_challenges`].
-///
-/// Always defined (not `#[cfg(feature = "tls")]`) because [`run_worker_pool`]'s signature
-/// takes `Option<RedirectInfo>` unconditionally — only *constructing* a `Some` (and consuming
-/// it in [`run_worker_thread`]) requires the `tls` feature.
-#[derive(Clone)]
-struct RedirectInfo {
-    // All three fields are only ever populated behind `#[cfg(feature = "tls")]` construction
-    // sites — cfg'd out entirely (rather than left in and unread) for a non-`tls` build, so
-    // that build doesn't trip `-D dead-code` over a type it can only ever hold as `None`.
-    #[cfg(feature = "tls")]
-    addr: std::net::SocketAddr,
-    #[cfg(feature = "tls")]
-    https_port: u16,
-    /// The known-good hostnames this deployment serves, when available (e.g. the ACME
-    /// `domains` list in [`Server::serve_all_acme`]). When `Some`, an inbound `Host` header
-    /// that doesn't match any entry is replaced with the first domain rather than echoed back
-    /// into the `Location` header — otherwise a request naming an arbitrary `Host` would get a
-    /// same-status redirect to an attacker-chosen origin. `None` (e.g. [`Server::start_all`],
-    /// which only knows a certificate, not the domain list) falls back to echoing the request's
-    /// `Host` unchecked, matching this listener's long-standing behaviour there.
-    #[cfg(feature = "tls")]
-    allowed_hosts: Option<Arc<[String]>>,
-}
 
 /// Default for [`Server::max_websocket_connections`] — see that field for how to size it.
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 25_600;
@@ -130,211 +117,6 @@ pub const DEFAULT_MAX_H3_CONCURRENT_STREAMS: usize = 256;
 /// cached or provisioned before starting the TLS listener regardless.
 #[cfg(feature = "lets-encrypt")]
 const FIRST_CERT_TIMEOUT: Duration = Duration::from_mins(1);
-
-thread_local! {
-    pub(crate) static IS_LOCAL_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Binds `addr` with `SO_REUSEADDR`/`SO_REUSEPORT` so one worker thread per core can share the
-/// port — see [`run_worker_pool`].
-///
-/// On Linux, `SO_REUSEPORT` lets *any* process running as the same effective UID join this
-/// listener's group and receive a share of its inbound connections — there is no additional
-/// namespace or capability check. That's inherent to the mechanism (no `SO_REUSEPORT_LB` or
-/// eBPF socket-selection filter is installed here), not a bug, but it's worth knowing given
-/// this crate's anonymity-transport features: a compromised same-UID process could observe or
-/// intercept a share of plaintext connections it otherwise has no access to.
-fn bind_reuseport(addr: std::net::SocketAddr) -> Result<std::net::TcpListener, std::io::Error> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let domain = Domain::for_address(addr);
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    {
-        socket.set_reuse_port(true)?;
-    }
-    socket.bind(&addr.into())?;
-    socket.set_nonblocking(true)?;
-    socket.listen(4096)?;
-    Ok(std::net::TcpListener::from(socket))
-}
-
-/// One worker thread's body: binds its share of `addr` (and, if configured, the redirect
-/// listener), reports the bind outcome over `bind_tx`, then runs `serve_fn` for the rest of
-/// this thread's life. Factored out of [`run_worker_pool`] to keep that function under
-/// clippy's line-count lint.
-async fn run_worker_thread<S, F, Fut>(
-    server: Arc<Server<S>>,
-    serve_fn: Arc<F>,
-    addr: std::net::SocketAddr,
-    redirect_info: Option<RedirectInfo>,
-    bind_tx: std::sync::mpsc::Sender<Result<(), std::io::Error>>,
-) where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(Server<S>, TcpListener) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
-{
-    IS_LOCAL_WORKER.with(|flag| flag.set(true));
-
-    // Only used for the HTTP->HTTPS redirect listener, which requires TLS.
-    #[cfg(not(feature = "tls"))]
-    let _ = &redirect_info;
-
-    #[cfg(feature = "tls")]
-    if let Some(info) = redirect_info {
-        let r_listener_res = bind_reuseport(info.addr).and_then(TcpListener::from_std);
-        match r_listener_res {
-            Ok(l) => {
-                tokio::task::spawn_local(async move {
-                    serve_http_redirect_and_challenges(l, info.https_port, info.allowed_hosts)
-                        .await;
-                });
-            }
-            Err(e) => {
-                tracing::error!("worker redirect bind error: {e}");
-            }
-        }
-    }
-
-    let listener_res = bind_reuseport(addr).and_then(TcpListener::from_std);
-    let listener = match listener_res {
-        Ok(l) => {
-            let _ = bind_tx.send(Ok(()));
-            l
-        }
-        Err(e) => {
-            tracing::error!("worker bind error: {e}");
-            let _ = bind_tx.send(Err(e));
-            return;
-        }
-    };
-
-    let server_clone = (*server).clone();
-    let _ = serve_fn(server_clone, listener).await;
-}
-
-async fn run_worker_pool<S, F, Fut>(
-    server: Server<S>,
-    addr: std::net::SocketAddr,
-    redirect_info: Option<RedirectInfo>,
-    serve_fn: F,
-) -> Result<(), std::io::Error>
-where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(Server<S>, TcpListener) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
-{
-    // Fails fast, with the real error text, before binding a listener on every core: every
-    // worker thread runs `serve_fn` via `let _ = serve_fn(...).await` (its return value is
-    // otherwise unobservable, since the accept loop is expected to run forever), so a
-    // same-check failure inside `serve_fn` itself only ever surfaced as the generic "all
-    // worker threads exited" error below, with the actual cause left to a log line. This
-    // check is cheap and a no-op without the `fips` feature, so running it unconditionally
-    // here (plain HTTP included) costs nothing.
-    enforce_fips_compliance()?;
-
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let mut handles = Vec::new();
-    let server = Arc::new(server);
-    let serve_fn = Arc::new(serve_fn);
-    // Each worker thread reports whether it managed to bind its listener, so
-    // that a totally unbindable address (e.g. permission denied, or already
-    // in use on every core) produces a real `Err` instead of hanging forever
-    // on the `pending()` below with only a log line to show for it.
-    let (bind_tx, bind_rx) = std::sync::mpsc::channel::<Result<(), std::io::Error>>();
-
-    for i in 0..cores {
-        let server = server.clone();
-        let serve_fn = serve_fn.clone();
-        let core_id = core_ids.get(i).copied();
-        let bind_tx = bind_tx.clone();
-        let redirect_info = redirect_info.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("tachyon-worker-{i}"))
-            .spawn(move || {
-                if let Some(id) = core_id {
-                    let _ = core_affinity::set_for_current(id);
-                }
-
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    tracing::error!("failed to build tokio runtime for worker thread");
-                    return;
-                };
-
-                let local = tokio::task::LocalSet::new();
-                local.block_on(
-                    &rt,
-                    run_worker_thread(server, serve_fn, addr, redirect_info, bind_tx),
-                );
-            })?;
-        handles.push(handle);
-    }
-    drop(bind_tx);
-
-    let (bind_results, bind_rx) = tokio::task::spawn_blocking(move || {
-        let results = (0..cores)
-            .filter_map(|_| bind_rx.recv().ok())
-            .collect::<Vec<_>>();
-        (results, bind_rx)
-    })
-    .await
-    .unwrap_or_else(|_| (Vec::new(), std::sync::mpsc::channel().1));
-    let bound = bind_results.iter().filter(|r| r.is_ok()).count();
-    if bound == 0 {
-        return Err(bind_results
-            .into_iter()
-            .find_map(std::result::Result::err)
-            .unwrap_or_else(|| {
-                std::io::Error::other("all worker threads failed to bind their listener")
-            }));
-    }
-    if bound < cores {
-        tracing::warn!(
-            "Only {bound}/{cores} worker threads bound successfully; running in a degraded state"
-        );
-    }
-
-    let _ = handles;
-    // Each worker's accept loop runs indefinitely, so under normal operation this task
-    // should never resolve. But a worker can still exit early *after* a successful bind —
-    // e.g. `serve_fn`'s own `enforce_fips_compliance()` check failing right at the start of
-    // `serve_http`/`serve_https` — and previously that left this function blocked on
-    // `pending::<()>().await` forever, reporting nothing beyond a `tracing::error!` from
-    // inside the dead thread. Every worker holds its `bind_tx` clone for its entire
-    // lifetime (it's captured by the async block that runs `serve_fn`), so waiting for the
-    // channel to close — every clone dropped, meaning every worker thread has exited,
-    // whether from returning or panicking — is a reliable "the whole pool has died" signal.
-    //
-    // This waits on a plain `std::thread`, not `tokio::task::spawn_blocking`: a
-    // `spawn_blocking` closure is tracked by the runtime's blocking pool, and — because it
-    // can't be preempted — `Runtime::drop` blocks the dropping thread until it returns.
-    // Under normal operation it never does (the accept loops run forever), so a caller that
-    // `tokio::spawn`s this and later drops or aborts that task (a test tearing down its own
-    // runtime, for instance) would hang forever on the runtime's own shutdown, long after
-    // the task itself was supposedly cancelled. A bare OS thread carries no such obligation:
-    // the runtime shuts down without waiting for it, and this future itself stays cancellable
-    // through the `oneshot` receiver like any other `.await` point.
-    let (hangup_tx, hangup_rx) = tokio::sync::oneshot::channel();
-    let _ = std::thread::Builder::new()
-        .name("tachyon-worker-hangup".to_string())
-        .spawn(move || {
-            while bind_rx.recv().is_ok() {}
-            let _ = hangup_tx.send(());
-        });
-    match hangup_rx.await {
-        Ok(()) => Err(std::io::Error::other(
-            "all worker threads exited without accepting a connection — check for an early \
-             error from `serve_fn` (e.g. FIPS enforcement) in the logs above",
-        )),
-        Err(_) => Err(std::io::Error::other(
-            "hangup watcher thread dropped without reporting",
-        )),
-    }
-}
 
 /// Main server configuration and runner.
 ///
@@ -842,7 +624,7 @@ where
         config.alpn_protocols = alpn_protocols(true);
         let config = Arc::new(config);
 
-        spawn_h3(&self, config.clone(), tls_addr)?;
+        h3::spawn_h3(&self, config.clone(), tls_addr)?;
 
         let addr = parse_addr(tls_addr)?;
         let tls_acceptor = TlsAcceptor::from(config);
@@ -969,16 +751,7 @@ where
 
         // Build the TLS config backed by the ACME hot-swap resolver, sharing the same
         // crypto/TLS policy as the onion/i2p listeners (see `Server::tls_policy`).
-        let mut tls_config = rustls::ServerConfig::builder_with_provider(policy.provider())
-            .with_protocol_versions(policy.versions())
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("TLS version configuration failed: {e}"),
-                )
-            })?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
+        let mut tls_config = tls_config_builder(&policy)?.with_cert_resolver(resolver);
 
         tls_config.alpn_protocols = alpn_protocols(cfg!(feature = "http3"));
 
@@ -986,7 +759,7 @@ where
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
 
         #[cfg(feature = "http3")]
-        spawn_h3(&self, tls_config, tls_addr)?;
+        h3::spawn_h3(&self, tls_config, tls_addr)?;
 
         // Bind the HTTPS listener and serve (blocks the calling task).
         let addr = parse_addr(tls_addr)?;
@@ -1037,15 +810,7 @@ where
         // fully custom `TlsPolicy`) for stricter version pinning than the default (TLS 1.3
         // and 1.2 both offered).
         let policy = self.effective_tls_policy();
-        let mut tls_config = rustls::ServerConfig::builder_with_provider(policy.provider())
-            .with_protocol_versions(policy.versions())
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to configure TLS protocol versions: {e}"),
-                )
-            })?
-            .with_no_client_auth()
+        let mut tls_config = tls_config_builder(&policy)?
             .with_single_cert(cert_chain, key_der)
             .map_err(|e| {
                 std::io::Error::new(
@@ -1075,7 +840,7 @@ where
 
         // Start HTTP/3 QUIC Server (if the feature is enabled).
         #[cfg(feature = "http3")]
-        spawn_h3(&self, tls_config, tls_addr)?;
+        h3::spawn_h3(&self, tls_config, tls_addr)?;
 
         // Start the HTTPS listener (blocks this task).
         let addr = parse_addr(tls_addr)?;
@@ -1088,64 +853,6 @@ where
 
         Ok(())
     }
-}
-
-/// Builds the QUIC endpoint HTTP/3 is served over, from a rustls config and a bind address.
-///
-/// Shared by every `http3` entry point so their limits can't drift apart.
-#[cfg(feature = "http3")]
-fn build_quic_server(
-    config: Arc<rustls::ServerConfig>,
-    io: impl tachyon_quic::s2n_quic::provider::io::TryInto<
-        Error: std::error::Error + Send + Sync + 'static,
-    >,
-) -> Result<tachyon_quic::s2n_quic::Server, Box<dyn std::error::Error + Send + Sync>> {
-    let limits = tachyon_quic::s2n_quic::provider::limits::Limits::new()
-        // 1 MB flow-control windows match H/2 settings and saturate LAN pipes.
-        .with_data_window(1_048_576)?
-        .with_bidirectional_local_data_window(1_048_576)?
-        .with_bidirectional_remote_data_window(1_048_576)?
-        // 100ms is a safe, standard default initial RTT for public internet clients.
-        .with_initial_round_trip_time(Duration::from_millis(100))?
-        // More simultaneous streams per connection.
-        .with_max_open_remote_bidirectional_streams(4096)?
-        // Keep ACK overhead low: ACK every 4th packet (default is every 2nd).
-        .with_ack_elicitation_interval(4)?
-        // Disable active migration (saves state tracking).
-        .with_active_connection_migration(false)?
-        // Reduce connection-ID slots (fewer is fine for 0-RTT / stationary peers).
-        .with_max_active_connection_ids(2)?
-        // Aggressive handshake timeout: reject slow clients quickly.
-        .with_max_handshake_duration(Duration::from_secs(5))?;
-
-    Ok(tachyon_quic::s2n_quic::Server::builder()
-        .with_tls(tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(
-            config,
-        ))?
-        .with_limits(limits)?
-        .with_io(io)?
-        .start()?)
-}
-
-/// Spawns [`Server::serve_h3`] on a QUIC endpoint built for `config`/`io`, alongside whichever
-/// TCP listener the caller goes on to run.
-#[cfg(feature = "http3")]
-fn spawn_h3<S>(
-    server: &Server<S>,
-    config: Arc<rustls::ServerConfig>,
-    io: impl tachyon_quic::s2n_quic::provider::io::TryInto<
-        Error: std::error::Error + Send + Sync + 'static,
-    >,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    let quic_server = build_quic_server(config, io)?;
-    let server = server.clone();
-    drop(tokio::spawn(async move {
-        let _ = server.serve_h3(quic_server).await;
-    }));
-    Ok(())
 }
 
 /// Enforces FIPS compliance on the cryptographic module.
@@ -1174,110 +881,6 @@ pub(crate) fn enforce_fips_compliance() -> Result<(), std::io::Error> {
         }
     }
     Ok(())
-}
-
-/// Rejects a caller-supplied `rustls::ServerConfig` that doesn't itself negotiate
-/// FIPS-140-3-approved algorithms, under the `fips` feature.
-///
-/// [`TlsPolicy::fips`](crate::tls::TlsPolicy::fips) is the only provider a `TlsPolicy` can hold
-/// under `fips` (see its docs), but a `ServerConfig` can also reach this crate through doors
-/// that never touch `TlsPolicy` at all: [`Server::serve_https_config`],
-/// [`Server::start_https_with_config`]/[`_addr`], [`Server::start_https_and_h3_with_config`],
-/// [`Server::with_https`]/[`MultiServer::with_https`](crate::server::multi::MultiServer::with_https),
-/// [`RustlsConfig::from_pem`], `OnionTls::Custom`, and `I2pTls::Custom`. Without this check, a
-/// caller could hand any of those a ChaCha20-only or X25519-only config and it would be served
-/// as-is even in a build that otherwise enforces FIPS. `rustls::ServerConfig::fips()` is the
-/// same predicate rustls itself uses: the negotiated provider is FIPS-approved *and*
-/// `require_ems` is set (FIPS 140-3 IG D.Q).
-#[cfg(all(feature = "tls", feature = "fips"))]
-pub(crate) fn assert_fips_server_config(
-    config: &rustls::ServerConfig,
-) -> Result<(), std::io::Error> {
-    if config.fips() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "TLS config is not FIPS-140-3-compliant (a non-approved cipher suite or \
-             key-exchange group is offered, or TLS 1.2 extended-master-secret isn't required) \
-             — build it via `TlsPolicy::fips()`/`TlsPolicy::new()` rather than \
-             `rustls::ServerConfig::builder()` directly",
-        ))
-    }
-}
-
-/// Builds the ALPN protocol list for a TLS `ServerConfig`, in preference order,
-/// matching whichever of `http3`/`http2`/`http1` are actually compiled in — so
-/// TLS never advertises a protocol the connection-handling code (gated on the
-/// same features, see `server/http.rs`) has no branch to serve it with.
-#[cfg(feature = "tls")]
-pub(crate) fn alpn_protocols(include_h3: bool) -> Vec<Vec<u8>> {
-    let mut protocols = Vec::with_capacity(3);
-    if include_h3 {
-        protocols.push(b"h3".to_vec());
-    }
-    #[cfg(feature = "http2")]
-    protocols.push(b"h2".to_vec());
-    #[cfg(feature = "http1")]
-    protocols.push(b"http/1.1".to_vec());
-    protocols
-}
-
-/// Parses the port number from a bind address string (e.g., `"0.0.0.0:443"`).
-/// Falls back to `default_port` if parsing fails.
-#[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
-fn parse_port(addr: &str, default_port: u16) -> u16 {
-    addr.split(':')
-        .next_back()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(default_port)
-}
-
-/// Parses a bind address string (e.g. `"0.0.0.0:443"`), wrapping the error the same way every
-/// `serve_*`/`start_*` entry point below does — shared so that wrapping can't drift between
-/// call sites.
-fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Error> {
-    addr.parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-}
-
-/// Strips the trailing `:port` from an HTTP `Host` header value, preserving IPv6 literals'
-/// brackets (e.g. `"[::1]:8443"` → `"[::1]"`) so the result is still a valid host in a URL.
-#[cfg(feature = "tls")]
-fn host_without_port(host: &str) -> &str {
-    let Some(rest) = host.strip_prefix('[') else {
-        return host.split(':').next().unwrap_or(host);
-    };
-    // `bracket_end` is an index into `rest` (one past the leading `[`); the matching `]` in
-    // `host` therefore sits at `bracket_end + 1`, so slicing up to (and including) that needs
-    // `..=bracket_end + 1`, i.e. an end bound of `bracket_end + 2`.
-    let Some(bracket_end) = rest.find(']') else {
-        return host;
-    };
-    let end = bracket_end.saturating_add(2);
-    host.get(..end).unwrap_or(host)
-}
-
-/// Resolves the host to put in the `Location` header of a plaintext→HTTPS redirect.
-///
-/// When `allowed_hosts` is `Some` (i.e. the caller knows its real domain list — see
-/// [`RedirectInfo::allowed_hosts`]), an inbound `Host` that doesn't match any entry is replaced
-/// with the first allowed domain rather than echoed back: otherwise a request naming an
-/// arbitrary `Host` would get a same-status redirect to an attacker-chosen origin (an open
-/// redirect). `None` preserves the historical echo-unchecked behaviour for callers that don't
-/// have a domain list to validate against (e.g. [`Server::start_all`]).
-#[cfg(feature = "tls")]
-fn resolve_redirect_host<'a>(host_header: &'a str, allowed_hosts: Option<&'a [String]>) -> &'a str {
-    let candidate = host_without_port(host_header);
-    let Some(allowed) = allowed_hosts else {
-        return candidate;
-    };
-    allowed
-        .iter()
-        .find(|d| d.eq_ignore_ascii_case(candidate))
-        .map_or_else(
-            || allowed.first().map_or(candidate, String::as_str),
-            String::as_str,
-        )
 }
 
 /// Whether an accept-loop I/O error indicates the process/system is transiently out of a
@@ -1321,119 +924,6 @@ pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
     false
 }
 
-/// Plain HTTP listener that answers `/.well-known/acme-challenge/<token>` from the global
-/// challenge store and `308`s everything else to the equivalent HTTPS URL.
-///
-/// `308` rather than `301` because it preserves the request method, so redirected `POST`s stay
-/// `POST`s.
-///
-/// Concurrency is capped at [`REDIRECT_MAX_CONNECTIONS`] per worker. This listener is bound to
-/// port 80 and therefore reachable by anyone, but it answers only redirects and ACME
-/// challenges — it never reaches the router — so it uses its own fixed ceiling rather than
-/// [`Server::max_connections`], which sizes the listener that actually runs application
-/// handlers.
-#[cfg(feature = "tls")]
-pub async fn serve_http_redirect_and_challenges(
-    listener: TcpListener,
-    https_port: u16,
-    allowed_hosts: Option<Arc<[String]>>,
-) {
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    // Without a `Timer`, hyper silently drops `header_read_timeout` (only a `warn!`, no
-    // error) — this listener is bound to port 80 and reachable by anyone, so a client that
-    // opens a connection and never finishes its request line would otherwise hold one of
-    // [`REDIRECT_MAX_CONNECTIONS`] permits forever (Slowloris).
-    let _ = builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(REQUEST_TIMEOUT);
-    #[cfg(feature = "http2")]
-    let _ = builder
-        .http2()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .keep_alive_interval(REQUEST_TIMEOUT)
-        .keep_alive_timeout(REQUEST_TIMEOUT);
-    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(REDIRECT_MAX_CONNECTIONS));
-
-    loop {
-        let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-            return;
-        };
-        let (stream, _peer) = match listener.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("[http-redirect] accept error: {e}");
-                drop(permit);
-                if is_resource_exhaustion(&e) {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                continue;
-            }
-        };
-        let _ = stream.set_nodelay(true);
-        let io = hyper_util::rt::TokioIo::new(stream);
-        let builder = builder.clone();
-        let allowed_hosts = allowed_hosts.clone();
-
-        drop(tokio::spawn(async move {
-            let _ = builder
-                .serve_connection(
-                    io,
-                    service_fn(move |req: Request<hyper::body::Incoming>| {
-                        let allowed_hosts = allowed_hosts.clone();
-                        async move {
-                            // Serve ACME HTTP-01 challenge response.
-                            #[cfg(feature = "lets-encrypt")]
-                            if let Some(token) = req
-                                .uri()
-                                .path()
-                                .strip_prefix("/.well-known/acme-challenge/")
-                                && let Some(key_auth) = crate::tls::acme::get_challenge(token)
-                            {
-                                let resp = Response::builder()
-                                    .status(200)
-                                    .header("content-type", "text/plain")
-                                    .body(Body::full(bytes::Bytes::from(key_auth)))
-                                    .unwrap_or_else(|_| Response::new(Body::empty()));
-                                return Ok::<_, std::convert::Infallible>(resp);
-                            }
-
-                            // 308 Permanent Redirect to HTTPS (preserves method).
-                            let host = req
-                                .headers()
-                                .get("host")
-                                .and_then(|h| h.to_str().ok())
-                                .unwrap_or("localhost");
-                            let redirect_host =
-                                resolve_redirect_host(host, allowed_hosts.as_deref());
-                            let port_suffix = if https_port == 443 {
-                                String::new()
-                            } else {
-                                format!(":{https_port}")
-                            };
-                            let path_and_query = req
-                                .uri()
-                                .path_and_query()
-                                .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-                            let location =
-                                format!("https://{redirect_host}{port_suffix}{path_and_query}");
-
-                            let resp = Response::builder()
-                                .status(308) // 308 Permanent Redirect preserves the HTTP method.
-                                .header("location", &location)
-                                .body(Body::empty())
-                                .unwrap_or_else(|_| Response::new(Body::empty()));
-                            Ok::<_, std::convert::Infallible>(resp)
-                        }
-                    }),
-                )
-                .await;
-            drop(permit);
-        }));
-    }
-}
-
 /// Start serving requests from the given `TcpListener` using the provided `Router`.
 ///
 /// This resolves the listener's local address, automatically compiles the router,
@@ -1462,309 +952,6 @@ where
     Serve { listener, router }
 }
 
-/// Configuration for custom rustls server.
-#[cfg(feature = "tls")]
-#[derive(Clone)]
-pub struct RustlsConfig {
-    pub(crate) server_config: Arc<rustls::ServerConfig>,
-}
-
-#[cfg(feature = "tls")]
-impl std::fmt::Debug for RustlsConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RustlsConfig").finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "tls")]
-impl RustlsConfig {
-    /// Create a new `RustlsConfig` from PEM-formatted certificate chain and private key bytes,
-    /// using [`TlsPolicy::default`](crate::tls::TlsPolicy::default) — the same crypto/TLS
-    /// policy `Server::start_all`/`serve_all_acme` build from, and the FIPS-140-3-compliant
-    /// one under the `fips` feature (see [`TlsPolicy`](crate::tls::TlsPolicy)'s `fips` docs).
-    ///
-    /// Previously this built from `rustls::ServerConfig::builder()`'s process-wide default
-    /// provider instead: besides not respecting `fips`, that provider depends on load order —
-    /// whichever crate first called `CryptoProvider::install_default()` (for example,
-    /// `Server::serve_tor`/`serve_onion` install this crate's [`TlsPolicy`](crate::tls::TlsPolicy) process-wide for
-    /// arti's benefit) determined the actual cipher suites in effect. Going through
-    /// [`TlsPolicy`](crate::tls::TlsPolicy) removes that nondeterminism. Use
-    /// [`Server::tls_policy`](crate::server::Server::tls_policy) plus a hand-built
-    /// `rustls::ServerConfig` if you need a non-default provider or protocol-version
-    /// restriction here.
-    ///
-    /// # Errors
-    /// Returns an error if the certificates or private key cannot be parsed, or if the config is invalid.
-    #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn from_pem(cert: Vec<u8>, key: Vec<u8>) -> Result<Self, std::io::Error> {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-        let cert_chain: Vec<CertificateDer<'static>> = crate::tls::pem::certs(&cert);
-
-        let key_der: PrivateKeyDer<'static> =
-            crate::tls::pem::private_key(&key).map_err(|e| crate::tls::pem::key_io_error(&e))?;
-
-        let policy = crate::tls::TlsPolicy::default();
-        let mut server_config = rustls::ServerConfig::builder_with_provider(policy.provider())
-            .with_protocol_versions(policy.versions())
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("TLS version configuration failed: {e}"),
-                )
-            })?
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key_der)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
-        server_config.alpn_protocols = alpn_protocols(false);
-
-        #[cfg(feature = "fips")]
-        assert_fips_server_config(&server_config)?;
-
-        Ok(Self {
-            server_config: Arc::new(server_config),
-        })
-    }
-}
-
-/// Create an HTTPS server bound to the given `SocketAddr` using the provided `RustlsConfig`.
-#[cfg(feature = "tls")]
-#[must_use]
-pub const fn bind_rustls(addr: std::net::SocketAddr, config: RustlsConfig) -> HttpsServer {
-    HttpsServer {
-        addr,
-        config,
-        serve_http3: false,
-    }
-}
-
-/// An HTTPS server ready to be run.
-#[cfg(feature = "tls")]
-pub struct HttpsServer {
-    addr: std::net::SocketAddr,
-    config: RustlsConfig,
-    serve_http3: bool,
-}
-
-#[cfg(feature = "tls")]
-impl std::fmt::Debug for HttpsServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpsServer")
-            .field("addr", &self.addr)
-            .field("serve_http3", &self.serve_http3)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "tls")]
-impl HttpsServer {
-    /// Enable or disable HTTP/3 (QUIC) support on the same port.
-    ///
-    /// Note: HTTP/3 requires the `http3` feature to be enabled.
-    #[must_use]
-    pub const fn serve_http3(mut self, enable: bool) -> Self {
-        self.serve_http3 = enable;
-        self
-    }
-
-    /// Run the server with the given router.
-    ///
-    /// # Errors
-    /// Returns an error if compiling the router or running the server fails.
-    pub async fn serve(self, router: crate::routing::Router<()>) -> Result<(), std::io::Error> {
-        let server = Server::new(router);
-        #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
-        let mut rustls_config = (*self.config.server_config).clone();
-
-        #[cfg(feature = "http3")]
-        if self.serve_http3 {
-            // Ensure ALPN lists "h3"
-            if !rustls_config.alpn_protocols.iter().any(|p| p == b"h3") {
-                rustls_config.alpn_protocols.insert(0, b"h3".to_vec());
-            }
-
-            spawn_h3(&server, Arc::new(rustls_config.clone()), self.addr)
-                .map_err(std::io::Error::other)?;
-        }
-
-        server
-            .start_https_with_config_addr(self.addr, rustls_config)
-            .await
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routing::Router;
-
-    /// `Server::clone` is hand-written (the field list is feature-gated, so `derive` can't be
-    /// used); this catches a field being dropped when a new one is added.
-    #[test]
-    #[allow(clippy::redundant_clone)]
-    fn clone_preserves_every_field() {
-        #[cfg_attr(not(any(feature = "tls", feature = "http3")), allow(unused_mut))]
-        let mut server = Server::new(Router::new())
-            .max_body_size(4096)
-            .max_connections(7)
-            .max_websocket_connections(9);
-        #[cfg(feature = "http3")]
-        {
-            server = server.max_h3_concurrent_streams(11);
-        }
-        #[cfg(feature = "tls")]
-        {
-            server = server.tls_policy(crate::tls::TlsPolicy::new().tls13_only());
-        }
-
-        let cloned = server.clone();
-        assert_eq!(cloned.max_body_size, 4096);
-        assert_eq!(cloned.max_connections, 7);
-        assert_eq!(cloned.max_websocket_connections, 9);
-        #[cfg(feature = "http3")]
-        assert_eq!(cloned.max_h3_concurrent_streams, 11);
-        #[cfg(feature = "ws")]
-        {
-            assert_eq!(cloned.websocket_permits.available_permits(), 9);
-            let _held = server
-                .websocket_permits
-                .clone()
-                .try_acquire_owned()
-                .expect("permit available");
-            assert_eq!(
-                cloned.websocket_permits.available_permits(),
-                8,
-                "clones must draw on one shared budget"
-            );
-        }
-        #[cfg(feature = "tls")]
-        assert!(cloned.tls_policy.is_some());
-    }
-
-    #[cfg(feature = "tls")]
-    #[test]
-    fn host_without_port_strips_a_plain_hostname() {
-        assert_eq!(host_without_port("example.com:8443"), "example.com");
-        assert_eq!(host_without_port("example.com"), "example.com");
-    }
-
-    #[cfg(feature = "tls")]
-    #[test]
-    fn host_without_port_preserves_ipv6_brackets() {
-        assert_eq!(host_without_port("[::1]:8443"), "[::1]");
-        assert_eq!(host_without_port("[::1]"), "[::1]");
-        assert_eq!(host_without_port("[2001:db8::1]:443"), "[2001:db8::1]");
-    }
-
-    #[cfg(feature = "tls")]
-    #[test]
-    fn resolve_redirect_host_echoes_unchecked_when_no_allow_list_is_known() {
-        // `start_all`/`start_all_inner` only have a cert, not a domain list — matches the
-        // long-standing behaviour there.
-        assert_eq!(
-            resolve_redirect_host("attacker.example:80", None),
-            "attacker.example"
-        );
-    }
-
-    #[cfg(feature = "tls")]
-    #[test]
-    fn resolve_redirect_host_accepts_a_matching_allowed_host() {
-        let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
-        assert_eq!(
-            resolve_redirect_host("EXAMPLE.com:80", Some(&allowed)),
-            "example.com",
-            "matching must be case-insensitive, and the request's own casing is dropped in \
-             favor of the configured domain"
-        );
-        assert_eq!(
-            resolve_redirect_host("www.example.com", Some(&allowed)),
-            "www.example.com"
-        );
-    }
-
-    #[cfg(feature = "tls")]
-    #[test]
-    fn resolve_redirect_host_falls_back_to_the_first_allowed_domain_on_a_mismatch() {
-        // The open-redirect regression test: an inbound `Host` naming an arbitrary origin must
-        // never be echoed back into a same-status `Location` header when a domain allow-list
-        // is known (e.g. `serve_all_acme`'s `domains`).
-        let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
-        assert_eq!(
-            resolve_redirect_host("evil.example:80", Some(&allowed)),
-            "example.com"
-        );
-    }
-
-    #[test]
-    fn is_resource_exhaustion_matches_only_known_codes() {
-        for code in [23, 24, 10024] {
-            assert!(
-                is_resource_exhaustion(&std::io::Error::from_raw_os_error(code)),
-                "code: {code}"
-            );
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        for code in [12, 105] {
-            assert!(
-                is_resource_exhaustion(&std::io::Error::from_raw_os_error(code)),
-                "code: {code}"
-            );
-        }
-        assert!(!is_resource_exhaustion(&std::io::Error::from_raw_os_error(
-            2
-        )));
-        assert!(!is_resource_exhaustion(&std::io::Error::other(
-            "not an os error"
-        )));
-    }
-
-    #[cfg(feature = "tls")]
-    #[tokio::test]
-    async fn rustls_config_from_pem_rejects_garbage_input() {
-        let err = RustlsConfig::from_pem(b"not a cert".to_vec(), b"not a key".to_vec())
-            .await
-            .expect_err("garbage PEM must not build a config");
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[cfg(feature = "cert-gen")]
-    #[tokio::test]
-    async fn rustls_config_from_pem_builds_from_a_valid_self_signed_cert() {
-        let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
-            .expect("generate self-signed cert");
-        let config = RustlsConfig::from_pem(cert.cert_pem.into_bytes(), cert.key_pem.into_bytes())
-            .await
-            .expect("build config from valid PEM");
-        assert!(!config.server_config.alpn_protocols.is_empty());
-    }
-
-    #[cfg(feature = "cert-gen")]
-    #[test]
-    fn bind_rustls_and_https_server_builders() {
-        let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
-            .expect("generate self-signed cert");
-        let mut server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.cert_der], cert.key_der)
-            .expect("build server config");
-        server_config.alpn_protocols = alpn_protocols(false);
-        let config = RustlsConfig {
-            server_config: Arc::new(server_config),
-        };
-        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse addr");
-
-        let https_server = bind_rustls(addr, config);
-        assert_eq!(https_server.addr, addr);
-        assert!(!https_server.serve_http3);
-        let dbg = format!("{https_server:?}");
-        assert!(dbg.contains("HttpsServer"));
-        assert!(dbg.contains("serve_http3: false"));
-
-        let https_server = https_server.serve_http3(true);
-        assert!(https_server.serve_http3);
-        let dbg = format!("{https_server:?}");
-        assert!(dbg.contains("serve_http3: true"));
-    }
-}
+#[path = "tests.rs"]
+mod tests;

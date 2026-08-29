@@ -1,8 +1,65 @@
 use bytes::{Buf, Bytes};
 use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::server::{REQUEST_TIMEOUT, Server};
+
+/// Builds the QUIC endpoint HTTP/3 is served over, from a rustls config and a bind address.
+///
+/// Shared by every `http3` entry point so their limits can't drift apart.
+pub(super) fn build_quic_server(
+    config: Arc<rustls::ServerConfig>,
+    io: impl tachyon_quic::s2n_quic::provider::io::TryInto<
+        Error: std::error::Error + Send + Sync + 'static,
+    >,
+) -> Result<tachyon_quic::s2n_quic::Server, Box<dyn std::error::Error + Send + Sync>> {
+    let limits = tachyon_quic::s2n_quic::provider::limits::Limits::new()
+        // 1 MB flow-control windows match H/2 settings and saturate LAN pipes.
+        .with_data_window(1_048_576)?
+        .with_bidirectional_local_data_window(1_048_576)?
+        .with_bidirectional_remote_data_window(1_048_576)?
+        // 100ms is a safe, standard default initial RTT for public internet clients.
+        .with_initial_round_trip_time(Duration::from_millis(100))?
+        // More simultaneous streams per connection.
+        .with_max_open_remote_bidirectional_streams(4096)?
+        // Keep ACK overhead low: ACK every 4th packet (default is every 2nd).
+        .with_ack_elicitation_interval(4)?
+        // Disable active migration (saves state tracking).
+        .with_active_connection_migration(false)?
+        // Reduce connection-ID slots (fewer is fine for 0-RTT / stationary peers).
+        .with_max_active_connection_ids(2)?
+        // Aggressive handshake timeout: reject slow clients quickly.
+        .with_max_handshake_duration(Duration::from_secs(5))?;
+
+    Ok(tachyon_quic::s2n_quic::Server::builder()
+        .with_tls(tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(
+            config,
+        ))?
+        .with_limits(limits)?
+        .with_io(io)?
+        .start()?)
+}
+
+/// Spawns [`Server::serve_h3`] on a QUIC endpoint built for `config`/`io`, alongside whichever
+/// TCP listener the caller goes on to run.
+pub(super) fn spawn_h3<S>(
+    server: &Server<S>,
+    config: Arc<rustls::ServerConfig>,
+    io: impl tachyon_quic::s2n_quic::provider::io::TryInto<
+        Error: std::error::Error + Send + Sync + 'static,
+    >,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let quic_server = build_quic_server(config, io)?;
+    let server = server.clone();
+    drop(tokio::spawn(async move {
+        let _ = server.serve_h3(quic_server).await;
+    }));
+    Ok(())
+}
 
 impl<S> Server<S>
 where
