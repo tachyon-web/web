@@ -17,7 +17,7 @@ use crate::routing::tower_compat::Route;
 /// fully materialized [`Route`]s at this point — `S` is kept only as a
 /// phantom type parameter for API-shape continuity (`CompiledRouter<S>`);
 /// dispatch itself needs no further state, since it was bound once, here, at
-/// [`Router::compile`] time.
+/// [`crate::routing::router::Router::compile`] time.
 pub struct CompiledRouter<S> {
     pub(crate) matcher: matchit::Router<CompiledMethodRouter>,
     pub(crate) fallback: Option<Route>,
@@ -234,7 +234,7 @@ impl<S> CompiledRouter<S> {
     /// Route an incoming request, returning the resulting HTTP response.
     ///
     /// Routes match **exactly**, as in Axum: `/foo` and `/foo/` are distinct and neither falls
-    /// back to the other unless [`Router::normalize_trailing_slash`] was set. Paths are
+    /// back to the other unless [`crate::routing::router::Router::normalize_trailing_slash`] was set. Paths are
     /// case-sensitive.
     ///
     /// This is the hot path: an `O(path_len)` `matchit` lookup, one prefix check, and an array

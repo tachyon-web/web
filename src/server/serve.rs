@@ -7,7 +7,7 @@
 //! `.await`. This mirrors that shape. See [`Serve::with_graceful_shutdown`]
 //! for the one real behavioral difference from Axum's version, and
 //! [`crate::server::Listener`]'s module docs for why `L` is generic in name
-//! only — only `TcpListener` can actually reach [`run`].
+//! only — only `TcpListener` can actually reach `run`.
 
 use crate::routing::Router;
 use crate::server::{Listener, Server};

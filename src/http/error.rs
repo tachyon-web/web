@@ -22,8 +22,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// body) still need a specific status to survive the trip through [`crate::http::response::Body`]'s
 /// `Error` associated type (this same type) before reaching [`crate::http::response::Body::collect_bytes`]
 /// or an `IntoResponse` call site — tachyon's body layer routes those through here rather
-/// than a separate side channel. That's handled by boxing a private [`StatusError`] and
-/// downcasting it back out where needed (see [`Error::status`]/[`Error::as_status`]); it's
+/// than a separate side channel. That's handled by boxing a private `StatusError` and
+/// downcasting it back out where needed (see `Error::status`/`Error::as_status`); it's
 /// never exposed as a public variant, so from the outside `Error` is exactly as opaque as
 /// axum's.
 #[derive(Debug)]

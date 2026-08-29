@@ -1,4 +1,4 @@
-//! Test suite for the `routing` module split across method_router.rs / router.rs / compiled.rs.
+//! Test suite for the `routing` module split across `method_router.rs` / `router.rs` / `compiled.rs`.
 
 #![allow(clippy::unwrap_used)]
 use super::*;

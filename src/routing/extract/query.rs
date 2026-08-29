@@ -1,5 +1,5 @@
 //! Query-string extractors: [`Query`], [`RawQuery`], and the shared
-//! [`QueryIter`]/`CoercingCowDeserializer` deserializer machinery (also used
+//! `QueryIter`/`CoercingCowDeserializer` deserializer machinery (also used
 //! by [`super::body::Form`]).
 
 #[cfg(feature = "query")]

@@ -17,7 +17,7 @@ use hyper::{Request, Response};
 
 /// Per-worker connection ceiling for the plaintext port-80 redirect listener.
 ///
-/// Far below [`Server::max_connections`] on purpose: every connection here gets a bodyless
+/// Far below [`crate::server::Server::max_connections`] on purpose: every connection here gets a bodyless
 /// `308` or a challenge token and closes, so the queue drains fast.
 #[cfg(feature = "tls")]
 pub const REDIRECT_MAX_CONNECTIONS: usize = 2048;
@@ -113,7 +113,7 @@ pub(super) fn resolve_redirect_host<'a>(
 /// Concurrency is capped at [`REDIRECT_MAX_CONNECTIONS`] per worker. This listener is bound to
 /// port 80 and therefore reachable by anyone, but it answers only redirects and ACME
 /// challenges — it never reaches the router — so it uses its own fixed ceiling rather than
-/// [`Server::max_connections`], which sizes the listener that actually runs application
+/// [`crate::server::Server::max_connections`], which sizes the listener that actually runs application
 /// handlers.
 #[cfg(feature = "tls")]
 pub async fn serve_http_redirect_and_challenges(

@@ -1,4 +1,4 @@
-//! Test suite for the `server` module split across worker_pool.rs / redirect.rs / tls_config.rs.
+//! Test suite for the `server` module split across `worker_pool.rs` / `redirect.rs` / `tls_config.rs`.
 
 use super::*;
 use crate::routing::Router;

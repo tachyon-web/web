@@ -1,5 +1,5 @@
 //! [`Path`]: URI path-parameter extraction, backed by a custom `serde::Deserializer`
-//! ([`PathDeserializer`]) supporting scalar, tuple, and struct/map targets.
+//! (`PathDeserializer`) supporting scalar, tuple, and struct/map targets.
 
 use serde::de::DeserializeOwned;
 use std::future::Future;

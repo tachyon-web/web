@@ -60,7 +60,7 @@ pub(crate) type BoxedIntoRoute<S> = Arc<dyn Fn(Arc<S>) -> Route + Send + Sync>;
 /// [`Handler`] or a `tower::Service` whose error is collapsed into a response immediately
 /// (via [`Route`]), so `E` is never actually produced. This means, unlike axum, attaching a
 /// fallible `tower::Layer` via [`MethodRouter::layer`] never requires wrapping it in
-/// [`error_handling::HandleErrorLayer`] first — any `E` (including axum's real, fallible
+/// [`crate::routing::error_handling::HandleErrorLayer`] first — any `E` (including axum's real, fallible
 /// ones) type-checks here with no extra step.
 pub struct MethodRouter<S, E = std::convert::Infallible> {
     pub(crate) handlers: [Option<BoxedIntoRoute<S>>; METHOD_COUNT],

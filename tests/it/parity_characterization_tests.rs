@@ -118,9 +118,6 @@ mod path_extractor_rejection_text {
         let res = server.get("/items/not-a-number").send().await.unwrap();
         assert_eq!(res.status(), 400);
         let body = res.text().await.unwrap();
-        assert!(
-            body.starts_with("Failed to deserialize path parameters:"),
-            "unexpected rejection body: {body:?}"
-        );
+        assert_eq!(body, "Invalid URL: Cannot parse `not-a-number` to a `u32`");
     }
 }
