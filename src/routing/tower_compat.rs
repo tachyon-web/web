@@ -51,7 +51,7 @@ impl<E> std::fmt::Debug for Route<E> {
 }
 
 impl<E> Route<E> {
-    fn new<Svc>(svc: Svc) -> Self
+    pub(crate) fn new<Svc>(svc: Svc) -> Self
     where
         Svc: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
             + Clone

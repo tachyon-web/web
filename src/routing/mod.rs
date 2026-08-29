@@ -1687,6 +1687,9 @@ impl<S> CompiledRouter<S> {
                     .extensions_mut()
                     .insert(crate::routing::extract::OriginalUri(original_uri));
             }
+            let _ = req
+                .extensions_mut()
+                .insert(crate::routing::extract::NestedPath(Arc::clone(prefix)));
             strip_uri_prefix(&mut req, prefix);
         }
 
@@ -2003,6 +2006,46 @@ mod tests {
             .to_bytes();
         // OriginalUri recovers the full, pre-strip path.
         assert_eq!(&body[..], b"/api/users/42");
+    }
+
+    #[tokio::test]
+    async fn test_nested_path_reports_the_mount_prefix() {
+        use crate::routing::extract::NestedPath;
+
+        async fn echo_nested(nested: NestedPath) -> String {
+            nested.as_str().to_string()
+        }
+
+        let inner = Router::new().route("/users", get(echo_nested));
+        let v1 = Router::new().nest("/v1", inner);
+        let app = Router::new()
+            .nest("/api", v1)
+            .with_state::<()>(())
+            .compile()
+            .expect("compile");
+
+        let resp = app.handle_request(make_req("GET", "/api/v1/users")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&body[..], b"/api/v1");
+    }
+
+    #[tokio::test]
+    async fn test_nested_path_rejects_on_a_non_nested_route() {
+        use crate::http::response::IntoResponse;
+        use crate::routing::extract::{FromRequestParts, NestedPath};
+
+        let mut parts = make_req("GET", "/plain").into_parts().0;
+        let err = NestedPath::from_request_parts(&mut parts, &())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]

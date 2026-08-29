@@ -61,11 +61,13 @@ mod h3;
 mod http;
 #[cfg(feature = "i2p")]
 pub mod i2p;
+mod listener;
 mod multi;
 pub mod serve;
 #[cfg(feature = "tor")]
 pub mod tor;
 
+pub use listener::{Listener, ListenerExt, TapIo};
 pub use multi::MultiServer;
 pub use serve::{Serve, WithGracefulShutdown};
 
@@ -1453,7 +1455,10 @@ pub async fn serve_http_redirect_and_challenges(
 /// to port `0` resolves to a concrete port first, so the workers all land on the same one.
 /// Pass the address to [`Server::start_http`]/[`Server::start_http_addr`] instead if you'd
 /// rather never hold the binding twice.
-pub const fn serve(listener: tokio::net::TcpListener, router: crate::routing::Router<()>) -> Serve {
+pub const fn serve<L>(listener: L, router: crate::routing::Router<()>) -> Serve<L>
+where
+    L: Listener<Addr = std::net::SocketAddr>,
+{
     Serve { listener, router }
 }
 

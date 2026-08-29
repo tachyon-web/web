@@ -86,7 +86,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # doesn't already have.
 TACHYON_FEATURES = (
     "json,cookies,matched-path,original-uri,http1,http2,tower-log,ws,form,query,"
-    "sse,sfv,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints"
+    "sse,sfv,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints,multipart"
 )
 
 # Every non-private, non-doc-only axum 0.8 feature, so nothing feature-gated

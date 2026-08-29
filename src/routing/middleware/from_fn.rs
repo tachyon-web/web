@@ -1,6 +1,6 @@
 //! `axum::middleware::from_fn` and friends, as real `tower::Layer`/`tower::Service`
-//! pairs wrapping [`Route`] — the same mechanism `Router::layer` itself uses,
-//! not a separate bespoke system.
+//! pairs wrapping an arbitrary inner `tower::Service` — the same mechanism
+//! `Router::layer` itself uses, not a separate bespoke system.
 //!
 //! Axum's real `from_fn` lets middleware take extractor arguments before
 //! `Next` (`async fn mw(State(s): State<AppState>, req: Request, next: Next)
@@ -15,6 +15,13 @@
 //! `Next` now that this crate's own state-erasure decision has been made),
 //! so a middleware needing state either closes over it directly or uses the
 //! `_with_state` variant below.
+//!
+//! Each family below unifies its plain/`_with_state` pair into one type
+//! (`FromFnLayer<F, S, T>`, matching axum's own generics exactly), using the
+//! otherwise-unused `T` slot as a marker distinguishing the two `F` call
+//! shapes (`Fn(Request<Body>, Next)` vs `Fn(S, Request<Body>, Next)`) —
+//! axum's own `T` plays the analogous "which shape is `F`" role via its
+//! extractor-tuple, just for a richer set of shapes than this crate supports.
 
 use crate::http::response::{Body, IntoResponse, Response};
 use crate::routing::extract::FromRequestParts;
@@ -28,12 +35,16 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tower::{Layer, Service, ServiceExt};
 
-/// Runs `route` to completion, converting its (infallible) result into a
-/// boxed future — the one place every `Service` below funnels its final
-/// dispatch through.
-fn drive(mut route: Route, req: Request<Body>) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+/// Runs `svc` to completion, converting its (infallible) result into a
+/// boxed future — the one place `map_request`/`map_response`/`from_extractor`
+/// funnel their final dispatch through.
+fn drive<I>(mut svc: I, req: Request<Body>) -> Pin<Box<dyn Future<Output = Response> + Send>>
+where
+    I: Service<Request<Body>, Response = Response, Error = Infallible> + Send + 'static,
+    I::Future: Send + 'static,
+{
     Box::pin(async move {
-        match route.ready().await {
+        match svc.ready().await {
             Ok(ready) => match ready.call(req).await {
                 Ok(resp) => resp,
                 Err(never) => match never {},
@@ -43,78 +54,124 @@ fn drive(mut route: Route, req: Request<Body>) -> Pin<Box<dyn Future<Output = Re
     })
 }
 
+/// Marks a [`FromFnLayer`]/[`MapRequestLayer`]/[`MapResponseLayer`] built via
+/// the plain (no state) constructor — `F` takes no leading state argument.
+#[derive(Debug, Clone, Copy)]
+pub struct NoState;
+
+/// Marks a [`FromFnLayer`]/[`MapRequestLayer`]/[`MapResponseLayer`] built via
+/// the `_with_state` constructor — `F` takes a bound state clone as its
+/// first argument.
+#[derive(Debug, Clone, Copy)]
+pub struct WithState;
+
 // --- from_fn -----------------------------------------------------------
 
 /// `tower::Layer` wrapping an `async fn(Request<Body>, Next) -> impl IntoResponse`.
 ///
-/// Matches `axum::middleware::from_fn` in spirit; see the module docs for how
-/// the signature differs. Built via [`from_fn`].
-pub struct FromFnLayer<F>(F);
+/// Optionally with a bound state argument first. Matches
+/// `axum::middleware::from_fn` in spirit; see the module docs for how the
+/// signature differs. Built via [`from_fn`]/[`from_fn_with_state`].
+pub struct FromFnLayer<F, S = (), T = ()> {
+    f: F,
+    state: S,
+    _extractor: PhantomData<fn() -> T>,
+}
 
-impl<F> std::fmt::Debug for FromFnLayer<F> {
+impl<F, S, T> std::fmt::Debug for FromFnLayer<F, S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FromFnLayer").finish_non_exhaustive()
     }
 }
 
-/// Wraps `f` for use with `.layer()`/`.route_layer()`.
-pub const fn from_fn<F, Fut, Res>(f: F) -> FromFnLayer<F>
-where
-    F: Fn(Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-{
-    FromFnLayer(f)
-}
-
-impl<F: Clone> Clone for FromFnLayer<F> {
+impl<F: Clone, S: Clone, T> Clone for FromFnLayer<F, S, T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            f: self.f.clone(),
+            state: self.state.clone(),
+            _extractor: PhantomData,
+        }
     }
 }
 
-impl<F, Fut, Res> Layer<Route> for FromFnLayer<F>
+/// Wraps `f` for use with `.layer()`/`.route_layer()`.
+pub const fn from_fn<F, Fut, Res>(f: F) -> FromFnLayer<F, (), NoState>
 where
     F: Fn(Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse + Send + 'static,
 {
-    type Service = FromFn<F>;
+    FromFnLayer {
+        f,
+        state: (),
+        _extractor: PhantomData,
+    }
+}
 
-    fn layer(&self, inner: Route) -> Self::Service {
+/// Wraps `f`, binding `state` as its first argument.
+pub const fn from_fn_with_state<F, Fut, Res, S>(state: S, f: F) -> FromFnLayer<F, S, WithState>
+where
+    F: Fn(S, Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
+    Res: IntoResponse + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    FromFnLayer {
+        f,
+        state,
+        _extractor: PhantomData,
+    }
+}
+
+impl<F: Clone, S: Clone, T, I> Layer<I> for FromFnLayer<F, S, T> {
+    type Service = FromFn<F, S, I, T>;
+
+    fn layer(&self, inner: I) -> Self::Service {
         FromFn {
-            f: self.0.clone(),
+            f: self.f.clone(),
+            state: self.state.clone(),
             inner,
+            _extractor: PhantomData,
         }
     }
 }
 
 /// The `tower::Service` produced by [`FromFnLayer`].
-pub struct FromFn<F> {
+pub struct FromFn<F, S, I, T> {
     f: F,
-    inner: Route,
+    state: S,
+    inner: I,
+    _extractor: PhantomData<fn() -> T>,
 }
 
-impl<F> std::fmt::Debug for FromFn<F> {
+impl<F, S, I, T> std::fmt::Debug for FromFn<F, S, I, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FromFn").finish_non_exhaustive()
     }
 }
 
-impl<F: Clone> Clone for FromFn<F> {
+impl<F: Clone, S: Clone, I: Clone, T> Clone for FromFn<F, S, I, T> {
     fn clone(&self) -> Self {
         Self {
             f: self.f.clone(),
+            state: self.state.clone(),
             inner: self.inner.clone(),
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<F, Fut, Res> Service<Request<Body>> for FromFn<F>
+impl<F, Fut, Res, I> Service<Request<Body>> for FromFn<F, (), I, NoState>
 where
     F: Fn(Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse + Send + 'static,
+    I: Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    I::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
@@ -126,97 +183,23 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let f = self.f.clone();
-        let next = Next(self.inner.clone());
+        let next = Next(Route::new(self.inner.clone()));
         Box::pin(async move { Ok(f(req, next).await.into_response()) })
     }
 }
 
-// --- from_fn_with_state --------------------------------------------------
-
-/// Like [`FromFnLayer`], but binds `state` and hands it to `f` as its first
-/// argument (a plain `S2` clone, not an extractor).
-///
-/// Matches `axum::middleware::from_fn_with_state` — see the module docs for
-/// how the signature differs. Built via [`from_fn_with_state`].
-pub struct FromFnWithStateLayer<F, S2> {
-    f: F,
-    state: S2,
-}
-
-impl<F, S2> std::fmt::Debug for FromFnWithStateLayer<F, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromFnWithStateLayer")
-            .finish_non_exhaustive()
-    }
-}
-
-/// Wraps `f`, binding `state` as its first argument.
-pub const fn from_fn_with_state<F, Fut, Res, S2>(state: S2, f: F) -> FromFnWithStateLayer<F, S2>
+impl<F, Fut, Res, S, I> Service<Request<Body>> for FromFn<F, S, I, WithState>
 where
-    F: Fn(S2, Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(S, Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    FromFnWithStateLayer { f, state }
-}
-
-impl<F: Clone, S2: Clone> Clone for FromFnWithStateLayer<F, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f.clone(),
-            state: self.state.clone(),
-        }
-    }
-}
-
-impl<F, Fut, Res, S2> Layer<Route> for FromFnWithStateLayer<F, S2>
-where
-    F: Fn(S2, Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    type Service = FromFnWithState<F, S2>;
-
-    fn layer(&self, inner: Route) -> Self::Service {
-        FromFnWithState {
-            f: self.f.clone(),
-            state: self.state.clone(),
-            inner,
-        }
-    }
-}
-
-/// The `tower::Service` produced by [`FromFnWithStateLayer`].
-pub struct FromFnWithState<F, S2> {
-    f: F,
-    state: S2,
-    inner: Route,
-}
-
-impl<F, S2> std::fmt::Debug for FromFnWithState<F, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromFnWithState").finish_non_exhaustive()
-    }
-}
-
-impl<F: Clone, S2: Clone> Clone for FromFnWithState<F, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f.clone(),
-            state: self.state.clone(),
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<F, Fut, Res, S2> Service<Request<Body>> for FromFnWithState<F, S2>
-where
-    F: Fn(S2, Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    I: Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    I::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
@@ -229,82 +212,118 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let f = self.f.clone();
         let state = self.state.clone();
-        let next = Next(self.inner.clone());
+        let next = Next(Route::new(self.inner.clone()));
         Box::pin(async move { Ok(f(state, req, next).await.into_response()) })
     }
 }
 
 // --- map_request / map_request_with_state ---------------------------------
 
-/// Transforms the request before running the rest of the pipeline.
+/// Transforms the request before running the rest of the pipeline
+/// (optionally with a bound state argument first).
 ///
-/// Matches `axum::middleware::map_request`, minus its
-/// `Result<Request, Response>` short-circuiting return (return early from
-/// `f` and drive the rest of the pipeline from inside your own
-/// [`from_fn`] middleware directly if you need that).
-pub struct MapRequestLayer<F>(F);
+/// Matches `axum::middleware::map_request`/`map_request_with_state`, minus
+/// their `Result<Request, Response>` short-circuiting return (return early
+/// from `f` and drive the rest of the pipeline from inside your own
+/// [`from_fn`] middleware directly if you need that). Built via
+/// [`map_request`]/[`map_request_with_state`].
+pub struct MapRequestLayer<F, S = (), T = ()> {
+    f: F,
+    state: S,
+    _extractor: PhantomData<fn() -> T>,
+}
 
-impl<F> std::fmt::Debug for MapRequestLayer<F> {
+impl<F, S, T> std::fmt::Debug for MapRequestLayer<F, S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapRequestLayer").finish_non_exhaustive()
     }
 }
 
-/// Wraps `f` for use with `.layer()`/`.route_layer()`.
-pub const fn map_request<F, Fut>(f: F) -> MapRequestLayer<F>
-where
-    F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Request<Body>> + Send + 'static,
-{
-    MapRequestLayer(f)
-}
-
-impl<F: Clone> Clone for MapRequestLayer<F> {
+impl<F: Clone, S: Clone, T> Clone for MapRequestLayer<F, S, T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            f: self.f.clone(),
+            state: self.state.clone(),
+            _extractor: PhantomData,
+        }
     }
 }
 
-impl<F, Fut> Layer<Route> for MapRequestLayer<F>
+/// Wraps `f` for use with `.layer()`/`.route_layer()`.
+pub const fn map_request<F, Fut>(f: F) -> MapRequestLayer<F, (), NoState>
 where
     F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Request<Body>> + Send + 'static,
 {
-    type Service = MapRequest<F>;
+    MapRequestLayer {
+        f,
+        state: (),
+        _extractor: PhantomData,
+    }
+}
 
-    fn layer(&self, inner: Route) -> Self::Service {
+/// Wraps `f`, binding `state` as its first argument.
+pub const fn map_request_with_state<F, Fut, S>(state: S, f: F) -> MapRequestLayer<F, S, WithState>
+where
+    F: Fn(S, Request<Body>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Request<Body>> + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    MapRequestLayer {
+        f,
+        state,
+        _extractor: PhantomData,
+    }
+}
+
+impl<F: Clone, S: Clone, T, I> Layer<I> for MapRequestLayer<F, S, T> {
+    type Service = MapRequest<F, S, I, T>;
+
+    fn layer(&self, inner: I) -> Self::Service {
         MapRequest {
-            f: self.0.clone(),
+            f: self.f.clone(),
+            state: self.state.clone(),
             inner,
+            _extractor: PhantomData,
         }
     }
 }
 
 /// The `tower::Service` produced by [`MapRequestLayer`].
-pub struct MapRequest<F> {
+pub struct MapRequest<F, S, I, T> {
     f: F,
-    inner: Route,
+    state: S,
+    inner: I,
+    _extractor: PhantomData<fn() -> T>,
 }
 
-impl<F> std::fmt::Debug for MapRequest<F> {
+impl<F, S, I, T> std::fmt::Debug for MapRequest<F, S, I, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapRequest").finish_non_exhaustive()
     }
 }
 
-impl<F: Clone> Clone for MapRequest<F> {
+impl<F: Clone, S: Clone, I: Clone, T> Clone for MapRequest<F, S, I, T> {
     fn clone(&self) -> Self {
         Self {
             f: self.f.clone(),
+            state: self.state.clone(),
             inner: self.inner.clone(),
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<F, Fut> Service<Request<Body>> for MapRequest<F>
+impl<F, Fut, I> Service<Request<Body>> for MapRequest<F, (), I, NoState>
 where
     F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Request<Body>> + Send + 'static,
+    I: Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    I::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
@@ -324,85 +343,17 @@ where
     }
 }
 
-/// Like [`MapRequestLayer`], but with a bound `state` clone passed to `f`
-/// first. Matches `axum::middleware::map_request_with_state`.
-pub struct MapRequestWithStateLayer<F, S2> {
-    f: F,
-    state: S2,
-}
-
-impl<F, S2> std::fmt::Debug for MapRequestWithStateLayer<F, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapRequestWithStateLayer")
-            .finish_non_exhaustive()
-    }
-}
-
-/// Wraps `f`, binding `state` as its first argument.
-pub const fn map_request_with_state<F, Fut, S2>(state: S2, f: F) -> MapRequestWithStateLayer<F, S2>
+impl<F, Fut, S, I> Service<Request<Body>> for MapRequest<F, S, I, WithState>
 where
-    F: Fn(S2, Request<Body>) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(S, Request<Body>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Request<Body>> + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    MapRequestWithStateLayer { f, state }
-}
-
-impl<F: Clone, S2: Clone> Clone for MapRequestWithStateLayer<F, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f.clone(),
-            state: self.state.clone(),
-        }
-    }
-}
-
-impl<F, Fut, S2> Layer<Route> for MapRequestWithStateLayer<F, S2>
-where
-    F: Fn(S2, Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Request<Body>> + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    type Service = MapRequestWithState<F, S2>;
-
-    fn layer(&self, inner: Route) -> Self::Service {
-        MapRequestWithState {
-            f: self.f.clone(),
-            state: self.state.clone(),
-            inner,
-        }
-    }
-}
-
-/// The `tower::Service` produced by [`MapRequestWithStateLayer`].
-pub struct MapRequestWithState<F, S2> {
-    f: F,
-    state: S2,
-    inner: Route,
-}
-
-impl<F, S2> std::fmt::Debug for MapRequestWithState<F, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapRequestWithState")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<F: Clone, S2: Clone> Clone for MapRequestWithState<F, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f.clone(),
-            state: self.state.clone(),
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<F, Fut, S2> Service<Request<Body>> for MapRequestWithState<F, S2>
-where
-    F: Fn(S2, Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Request<Body>> + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    I: Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    I::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
@@ -425,74 +376,114 @@ where
 
 // --- map_response / map_response_with_state --------------------------------
 
-/// Transforms the response after the rest of the pipeline runs. Matches
-/// `axum::middleware::map_response`.
-pub struct MapResponseLayer<F>(F);
+/// Transforms the response after the rest of the pipeline runs.
+///
+/// Optionally with a bound state argument first. Matches
+/// `axum::middleware::map_response`/`map_response_with_state`. Built via
+/// [`map_response`]/[`map_response_with_state`].
+pub struct MapResponseLayer<F, S = (), T = ()> {
+    f: F,
+    state: S,
+    _extractor: PhantomData<fn() -> T>,
+}
 
-impl<F> std::fmt::Debug for MapResponseLayer<F> {
+impl<F, S, T> std::fmt::Debug for MapResponseLayer<F, S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapResponseLayer").finish_non_exhaustive()
     }
 }
 
-/// Wraps `f` for use with `.layer()`/`.route_layer()`.
-pub const fn map_response<F, Fut, Res>(f: F) -> MapResponseLayer<F>
-where
-    F: Fn(Response) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-{
-    MapResponseLayer(f)
-}
-
-impl<F: Clone> Clone for MapResponseLayer<F> {
+impl<F: Clone, S: Clone, T> Clone for MapResponseLayer<F, S, T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            f: self.f.clone(),
+            state: self.state.clone(),
+            _extractor: PhantomData,
+        }
     }
 }
 
-impl<F, Fut, Res> Layer<Route> for MapResponseLayer<F>
+/// Wraps `f` for use with `.layer()`/`.route_layer()`.
+pub const fn map_response<F, Fut, Res>(f: F) -> MapResponseLayer<F, (), NoState>
 where
     F: Fn(Response) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse + Send + 'static,
 {
-    type Service = MapResponse<F>;
+    MapResponseLayer {
+        f,
+        state: (),
+        _extractor: PhantomData,
+    }
+}
 
-    fn layer(&self, inner: Route) -> Self::Service {
+/// Wraps `f`, binding `state` as its first argument.
+pub const fn map_response_with_state<F, Fut, Res, S>(
+    state: S,
+    f: F,
+) -> MapResponseLayer<F, S, WithState>
+where
+    F: Fn(S, Response) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
+    Res: IntoResponse + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    MapResponseLayer {
+        f,
+        state,
+        _extractor: PhantomData,
+    }
+}
+
+impl<F: Clone, S: Clone, T, I> Layer<I> for MapResponseLayer<F, S, T> {
+    type Service = MapResponse<F, S, I, T>;
+
+    fn layer(&self, inner: I) -> Self::Service {
         MapResponse {
-            f: self.0.clone(),
+            f: self.f.clone(),
+            state: self.state.clone(),
             inner,
+            _extractor: PhantomData,
         }
     }
 }
 
 /// The `tower::Service` produced by [`MapResponseLayer`].
-pub struct MapResponse<F> {
+pub struct MapResponse<F, S, I, T> {
     f: F,
-    inner: Route,
+    state: S,
+    inner: I,
+    _extractor: PhantomData<fn() -> T>,
 }
 
-impl<F> std::fmt::Debug for MapResponse<F> {
+impl<F, S, I, T> std::fmt::Debug for MapResponse<F, S, I, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MapResponse").finish_non_exhaustive()
     }
 }
 
-impl<F: Clone> Clone for MapResponse<F> {
+impl<F: Clone, S: Clone, I: Clone, T> Clone for MapResponse<F, S, I, T> {
     fn clone(&self) -> Self {
         Self {
             f: self.f.clone(),
+            state: self.state.clone(),
             inner: self.inner.clone(),
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<F, Fut, Res> Service<Request<Body>> for MapResponse<F>
+impl<F, Fut, Res, I> Service<Request<Body>> for MapResponse<F, (), I, NoState>
 where
     F: Fn(Response) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse + Send + 'static,
+    I: Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    I::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
@@ -512,91 +503,18 @@ where
     }
 }
 
-/// Like [`MapResponseLayer`], but with a bound `state` clone passed to `f`
-/// first. Matches `axum::middleware::map_response_with_state`.
-pub struct MapResponseWithStateLayer<F, S2> {
-    f: F,
-    state: S2,
-}
-
-impl<F, S2> std::fmt::Debug for MapResponseWithStateLayer<F, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapResponseWithStateLayer")
-            .finish_non_exhaustive()
-    }
-}
-
-/// Wraps `f`, binding `state` as its first argument.
-pub const fn map_response_with_state<F, Fut, Res, S2>(
-    state: S2,
-    f: F,
-) -> MapResponseWithStateLayer<F, S2>
+impl<F, Fut, Res, S, I> Service<Request<Body>> for MapResponse<F, S, I, WithState>
 where
-    F: Fn(S2, Response) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(S, Response) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Res> + Send + 'static,
     Res: IntoResponse + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    MapResponseWithStateLayer { f, state }
-}
-
-impl<F: Clone, S2: Clone> Clone for MapResponseWithStateLayer<F, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f.clone(),
-            state: self.state.clone(),
-        }
-    }
-}
-
-impl<F, Fut, Res, S2> Layer<Route> for MapResponseWithStateLayer<F, S2>
-where
-    F: Fn(S2, Response) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    type Service = MapResponseWithState<F, S2>;
-
-    fn layer(&self, inner: Route) -> Self::Service {
-        MapResponseWithState {
-            f: self.f.clone(),
-            state: self.state.clone(),
-            inner,
-        }
-    }
-}
-
-/// The `tower::Service` produced by [`MapResponseWithStateLayer`].
-pub struct MapResponseWithState<F, S2> {
-    f: F,
-    state: S2,
-    inner: Route,
-}
-
-impl<F, S2> std::fmt::Debug for MapResponseWithState<F, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapResponseWithState")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<F: Clone, S2: Clone> Clone for MapResponseWithState<F, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            f: self.f.clone(),
-            state: self.state.clone(),
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<F, Fut, Res, S2> Service<Request<Body>> for MapResponseWithState<F, S2>
-where
-    F: Fn(S2, Response) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    I: Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    I::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
@@ -626,9 +544,12 @@ where
 /// `axum::middleware::from_extractor`. Since `Next` no longer carries state,
 /// this runs `E` against unit state (`()`) — use [`from_extractor_with_state`]
 /// for an extractor that needs real state.
-pub struct FromExtractorLayer<E>(PhantomData<fn() -> E>);
+pub struct FromExtractorLayer<E, S = ()> {
+    state: S,
+    _marker: PhantomData<fn() -> E>,
+}
 
-impl<E> std::fmt::Debug for FromExtractorLayer<E> {
+impl<E, S> std::fmt::Debug for FromExtractorLayer<E, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FromExtractorLayer").finish_non_exhaustive()
     }
@@ -636,160 +557,74 @@ impl<E> std::fmt::Debug for FromExtractorLayer<E> {
 
 /// Builds the layer for extractor `E`, matching `axum::middleware::from_extractor::<E>()`.
 #[must_use]
-pub fn from_extractor<E>() -> FromExtractorLayer<E>
+pub fn from_extractor<E>() -> FromExtractorLayer<E, ()>
 where
     E: FromRequestParts<()> + Send + 'static,
 {
-    FromExtractorLayer(PhantomData)
-}
-
-impl<E> Clone for FromExtractorLayer<E> {
-    fn clone(&self) -> Self {
-        Self(PhantomData)
+    FromExtractorLayer {
+        state: (),
+        _marker: PhantomData,
     }
 }
 
-impl<E> Layer<Route> for FromExtractorLayer<E>
-where
-    E: FromRequestParts<()> + Send + 'static,
-{
-    type Service = FromExtractor<E>;
+impl<E, S: Clone> Clone for FromExtractorLayer<E, S> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
 
-    fn layer(&self, inner: Route) -> Self::Service {
+impl<E, S: Clone + Sync, T> Layer<T> for FromExtractorLayer<E, S>
+where
+    E: FromRequestParts<S> + Send + 'static,
+{
+    type Service = FromExtractor<T, E, S>;
+
+    fn layer(&self, inner: T) -> Self::Service {
         FromExtractor {
             inner,
-            _marker: PhantomData,
+            state: self.state.clone(),
+            _extractor: PhantomData,
         }
     }
 }
 
 /// The `tower::Service` produced by [`FromExtractorLayer`].
-pub struct FromExtractor<E> {
-    inner: Route,
-    _marker: PhantomData<fn() -> E>,
+pub struct FromExtractor<T, E, S> {
+    inner: T,
+    state: S,
+    _extractor: PhantomData<fn() -> E>,
 }
 
-impl<E> std::fmt::Debug for FromExtractor<E> {
+impl<T, E, S> std::fmt::Debug for FromExtractor<T, E, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FromExtractor").finish_non_exhaustive()
     }
 }
 
-impl<E> Clone for FromExtractor<E> {
+impl<T: Clone, E, S: Clone> Clone for FromExtractor<T, E, S> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            _marker: PhantomData,
+            state: self.state.clone(),
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<E> Service<Request<Body>> for FromExtractor<E>
+impl<T, E, S> Service<Request<Body>> for FromExtractor<T, E, S>
 where
-    E: FromRequestParts<()> + Send + 'static,
+    E: FromRequestParts<S> + Send + 'static,
     E::Rejection: Send,
-{
-    type Response = Response;
-    type Error = Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            let (mut parts, body) = req.into_parts();
-            match E::from_request_parts(&mut parts, &()).await {
-                Ok(_) => Ok(drive(inner, Request::from_parts(parts, body)).await),
-                Err(rejection) => Ok(rejection.into_response()),
-            }
-        })
-    }
-}
-
-/// Like [`FromExtractorLayer`], but the extractor runs against a bound
-/// `state` clone (`E: FromRequestParts<S2>`) rather than unit state. Matches
-/// `axum::middleware::from_extractor_with_state`.
-pub struct FromExtractorWithStateLayer<E, S2> {
-    state: S2,
-    _marker: PhantomData<fn() -> E>,
-}
-
-impl<E, S2> std::fmt::Debug for FromExtractorWithStateLayer<E, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromExtractorWithStateLayer")
-            .finish_non_exhaustive()
-    }
-}
-
-/// Builds the layer for extractor `E`, bound to `state`.
-pub fn from_extractor_with_state<E, S2>(state: S2) -> FromExtractorWithStateLayer<E, S2>
-where
-    E: FromRequestParts<S2> + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    FromExtractorWithStateLayer {
-        state,
-        _marker: PhantomData,
-    }
-}
-
-impl<E, S2: Clone> Clone for FromExtractorWithStateLayer<E, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<E, S2> Layer<Route> for FromExtractorWithStateLayer<E, S2>
-where
-    E: FromRequestParts<S2> + Send + 'static,
-    S2: Clone + Send + Sync + 'static,
-{
-    type Service = FromExtractorWithState<E, S2>;
-
-    fn layer(&self, inner: Route) -> Self::Service {
-        FromExtractorWithState {
-            state: self.state.clone(),
-            inner,
-            _marker: PhantomData,
-        }
-    }
-}
-
-/// The `tower::Service` produced by [`FromExtractorWithStateLayer`].
-pub struct FromExtractorWithState<E, S2> {
-    state: S2,
-    inner: Route,
-    _marker: PhantomData<fn() -> E>,
-}
-
-impl<E, S2> std::fmt::Debug for FromExtractorWithState<E, S2> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromExtractorWithState")
-            .finish_non_exhaustive()
-    }
-}
-
-impl<E, S2: Clone> Clone for FromExtractorWithState<E, S2> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-            inner: self.inner.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<E, S2> Service<Request<Body>> for FromExtractorWithState<E, S2>
-where
-    E: FromRequestParts<S2> + Send + 'static,
-    E::Rejection: Send,
-    S2: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+    T: Service<Request<Body>, Response = Response, Error = Infallible>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    T::Future: Send + 'static,
 {
     type Response = Response;
     type Error = Infallible;
@@ -809,6 +644,18 @@ where
                 Err(rejection) => Ok(rejection.into_response()),
             }
         })
+    }
+}
+
+/// Builds the layer for extractor `E`, bound to `state`.
+pub fn from_extractor_with_state<E, S>(state: S) -> FromExtractorLayer<E, S>
+where
+    E: FromRequestParts<S> + Send + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    FromExtractorLayer {
+        state,
+        _marker: PhantomData,
     }
 }
 

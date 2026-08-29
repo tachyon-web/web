@@ -59,6 +59,9 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 # Optional Server-Sent Events support (see the `sse` feature).
 futures-core = { version = "0.3", default-features = false, optional = true }
 
+# Optional `multipart/form-data` support (see the `multipart` feature).
+multer = { version = "3", default-features = false, optional = true }
+
 # Optional response-compression codecs (see the `compression-*` features).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"], optional = true }
 brotli = { version = "8", default-features = false, features = ["std"], optional = true }
@@ -114,6 +117,7 @@ tower-log = ["tower/log"]
 ws = ["dep:tungstenite", "dep:futures-util", "dep:flate2"]
 form = []
 query = []
+multipart = ["dep:multer", "dep:futures-core"]
 
 # Tachyon-only additions
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]

@@ -20,6 +20,15 @@ pub use crate::ws::WebSocketUpgrade;
 #[cfg(feature = "sfv")]
 pub use crate::http::sfv::StructuredHeader;
 
+/// `multipart/form-data` extractor (`Multipart`, `Field`, `MultipartError`).
+///
+/// Matches `axum::extract::multipart`. Requires the `multipart` feature.
+#[cfg(feature = "multipart")]
+pub mod multipart;
+/// Flattened re-export matching `axum::extract::Multipart`.
+#[cfg(feature = "multipart")]
+pub use multipart::Multipart;
+
 use crate::http::error::Error;
 use crate::http::response::Body;
 use bytes::Bytes;
@@ -215,6 +224,7 @@ struct QueryIter<'de> {
     input: &'de str,
 }
 
+#[cfg(any(feature = "query", feature = "form"))]
 struct CoercingCowDeserializer<'de> {
     val: std::borrow::Cow<'de, str>,
 }
@@ -222,6 +232,7 @@ struct CoercingCowDeserializer<'de> {
 /// Query/form/path values arrive as strings, so every numeric target is deserialized by
 /// `FromStr`-parsing the raw value. Generates one `deserialize_*` method per primitive,
 /// all identical apart from the type parsed and the visitor method called.
+#[cfg(any(feature = "query", feature = "form"))]
 macro_rules! coerce_via_from_str {
     ($( $method:ident => $visit:ident : $ty:ty ),* $(,)?) => {
         $(
@@ -239,6 +250,7 @@ macro_rules! coerce_via_from_str {
     };
 }
 
+#[cfg(any(feature = "query", feature = "form"))]
 impl<'de> serde::de::Deserializer<'de> for CoercingCowDeserializer<'de> {
     type Error = serde::de::value::Error;
 
@@ -323,6 +335,7 @@ impl<'de> serde::de::Deserializer<'de> for CoercingCowDeserializer<'de> {
     }
 }
 
+#[cfg(any(feature = "query", feature = "form"))]
 impl<'de> serde::de::IntoDeserializer<'de, serde::de::value::Error>
     for CoercingCowDeserializer<'de>
 {
@@ -437,117 +450,433 @@ pub struct PathParams(pub PathParamsVec);
 
 /// A `serde::Deserializer` over route path parameters that supports scalar,
 /// tuple, and map/struct deserialization targets, mirroring Axum's `Path`
-/// extractor semantics.
+/// extractor semantics — including its structured [`rejection::ErrorKind`]
+/// (which key/index a parse failure happened at, not just a message string).
 struct PathDeserializer<'de> {
     params: &'de [(std::sync::Arc<str>, String)],
 }
 
-impl<'de> PathDeserializer<'de> {
-    fn single_value(&self) -> Result<&'de str, serde::de::value::Error> {
-        match self.params {
-            [(_, v)] => Ok(v.as_str()),
-            _ => Err(serde::de::Error::custom(format!(
-                "wrong number of path parameters: expected 1, got {}",
-                self.params.len()
-            ))),
+macro_rules! path_unsupported_type {
+    ($trait_fn:ident) => {
+        fn $trait_fn<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            Err(rejection::PathDeserializationError::unsupported_type(
+                std::any::type_name::<V::Value>(),
+            ))
         }
-    }
-
-    const fn value_deserializer(val: &'de str) -> CoercingCowDeserializer<'de> {
-        CoercingCowDeserializer {
-            val: std::borrow::Cow::Borrowed(val),
-        }
-    }
-
-    fn map_deserializer(
-        &self,
-    ) -> serde::de::value::MapDeserializer<
-        'de,
-        impl Iterator<Item = (std::borrow::Cow<'de, str>, CoercingCowDeserializer<'de>)>,
-        serde::de::value::Error,
-    > {
-        serde::de::value::MapDeserializer::new(self.params.iter().map(|(k, v)| {
-            (
-                std::borrow::Cow::Borrowed(k.as_ref()),
-                CoercingCowDeserializer {
-                    val: std::borrow::Cow::Borrowed(v.as_str()),
-                },
-            )
-        }))
-    }
+    };
 }
 
-struct PathParamsSeqAccess<'de> {
-    iter: std::slice::Iter<'de, (std::sync::Arc<str>, String)>,
-}
-
-impl<'de> serde::de::SeqAccess<'de> for PathParamsSeqAccess<'de> {
-    type Error = serde::de::value::Error;
-
-    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
-    where
-        T: serde::de::DeserializeSeed<'de>,
-    {
-        match self.iter.next() {
-            Some((_, v)) => seed
-                .deserialize(CoercingCowDeserializer {
-                    val: std::borrow::Cow::Borrowed(v.as_str()),
+macro_rules! path_parse_single_value {
+    ($trait_fn:ident, $visit_fn:ident, $ty:literal) => {
+        fn $trait_fn<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            let [(_, raw)] = self.params else {
+                return Err(
+                    rejection::PathDeserializationError::wrong_number_of_parameters(
+                        self.params.len(),
+                    )
+                    .expected(1),
+                );
+            };
+            let value = raw.parse().map_err(|_| {
+                rejection::PathDeserializationError::new(rejection::ErrorKind::ParseError {
+                    value: raw.clone(),
+                    expected_type: $ty,
                 })
-                .map(Some),
-            None => Ok(None),
+            })?;
+            visitor.$visit_fn(value)
         }
-    }
-
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.iter.len())
-    }
-}
-
-macro_rules! path_deserialize_scalar {
-    ($($method:ident),* $(,)?) => {
-        $(
-            fn $method<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-            where
-                V: serde::de::Visitor<'de>,
-            {
-                let val = self.single_value()?;
-                PathDeserializer::value_deserializer(val).$method(visitor)
-            }
-        )*
     };
 }
 
 impl<'de> serde::de::Deserializer<'de> for PathDeserializer<'de> {
-    type Error = serde::de::value::Error;
+    type Error = rejection::PathDeserializationError;
+
+    // Unlike axum's own top-level deserializer (which rejects these outright),
+    // this crate has always supported a bare `Path<Option<T>>`/`Path<IgnoredAny>`
+    // target and identifier forwarding — a superset of axum's behavior with no
+    // downside, so it's kept rather than narrowed down to match axum's stricter
+    // (and, for these four methods, purely more restrictive) real deserializer.
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        let [(_, value)] = self.params else {
+            return Err(
+                rejection::PathDeserializationError::wrong_number_of_parameters(self.params.len())
+                    .expected(1),
+            );
+        };
+        visitor.visit_borrowed_bytes(value.as_bytes())
+    }
+
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_str(visitor)
+    }
+
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    path_parse_single_value!(deserialize_bool, visit_bool, "bool");
+    path_parse_single_value!(deserialize_i8, visit_i8, "i8");
+    path_parse_single_value!(deserialize_i16, visit_i16, "i16");
+    path_parse_single_value!(deserialize_i32, visit_i32, "i32");
+    path_parse_single_value!(deserialize_i64, visit_i64, "i64");
+    path_parse_single_value!(deserialize_i128, visit_i128, "i128");
+    path_parse_single_value!(deserialize_u8, visit_u8, "u8");
+    path_parse_single_value!(deserialize_u16, visit_u16, "u16");
+    path_parse_single_value!(deserialize_u32, visit_u32, "u32");
+    path_parse_single_value!(deserialize_u64, visit_u64, "u64");
+    path_parse_single_value!(deserialize_u128, visit_u128, "u128");
+    path_parse_single_value!(deserialize_f32, visit_f32, "f32");
+    path_parse_single_value!(deserialize_f64, visit_f64, "f64");
+    path_parse_single_value!(deserialize_string, visit_string, "String");
+    path_parse_single_value!(deserialize_byte_buf, visit_string, "String");
+    path_parse_single_value!(deserialize_char, visit_char, "char");
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        // Single-param routes are ambiguous between "scalar" and "1-field struct" at
-        // this point; defer to visit_map, which handles both since serde's derived
-        // struct visitors accept single-entry maps and scalar newtypes forward here too.
-        visitor.visit_map(self.map_deserializer())
+        self.deserialize_str(visitor)
     }
 
-    path_deserialize_scalar!(
-        deserialize_bool,
-        deserialize_u8,
-        deserialize_u16,
-        deserialize_u32,
-        deserialize_u64,
-        deserialize_i8,
-        deserialize_i16,
-        deserialize_i32,
-        deserialize_i64,
-        deserialize_f32,
-        deserialize_f64,
-        deserialize_char,
-        deserialize_str,
-        deserialize_string,
-        deserialize_bytes,
-        deserialize_byte_buf,
-    );
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        let [(key, value)] = self.params else {
+            return Err(
+                rejection::PathDeserializationError::wrong_number_of_parameters(self.params.len())
+                    .expected(1),
+            );
+        };
+        visitor.visit_borrowed_str(value.as_str()).map_err(
+            |e: rejection::PathDeserializationError| {
+                if let rejection::ErrorKind::Message(message) = &e.kind {
+                    rejection::PathDeserializationError::new(
+                        rejection::ErrorKind::DeserializeError {
+                            key: key.to_string(),
+                            value: value.clone(),
+                            message: message.clone(),
+                        },
+                    )
+                } else {
+                    e
+                }
+            },
+        )
+    }
+
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_unit_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_newtype_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_seq(PathSeqAccess {
+            params: self.params,
+            idx: 0,
+        })
+    }
+
+    fn deserialize_tuple<V>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        if self.params.len() != len {
+            return Err(
+                rejection::PathDeserializationError::wrong_number_of_parameters(self.params.len())
+                    .expected(len),
+            );
+        }
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V>(
+        self,
+        _name: &'static str,
+        len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_tuple(len, visitor)
+    }
+
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_map(PathMapAccess {
+            params: self.params,
+            key: None,
+            value: None,
+        })
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_map(visitor)
+    }
+
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        let [(_, value)] = self.params else {
+            return Err(
+                rejection::PathDeserializationError::wrong_number_of_parameters(self.params.len())
+                    .expected(1),
+            );
+        };
+        visitor.visit_enum(PathEnumAccess {
+            value: value.as_str(),
+        })
+    }
+}
+
+/// Tracks whether a value came from a named struct field or a positional
+/// tuple/sequence slot, so a parse failure can be attributed precisely
+/// (`ErrorKind::ParseErrorAtKey` vs `ErrorKind::ParseErrorAtIndex`).
+#[derive(Clone, Copy)]
+enum PathKeyOrIdx<'de> {
+    Key(&'de str),
+    Idx(usize),
+}
+
+struct PathMapAccess<'de> {
+    params: &'de [(std::sync::Arc<str>, String)],
+    key: Option<&'de str>,
+    value: Option<&'de str>,
+}
+
+impl<'de> serde::de::MapAccess<'de> for PathMapAccess<'de> {
+    type Error = rejection::PathDeserializationError;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: serde::de::DeserializeSeed<'de>,
+    {
+        match self.params.split_first() {
+            Some(((key, value), tail)) => {
+                self.key = Some(key.as_ref());
+                self.value = Some(value.as_str());
+                self.params = tail;
+                seed.deserialize(PathKeyDeserializer { key: key.as_ref() })
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::DeserializeSeed<'de>,
+    {
+        match self.value.take() {
+            Some(value) => seed.deserialize(PathValueDeserializer {
+                key_or_idx: self.key.take().map(PathKeyOrIdx::Key),
+                value,
+            }),
+            None => Err(serde::de::Error::custom("value is missing")),
+        }
+    }
+}
+
+struct PathKeyDeserializer<'de> {
+    key: &'de str,
+}
+
+macro_rules! path_parse_key {
+    ($trait_fn:ident) => {
+        fn $trait_fn<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            visitor.visit_str(self.key)
+        }
+    };
+}
+
+impl<'de> serde::de::Deserializer<'de> for PathKeyDeserializer<'de> {
+    type Error = rejection::PathDeserializationError;
+
+    path_parse_key!(deserialize_identifier);
+    path_parse_key!(deserialize_str);
+    path_parse_key!(deserialize_string);
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::Error::custom("Unexpected key type"))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char bytes
+        byte_buf option unit unit_struct seq tuple
+        tuple_struct map newtype_struct struct enum ignored_any
+    }
+}
+
+struct PathValueDeserializer<'de> {
+    key_or_idx: Option<PathKeyOrIdx<'de>>,
+    value: &'de str,
+}
+
+macro_rules! path_parse_value {
+    ($trait_fn:ident, $visit_fn:ident, $ty:literal) => {
+        fn $trait_fn<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: serde::de::Visitor<'de>,
+        {
+            let v = self.value.parse().map_err(|_| match self.key_or_idx {
+                Some(PathKeyOrIdx::Key(key)) => rejection::PathDeserializationError::new(
+                    rejection::ErrorKind::ParseErrorAtKey {
+                        key: key.to_string(),
+                        value: self.value.to_string(),
+                        expected_type: $ty,
+                    },
+                ),
+                Some(PathKeyOrIdx::Idx(index)) => rejection::PathDeserializationError::new(
+                    rejection::ErrorKind::ParseErrorAtIndex {
+                        index,
+                        value: self.value.to_string(),
+                        expected_type: $ty,
+                    },
+                ),
+                None => {
+                    rejection::PathDeserializationError::new(rejection::ErrorKind::ParseError {
+                        value: self.value.to_string(),
+                        expected_type: $ty,
+                    })
+                }
+            })?;
+            visitor.$visit_fn(v)
+        }
+    };
+}
+
+impl<'de> serde::de::Deserializer<'de> for PathValueDeserializer<'de> {
+    type Error = rejection::PathDeserializationError;
+
+    path_unsupported_type!(deserialize_map);
+    path_unsupported_type!(deserialize_identifier);
+
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        visitor.visit_borrowed_bytes(self.value.as_bytes())
+    }
+
+    path_parse_value!(deserialize_bool, visit_bool, "bool");
+    path_parse_value!(deserialize_i8, visit_i8, "i8");
+    path_parse_value!(deserialize_i16, visit_i16, "i16");
+    path_parse_value!(deserialize_i32, visit_i32, "i32");
+    path_parse_value!(deserialize_i64, visit_i64, "i64");
+    path_parse_value!(deserialize_i128, visit_i128, "i128");
+    path_parse_value!(deserialize_u8, visit_u8, "u8");
+    path_parse_value!(deserialize_u16, visit_u16, "u16");
+    path_parse_value!(deserialize_u32, visit_u32, "u32");
+    path_parse_value!(deserialize_u64, visit_u64, "u64");
+    path_parse_value!(deserialize_u128, visit_u128, "u128");
+    path_parse_value!(deserialize_f32, visit_f32, "f32");
+    path_parse_value!(deserialize_f64, visit_f64, "f64");
+    path_parse_value!(deserialize_string, visit_string, "String");
+    path_parse_value!(deserialize_byte_buf, visit_string, "String");
+    path_parse_value!(deserialize_char, visit_char, "char");
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_str(visitor)
+    }
+
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        let key_or_idx = self.key_or_idx;
+        let value = self.value;
+        visitor
+            .visit_borrowed_str(value)
+            .map_err(
+                |e: rejection::PathDeserializationError| match (&e.kind, key_or_idx) {
+                    (rejection::ErrorKind::Message(message), Some(PathKeyOrIdx::Key(key))) => {
+                        rejection::PathDeserializationError::new(
+                            rejection::ErrorKind::DeserializeError {
+                                key: key.to_string(),
+                                value: value.to_string(),
+                                message: message.clone(),
+                            },
+                        )
+                    }
+                    _ => e,
+                },
+            )
+    }
 
     fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
     where
@@ -585,57 +914,104 @@ impl<'de> serde::de::Deserializer<'de> for PathDeserializer<'de> {
         visitor.visit_newtype_struct(self)
     }
 
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        visitor.visit_seq(PathParamsSeqAccess {
-            iter: self.params.iter(),
-        })
-    }
-
     fn deserialize_tuple<V>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        if self.params.len() != len {
-            return Err(serde::de::Error::custom(format!(
-                "wrong number of path parameters: expected {len}, got {}",
-                self.params.len()
-            )));
+        // `Vec<(K, V)>` targets decompose each map entry into a 2-tuple; anything
+        // else at this arity has no sensible interpretation for a single value.
+        struct PathPairAccess<'de> {
+            key_or_idx: Option<PathKeyOrIdx<'de>>,
+            value: Option<&'de str>,
         }
-        self.deserialize_seq(visitor)
+
+        impl<'de> serde::de::SeqAccess<'de> for PathPairAccess<'de> {
+            type Error = rejection::PathDeserializationError;
+
+            fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+            where
+                T: serde::de::DeserializeSeed<'de>,
+            {
+                match self.key_or_idx.take() {
+                    Some(PathKeyOrIdx::Key(key)) => {
+                        return seed.deserialize(PathKeyDeserializer { key }).map(Some);
+                    }
+                    Some(PathKeyOrIdx::Idx(_)) => {
+                        return Err(serde::de::Error::custom("array types are not supported"));
+                    }
+                    None => {}
+                }
+                self.value
+                    .take()
+                    .map(|value| {
+                        seed.deserialize(PathValueDeserializer {
+                            key_or_idx: None,
+                            value,
+                        })
+                    })
+                    .transpose()
+            }
+        }
+
+        if len == 2 {
+            let value = self.value;
+            // `key_or_idx` is only `None` when deserializing bare (non-map) values,
+            // which never reach `deserialize_tuple` at len == 2.
+            self.key_or_idx.map_or_else(
+                || {
+                    Err(rejection::PathDeserializationError::unsupported_type(
+                        std::any::type_name::<V::Value>(),
+                    ))
+                },
+                |key_or_idx| {
+                    visitor.visit_seq(PathPairAccess {
+                        key_or_idx: Some(key_or_idx),
+                        value: Some(value),
+                    })
+                },
+            )
+        } else {
+            Err(rejection::PathDeserializationError::unsupported_type(
+                std::any::type_name::<V::Value>(),
+            ))
+        }
+    }
+
+    fn deserialize_seq<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(rejection::PathDeserializationError::unsupported_type(
+            std::any::type_name::<V::Value>(),
+        ))
     }
 
     fn deserialize_tuple_struct<V>(
         self,
         _name: &'static str,
-        len: usize,
-        visitor: V,
+        _len: usize,
+        _visitor: V,
     ) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        self.deserialize_tuple(len, visitor)
-    }
-
-    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        visitor.visit_map(self.map_deserializer())
+        Err(rejection::PathDeserializationError::unsupported_type(
+            std::any::type_name::<V::Value>(),
+        ))
     }
 
     fn deserialize_struct<V>(
         self,
         _name: &'static str,
         _fields: &'static [&'static str],
-        visitor: V,
+        _visitor: V,
     ) -> Result<V::Value, Self::Error>
     where
         V: serde::de::Visitor<'de>,
     {
-        self.deserialize_map(visitor)
+        Err(rejection::PathDeserializationError::unsupported_type(
+            std::any::type_name::<V::Value>(),
+        ))
     }
 
     fn deserialize_enum<V>(
@@ -647,16 +1023,7 @@ impl<'de> serde::de::Deserializer<'de> for PathDeserializer<'de> {
     where
         V: serde::de::Visitor<'de>,
     {
-        use serde::de::IntoDeserializer;
-        let val = self.single_value()?;
-        visitor.visit_enum(val.into_deserializer())
-    }
-
-    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
-    where
-        V: serde::de::Visitor<'de>,
-    {
-        self.deserialize_str(visitor)
+        visitor.visit_enum(PathEnumAccess { value: self.value })
     }
 
     fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
@@ -664,6 +1031,98 @@ impl<'de> serde::de::Deserializer<'de> for PathDeserializer<'de> {
         V: serde::de::Visitor<'de>,
     {
         visitor.visit_unit()
+    }
+}
+
+struct PathEnumAccess<'de> {
+    value: &'de str,
+}
+
+impl<'de> serde::de::EnumAccess<'de> for PathEnumAccess<'de> {
+    type Error = rejection::PathDeserializationError;
+    type Variant = PathUnitVariant;
+
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
+    where
+        V: serde::de::DeserializeSeed<'de>,
+    {
+        Ok((
+            seed.deserialize(PathKeyDeserializer { key: self.value })?,
+            PathUnitVariant,
+        ))
+    }
+}
+
+struct PathUnitVariant;
+
+impl<'de> serde::de::VariantAccess<'de> for PathUnitVariant {
+    type Error = rejection::PathDeserializationError;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T>(self, _seed: T) -> Result<T::Value, Self::Error>
+    where
+        T: serde::de::DeserializeSeed<'de>,
+    {
+        Err(rejection::PathDeserializationError::unsupported_type(
+            "newtype enum variant",
+        ))
+    }
+
+    fn tuple_variant<V>(self, _len: usize, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(rejection::PathDeserializationError::unsupported_type(
+            "tuple enum variant",
+        ))
+    }
+
+    fn struct_variant<V>(
+        self,
+        _fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(rejection::PathDeserializationError::unsupported_type(
+            "struct enum variant",
+        ))
+    }
+}
+
+struct PathSeqAccess<'de> {
+    params: &'de [(std::sync::Arc<str>, String)],
+    idx: usize,
+}
+
+impl<'de> serde::de::SeqAccess<'de> for PathSeqAccess<'de> {
+    type Error = rejection::PathDeserializationError;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: serde::de::DeserializeSeed<'de>,
+    {
+        match self.params.split_first() {
+            Some(((_, value), tail)) => {
+                self.params = tail;
+                let idx = self.idx;
+                self.idx = self.idx.wrapping_add(1);
+                seed.deserialize(PathValueDeserializer {
+                    key_or_idx: Some(PathKeyOrIdx::Idx(idx)),
+                    value: value.as_str(),
+                })
+                .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.params.len())
     }
 }
 
@@ -690,13 +1149,68 @@ where
 
             T::deserialize(PathDeserializer { params })
                 .map(Path)
-                .map_err(|e: serde::de::value::Error| {
-                    rejection::FailedToDeserializePathParams(format!(
-                        "Failed to deserialize path parameters: {e}"
-                    ))
-                    .into()
+                .map_err(|e: rejection::PathDeserializationError| {
+                    rejection::FailedToDeserializePathParams(e).into()
                 })
         })
+    }
+}
+
+/// Extractor for the raw, un-deserialized path parameters as `(key, value)`
+/// string pairs, bypassing [`Path`]'s `serde` deserialization step entirely.
+/// Matches `axum::extract::RawPathParams`.
+///
+/// Prefer [`Path`] where it fits; this exists for the (rarer) case of wanting
+/// the params without paying for the deserialize step.
+#[derive(Debug, Clone)]
+pub struct RawPathParams(PathParamsVec);
+
+impl<S: Sync> FromRequestParts<S> for RawPathParams {
+    type Rejection = rejection::RawPathParamsRejection;
+
+    fn from_request_parts(
+        parts: &mut hyper::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        // Mirrors `Path<T>`'s own "no extension = zero params" convention above:
+        // this crate never inserts a `PathParams` extension for parameterless
+        // routes, so a missing extension isn't `MissingPathParams` here either.
+        std::future::ready(Ok(Self(
+            parts
+                .extensions
+                .get::<PathParams>()
+                .map_or_else(PathParamsVec::new, |p| p.0.clone()),
+        )))
+    }
+}
+
+impl RawPathParams {
+    /// Get an iterator over the path parameters.
+    #[must_use]
+    pub fn iter(&self) -> RawPathParamsIter<'_> {
+        self.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a RawPathParams {
+    type Item = (&'a str, &'a str);
+    type IntoIter = RawPathParamsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        RawPathParamsIter(self.0.iter())
+    }
+}
+
+/// An iterator over raw path parameters. Created with [`RawPathParams::iter`].
+#[derive(Debug, Clone)]
+pub struct RawPathParamsIter<'a>(std::slice::Iter<'a, (std::sync::Arc<str>, String)>);
+
+impl<'a> Iterator for RawPathParamsIter<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, value) = self.0.next()?;
+        Some((key.as_ref(), value.as_str()))
     }
 }
 
@@ -971,6 +1485,52 @@ where
     }
 }
 
+/// Extractor for the raw, un-deserialized form payload, bypassing [`Form`]'s
+/// `serde` deserialization step entirely. Matches `axum::extract::RawForm`.
+///
+/// For `GET`/`HEAD` requests this is the raw query string; for other methods
+/// it's the raw `application/x-www-form-urlencoded` request body. Requires
+/// the `form` feature.
+#[cfg(feature = "form")]
+#[derive(Debug, Clone)]
+pub struct RawForm(pub Bytes);
+
+#[cfg(feature = "form")]
+impl<S> FromRequest<S> for RawForm
+where
+    S: Sync,
+{
+    type Rejection = rejection::RawFormRejection;
+
+    async fn from_request(req: hyper::Request<Body>, _state: &S) -> Result<Self, Self::Rejection> {
+        if req.method() == hyper::Method::GET || req.method() == hyper::Method::HEAD {
+            return Ok(Self(req.uri().query().map_or_else(Bytes::new, |q| {
+                Bytes::copy_from_slice(q.as_bytes())
+            })));
+        }
+
+        let ct = req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let essence = ct.split(';').next().unwrap_or("").trim();
+        if !essence.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+            return Err(rejection::InvalidFormContentType(format!(
+                "Expected Content-Type: application/x-www-form-urlencoded, got: '{ct}'"
+            ))
+            .into());
+        }
+        let limit = max_body_size(req.extensions());
+        let body = req
+            .into_body()
+            .collect_bytes(limit)
+            .await
+            .map_err(rejection::BytesRejection::from)?;
+        Ok(Self(body))
+    }
+}
+
 /// Extractor for request-local extensions.
 #[derive(Debug, Clone, Copy)]
 pub struct Extension<T>(pub T);
@@ -999,6 +1559,65 @@ where
                     .into()
                 })
         })
+    }
+}
+
+impl<T> crate::http::response::IntoResponse for Extension<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    fn into_response(self) -> crate::http::response::Response {
+        let mut res = crate::http::response::IntoResponse::into_response(());
+        res.extensions_mut().insert(self.0);
+        res
+    }
+}
+
+/// A `tower::Layer` inserting a fixed, cloneable value into every incoming
+/// request's extensions. Matches `Extension<T>`'s `tower::Layer` impl in axum
+/// — the layer form of the [`Extension`] extractor above, for a value bound
+/// once at `.layer()` time rather than read from somewhere else per request.
+impl<S, T> tower::Layer<S> for Extension<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    type Service = AddExtension<S, T>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AddExtension {
+            inner,
+            value: self.0.clone(),
+        }
+    }
+}
+
+/// The `tower::Service` produced by [`Extension`]'s `tower::Layer` impl.
+/// Matches `axum::extension::AddExtension`.
+#[derive(Clone, Copy, Debug)]
+pub struct AddExtension<S, T> {
+    pub(crate) inner: S,
+    pub(crate) value: T,
+}
+
+impl<ResBody, S, T> tower::Service<hyper::Request<ResBody>> for AddExtension<S, T>
+where
+    S: tower::Service<hyper::Request<ResBody>>,
+    T: Clone + Send + Sync + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: hyper::Request<ResBody>) -> Self::Future {
+        req.extensions_mut().insert(self.value.clone());
+        self.inner.call(req)
     }
 }
 
@@ -1215,6 +1834,40 @@ impl<S: Sync> FromRequestParts<S> for MatchedPath {
     }
 }
 
+/// Extractor for the path prefix a matched route was nested under, e.g. `/api`
+/// for a route mounted via `Router::nest("/api", ...)`. Matches
+/// `axum::extract::NestedPath`.
+///
+/// Only available for requests that matched a route reached through at least
+/// one level of nesting — a non-nested route has no [`NestedPath`].
+#[derive(Debug, Clone)]
+pub struct NestedPath(pub(crate) std::sync::Arc<str>);
+
+impl NestedPath {
+    /// Returns a `str` representation of the path.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<S: Sync> FromRequestParts<S> for NestedPath {
+    type Rejection = rejection::NestedPathRejection;
+
+    fn from_request_parts(
+        parts: &mut hyper::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(
+            parts
+                .extensions
+                .get::<Self>()
+                .cloned()
+                .ok_or(rejection::NestedPathRejection),
+        )
+    }
+}
+
 /// Extractor for network connection info.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectInfo<T>(pub T);
@@ -1288,9 +1941,11 @@ impl_from_request_via_parts!(Host);
 impl_from_request_via_parts!(OriginalUri);
 #[cfg(feature = "matched-path")]
 impl_from_request_via_parts!(MatchedPath);
+impl_from_request_via_parts!(NestedPath);
 
 impl_from_request_via_parts!(State<T>, T: FromRef<S> + Send + Sync + 'static);
 impl_from_request_via_parts!(Path<T>, T: DeserializeOwned + Send + Sync + 'static);
+impl_from_request_via_parts!(RawPathParams);
 #[cfg(feature = "query")]
 impl_from_request_via_parts!(Query<T>, T: DeserializeOwned + Send + Sync + 'static);
 impl_from_request_via_parts!(Extension<T>, T: Clone + Send + Sync + 'static);
@@ -1457,6 +2112,35 @@ mod tests {
     use super::*;
     use hyper::http::Request;
     use serde::Deserialize;
+
+    #[tokio::test]
+    async fn add_extension_layer_inserts_the_bound_value_into_every_request() {
+        #[derive(Clone, PartialEq, Debug)]
+        struct Shared(u32);
+
+        struct Echo;
+        impl tower::Service<hyper::Request<Body>> for Echo {
+            type Response = Option<Shared>;
+            type Error = Infallible;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(
+                &mut self,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: hyper::Request<Body>) -> Self::Future {
+                std::future::ready(Ok(req.extensions().get::<Shared>().cloned()))
+            }
+        }
+
+        let mut svc = tower::Layer::layer(&Extension(Shared(42)), Echo);
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let seen = tower::Service::call(&mut svc, req).await.unwrap();
+        assert_eq!(seen, Some(Shared(42)));
+    }
 
     #[tokio::test]
     async fn option_extractor_is_some_on_success_and_none_on_rejection() {
@@ -1741,6 +2425,43 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "form")]
+    #[tokio::test]
+    async fn test_raw_form_reads_query_on_get_and_body_on_post() {
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/search?foo=bar")
+            .body(Body::empty())
+            .unwrap();
+        let RawForm(query) = RawForm::from_request(get_req, &()).await.unwrap();
+        assert_eq!(&query[..], b"foo=bar");
+
+        let post_req = Request::builder()
+            .method("POST")
+            .header(
+                hyper::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::full(Bytes::from("foo=bar")))
+            .unwrap();
+        let RawForm(body) = RawForm::from_request(post_req, &()).await.unwrap();
+        assert_eq!(&body[..], b"foo=bar");
+    }
+
+    #[cfg(feature = "form")]
+    #[tokio::test]
+    async fn test_raw_form_rejects_wrong_content_type_on_post() {
+        let req = Request::builder()
+            .method("POST")
+            .body(Body::full(Bytes::from("foo=bar")))
+            .unwrap();
+        let err = RawForm::from_request(req, &()).await.unwrap_err();
+        assert!(matches!(
+            err,
+            rejection::RawFormRejection::InvalidFormContentType(_)
+        ));
+    }
+
     #[cfg(feature = "query")]
     #[tokio::test]
     async fn test_query_deserialize_error() {
@@ -1863,6 +2584,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_raw_path_params_iterates_key_value_pairs_in_order() {
+        let mut parts = make_path_parts(vec![("user_id", "1"), ("team_id", "2")]);
+        let params = RawPathParams::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        let collected: Vec<_> = params.iter().collect();
+        assert_eq!(collected, vec![("user_id", "1"), ("team_id", "2")]);
+    }
+
+    #[tokio::test]
+    async fn test_raw_path_params_succeeds_empty_on_a_parameterless_route() {
+        let mut parts = make_path_parts(vec![]);
+        let params = RawPathParams::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(params.iter().count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_path_scalar_wrong_param_count() {
         // Zero params for a bare scalar target.
         let mut zero = make_path_parts(vec![]);
@@ -1886,6 +2626,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, 7);
+    }
+
+    #[tokio::test]
+    async fn test_path_error_kind_pinpoints_the_failing_field_or_index() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Params {
+            a: u32,
+            b: u32,
+        }
+
+        let mut struct_target = make_path_parts(vec![("a", "1"), ("b", "not-a-number")]);
+        let err = Path::<Params>::from_request_parts(&mut struct_target, &())
+            .await
+            .unwrap_err();
+        let rejection::PathRejection::FailedToDeserializePathParams(err) = err else {
+            panic!("expected FailedToDeserializePathParams");
+        };
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(matches!(
+            err.into_kind(),
+            rejection::ErrorKind::ParseErrorAtKey { key, expected_type: "u32", .. }
+                if key == "b"
+        ));
+
+        let mut tuple_target = make_path_parts(vec![("a", "true"), ("b", "nope")]);
+        let err = Path::<(bool, u32)>::from_request_parts(&mut tuple_target, &())
+            .await
+            .unwrap_err();
+        let rejection::PathRejection::FailedToDeserializePathParams(err) = err else {
+            panic!("expected FailedToDeserializePathParams");
+        };
+        assert!(matches!(
+            err.into_kind(),
+            rejection::ErrorKind::ParseErrorAtIndex {
+                index: 1,
+                expected_type: "u32",
+                ..
+            }
+        ));
+
+        let mut scalar_target = make_path_parts(vec![("id", "nope")]);
+        let err = Path::<u32>::from_request_parts(&mut scalar_target, &())
+            .await
+            .unwrap_err();
+        let rejection::PathRejection::FailedToDeserializePathParams(err) = err else {
+            panic!("expected FailedToDeserializePathParams");
+        };
+        assert!(matches!(
+            err.into_kind(),
+            rejection::ErrorKind::ParseError {
+                expected_type: "u32",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

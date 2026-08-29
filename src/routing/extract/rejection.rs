@@ -176,10 +176,247 @@ composite_rejection! {
 
 // --- Path --------------------------------------------------------------
 
-leaf_rejection! {
-    /// The path parameters didn't deserialize into the extractor's target
-    /// type. Matches `axum::extract::path::FailedToDeserializePathParams`.
-    pub struct FailedToDeserializePathParams => BAD_REQUEST
+/// The kinds of errors that can happen when deserializing into a [`super::Path`].
+///
+/// Obtained through [`FailedToDeserializePathParams::kind`]/`::into_kind`, useful
+/// for building more precise error messages. Matches `axum::extract::path::ErrorKind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// The URI contained the wrong number of parameters.
+    WrongNumberOfParameters {
+        /// The number of actual parameters in the URI.
+        got: usize,
+        /// The number of expected parameters.
+        expected: usize,
+    },
+    /// Failed to parse the value at a specific key into the expected type.
+    ///
+    /// Used when deserializing into types with named fields, such as structs.
+    ParseErrorAtKey {
+        /// The key at which the value was located.
+        key: String,
+        /// The value from the URI.
+        value: String,
+        /// The expected type of the value.
+        expected_type: &'static str,
+    },
+    /// Failed to parse the value at a specific index into the expected type.
+    ///
+    /// Used when deserializing into sequence types, such as tuples.
+    ParseErrorAtIndex {
+        /// The index at which the value was located.
+        index: usize,
+        /// The value from the URI.
+        value: String,
+        /// The expected type of the value.
+        expected_type: &'static str,
+    },
+    /// Failed to parse a value into the expected type.
+    ///
+    /// Used when deserializing into a primitive type (such as `String` and `u32`).
+    ParseError {
+        /// The value from the URI.
+        value: String,
+        /// The expected type of the value.
+        expected_type: &'static str,
+    },
+    /// A parameter contained text that, once percent-decoded, wasn't valid UTF-8.
+    ///
+    /// Currently unreachable: this crate's router falls back to the raw,
+    /// still-encoded value on a decode failure rather than rejecting the
+    /// request (see `crate::routing::percent_decode`'s callers). Kept for
+    /// structural parity with axum, in case that fallback policy changes.
+    InvalidUtf8InPathParam {
+        /// The key at which the invalid value was located.
+        key: String,
+    },
+    /// Tried to deserialize into an unsupported type such as nested maps.
+    ///
+    /// This error kind is caused by programmer errors and thus gets converted
+    /// into a `500 Internal Server Error` response.
+    UnsupportedType {
+        /// The name of the unsupported type.
+        name: &'static str,
+    },
+    /// Failed to deserialize the value with a custom deserialization error.
+    DeserializeError {
+        /// The key at which the invalid value was located.
+        key: String,
+        /// The value that failed to deserialize.
+        value: String,
+        /// The deserialization failure message.
+        message: String,
+    },
+    /// Catch-all variant for errors that don't fit any other variant.
+    Message(String),
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(msg) => f.write_str(msg),
+            Self::InvalidUtf8InPathParam { key } => write!(f, "Invalid UTF-8 in `{key}`"),
+            Self::WrongNumberOfParameters { got, expected } => {
+                write!(
+                    f,
+                    "Wrong number of path arguments for `Path`. Expected {expected} but got {got}"
+                )?;
+                if *expected == 1 {
+                    write!(
+                        f,
+                        ". Note that multiple parameters must be extracted with a tuple \
+                         `Path<(_, _)>` or a struct `Path<YourParams>`"
+                    )?;
+                }
+                Ok(())
+            }
+            Self::UnsupportedType { name } => write!(f, "Unsupported type `{name}`"),
+            Self::ParseErrorAtKey {
+                key,
+                value,
+                expected_type,
+            } => write!(
+                f,
+                "Cannot parse `{key}` with value `{value}` to a `{expected_type}`"
+            ),
+            Self::ParseError {
+                value,
+                expected_type,
+            } => write!(f, "Cannot parse `{value}` to a `{expected_type}`"),
+            Self::ParseErrorAtIndex {
+                index,
+                value,
+                expected_type,
+            } => write!(
+                f,
+                "Cannot parse value at index {index} with value `{value}` to a `{expected_type}`"
+            ),
+            Self::DeserializeError {
+                key,
+                value,
+                message,
+            } => write!(f, "Cannot parse `{key}` with value `{value}`: {message}"),
+        }
+    }
+}
+
+/// Wraps [`ErrorKind`] as a `serde::de::Error`, hiding that impl from the
+/// public [`FailedToDeserializePathParams`] surface. Matches axum's internal
+/// `PathDeserializationError`.
+#[derive(Debug)]
+pub(crate) struct PathDeserializationError {
+    pub(crate) kind: ErrorKind,
+}
+
+impl PathDeserializationError {
+    pub(crate) const fn new(kind: ErrorKind) -> Self {
+        Self { kind }
+    }
+
+    pub(crate) const fn wrong_number_of_parameters(got: usize) -> WrongNumberOfParameters {
+        WrongNumberOfParameters { got }
+    }
+
+    pub(crate) const fn unsupported_type(name: &'static str) -> Self {
+        Self::new(ErrorKind::UnsupportedType { name })
+    }
+}
+
+/// Builder half of [`PathDeserializationError::wrong_number_of_parameters`].
+pub(crate) struct WrongNumberOfParameters {
+    got: usize,
+}
+
+impl WrongNumberOfParameters {
+    pub(crate) const fn expected(self, expected: usize) -> PathDeserializationError {
+        PathDeserializationError::new(ErrorKind::WrongNumberOfParameters {
+            got: self.got,
+            expected,
+        })
+    }
+}
+
+impl serde::de::Error for PathDeserializationError {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        Self {
+            kind: ErrorKind::Message(msg.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for PathDeserializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl std::error::Error for PathDeserializationError {}
+
+/// The path parameters didn't deserialize into the extractor's target type.
+/// Matches `axum::extract::path::FailedToDeserializePathParams`.
+#[derive(Debug)]
+pub struct FailedToDeserializePathParams(pub(crate) PathDeserializationError);
+
+impl FailedToDeserializePathParams {
+    /// Get a reference to the underlying error kind.
+    #[must_use]
+    pub const fn kind(&self) -> &ErrorKind {
+        &self.0.kind
+    }
+
+    /// Convert this error into the underlying error kind.
+    #[must_use]
+    pub fn into_kind(self) -> ErrorKind {
+        self.0.kind
+    }
+
+    /// Get the response body text used for this rejection.
+    #[must_use]
+    pub fn body_text(&self) -> String {
+        match &self.0.kind {
+            ErrorKind::Message(_)
+            | ErrorKind::DeserializeError { .. }
+            | ErrorKind::InvalidUtf8InPathParam { .. }
+            | ErrorKind::ParseError { .. }
+            | ErrorKind::ParseErrorAtIndex { .. }
+            | ErrorKind::ParseErrorAtKey { .. } => format!("Invalid URL: {}", self.0.kind),
+            ErrorKind::WrongNumberOfParameters { .. } | ErrorKind::UnsupportedType { .. } => {
+                self.0.kind.to_string()
+            }
+        }
+    }
+
+    /// Get the status code used for this rejection.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        match &self.0.kind {
+            ErrorKind::Message(_)
+            | ErrorKind::DeserializeError { .. }
+            | ErrorKind::InvalidUtf8InPathParam { .. }
+            | ErrorKind::ParseError { .. }
+            | ErrorKind::ParseErrorAtIndex { .. }
+            | ErrorKind::ParseErrorAtKey { .. } => StatusCode::BAD_REQUEST,
+            ErrorKind::WrongNumberOfParameters { .. } | ErrorKind::UnsupportedType { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for FailedToDeserializePathParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for FailedToDeserializePathParams {}
+
+impl IntoResponse for FailedToDeserializePathParams {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        (status, self.body_text()).into_response()
+    }
 }
 
 leaf_rejection! {
@@ -194,6 +431,56 @@ composite_rejection! {
     /// `axum::extract::rejection::PathRejection`.
     pub enum PathRejection {
         FailedToDeserializePathParams(FailedToDeserializePathParams),
+        MissingPathParams(MissingPathParams),
+    }
+}
+
+/// A path parameter contained text that, once percent-decoded, wasn't valid
+/// UTF-8. Matches `axum::extract::path::InvalidUtf8InPathParam`.
+///
+/// Currently unreachable via [`super::RawPathParams`]: this crate's router
+/// falls back to the raw, still-encoded value on a decode failure rather than
+/// rejecting the request (see [`ErrorKind::InvalidUtf8InPathParam`]'s docs).
+/// Kept for structural parity with axum, in case that fallback policy changes.
+#[derive(Debug, Clone)]
+pub struct InvalidUtf8InPathParam {
+    key: std::sync::Arc<str>,
+}
+
+impl InvalidUtf8InPathParam {
+    /// Get the response body text used for this rejection.
+    #[must_use]
+    pub fn body_text(&self) -> String {
+        self.to_string()
+    }
+
+    /// Get the status code used for this rejection.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+impl std::fmt::Display for InvalidUtf8InPathParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid UTF-8 in `{}`", self.key)
+    }
+}
+
+impl std::error::Error for InvalidUtf8InPathParam {}
+
+impl IntoResponse for InvalidUtf8InPathParam {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        (status, self.body_text()).into_response()
+    }
+}
+
+composite_rejection! {
+    /// Rejection for the [`super::RawPathParams`] extractor. Matches
+    /// `axum::extract::rejection::RawPathParamsRejection`.
+    pub enum RawPathParamsRejection {
+        InvalidUtf8InPathParam(InvalidUtf8InPathParam),
         MissingPathParams(MissingPathParams),
     }
 }
@@ -288,6 +575,16 @@ composite_rejection! {
     }
 }
 
+#[cfg(feature = "form")]
+composite_rejection! {
+    /// Rejection for the [`super::RawForm`] extractor. Matches
+    /// `axum::extract::rejection::RawFormRejection`.
+    pub enum RawFormRejection {
+        InvalidFormContentType(InvalidFormContentType),
+        BytesRejection(BytesRejection),
+    }
+}
+
 // --- Extension ---------------------------------------------------------
 
 leaf_rejection! {
@@ -320,6 +617,65 @@ composite_rejection! {
     /// `axum::extract::rejection::MatchedPathRejection`.
     pub enum MatchedPathRejection {
         MatchedPathMissing(MatchedPathMissing),
+    }
+}
+
+// --- NestedPath ----------------------------------------------------------
+
+/// The matched route wasn't nested under a prefix. Matches
+/// `axum::extract::rejection::NestedPathRejection`.
+#[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
+pub struct NestedPathRejection;
+
+impl std::fmt::Display for NestedPathRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The matched route is not nested")
+    }
+}
+
+impl std::error::Error for NestedPathRejection {}
+
+impl IntoResponse for NestedPathRejection {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
+    }
+}
+
+// --- Multipart -------------------------------------------------------------
+
+/// The `boundary` in a `multipart/form-data` request was missing or invalid.
+///
+/// Matches `axum::extract::rejection::InvalidBoundary`.
+#[cfg(feature = "multipart")]
+#[derive(Debug, Default, Clone, Copy)]
+#[non_exhaustive]
+pub struct InvalidBoundary;
+
+#[cfg(feature = "multipart")]
+impl std::fmt::Display for InvalidBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Invalid `boundary` for `multipart/form-data` request")
+    }
+}
+
+#[cfg(feature = "multipart")]
+impl std::error::Error for InvalidBoundary {}
+
+#[cfg(feature = "multipart")]
+impl IntoResponse for InvalidBoundary {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+    }
+}
+
+#[cfg(feature = "multipart")]
+composite_rejection! {
+    /// Rejection for the [`super::multipart::Multipart`] extractor.
+    ///
+    /// Matches `axum::extract::rejection::MultipartRejection`.
+    pub enum MultipartRejection {
+        InvalidBoundary(InvalidBoundary),
     }
 }
 
@@ -368,7 +724,9 @@ mod tests {
 
     #[test]
     fn path_rejection_display_forwards_inner_message() {
-        let rej = PathRejection::from(FailedToDeserializePathParams("bad id".into()));
+        let rej = PathRejection::from(FailedToDeserializePathParams(
+            PathDeserializationError::new(ErrorKind::Message("bad id".to_string())),
+        ));
         assert_eq!(rej.to_string(), "bad id");
     }
 }

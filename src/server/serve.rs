@@ -5,13 +5,15 @@
 //! [`IntoFuture`] rather than an `async fn`'s bare future, so
 //! `.with_graceful_shutdown(signal)` can be chained on before the final
 //! `.await`. This mirrors that shape. See [`Serve::with_graceful_shutdown`]
-//! for the one real behavioral difference from Axum's version.
+//! for the one real behavioral difference from Axum's version, and
+//! [`crate::server::Listener`]'s module docs for why `L` is generic in name
+//! only — only `TcpListener` can actually reach [`run`].
 
 use crate::routing::Router;
-use crate::server::Server;
+use crate::server::{Listener, Server};
 use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
 use std::pin::Pin;
-use tokio::net::TcpListener;
 
 /// The future returned by [`fn@crate::serve`] before any
 /// `.with_graceful_shutdown()` call.
@@ -20,18 +22,21 @@ use tokio::net::TcpListener;
 /// keeps working exactly as a plain `async fn` would; `.with_graceful_shutdown()`
 /// is also available, matching `axum::serve::Serve`.
 #[must_use = "futures do nothing unless polled or `.await`ed"]
-pub struct Serve {
-    pub(crate) listener: TcpListener,
+pub struct Serve<L> {
+    pub(crate) listener: L,
     pub(crate) router: Router<()>,
 }
 
-impl std::fmt::Debug for Serve {
+impl<L> std::fmt::Debug for Serve<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Serve").finish_non_exhaustive()
     }
 }
 
-impl Serve {
+impl<L> Serve<L>
+where
+    L: Listener<Addr = SocketAddr>,
+{
     /// Races the server against `signal`: returns as soon as either the
     /// server errors or `signal` resolves. Matches
     /// `axum::serve::Serve::with_graceful_shutdown`.
@@ -47,7 +52,7 @@ impl Serve {
     /// `tachyon_web::serve(listener, app).with_graceful_shutdown(sig).await`
     /// returns control to the caller (e.g. so `main` can proceed to exit)
     /// exactly when Axum code expects it to.
-    pub fn with_graceful_shutdown<F>(self, signal: F) -> WithGracefulShutdown<F>
+    pub fn with_graceful_shutdown<F>(self, signal: F) -> WithGracefulShutdown<L, F>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -57,9 +62,20 @@ impl Serve {
             signal,
         }
     }
+
+    /// Returns the local address this server is bound to.
+    ///
+    /// # Errors
+    /// Returns an error if querying the OS for the bound address fails.
+    pub fn local_addr(&self) -> std::io::Result<L::Addr> {
+        self.listener.local_addr()
+    }
 }
 
-impl IntoFuture for Serve {
+impl<L> IntoFuture for Serve<L>
+where
+    L: Listener<Addr = SocketAddr>,
+{
     type Output = Result<(), std::io::Error>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
 
@@ -71,21 +87,22 @@ impl IntoFuture for Serve {
 /// Returned by [`Serve::with_graceful_shutdown`]. Matches
 /// `axum::serve::WithGracefulShutdown`.
 #[must_use = "futures do nothing unless polled or `.await`ed"]
-pub struct WithGracefulShutdown<F> {
-    listener: TcpListener,
+pub struct WithGracefulShutdown<L, F> {
+    listener: L,
     router: Router<()>,
     signal: F,
 }
 
-impl<F> std::fmt::Debug for WithGracefulShutdown<F> {
+impl<L, F> std::fmt::Debug for WithGracefulShutdown<L, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WithGracefulShutdown")
             .finish_non_exhaustive()
     }
 }
 
-impl<F> IntoFuture for WithGracefulShutdown<F>
+impl<L, F> IntoFuture for WithGracefulShutdown<L, F>
 where
+    L: Listener<Addr = SocketAddr>,
     F: Future<Output = ()> + Send + 'static,
 {
     type Output = Result<(), std::io::Error>;
@@ -96,7 +113,10 @@ where
     }
 }
 
-async fn run(listener: TcpListener, router: Router<()>) -> Result<(), std::io::Error> {
+async fn run<L>(listener: L, router: Router<()>) -> Result<(), std::io::Error>
+where
+    L: Listener<Addr = SocketAddr>,
+{
     let addr = listener.local_addr()?;
     // drop the listener so the port is free to bind SO_REUSEPORT sockets in the worker pool
     drop(listener);
