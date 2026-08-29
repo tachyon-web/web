@@ -41,6 +41,7 @@
 
 mod compat;
 mod deflate;
+pub mod rejection;
 mod socket;
 
 use crate::http::error::Error;
@@ -48,6 +49,13 @@ use crate::http::response::Body;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::{Method, Response, StatusCode};
+use rejection::{
+    ConnectionLimitReached, ConnectionNotUpgradable, HttpVersionNotSupported,
+    InvalidConnectionHeader, InvalidUpgradeHeader, InvalidWebSocketVersionHeader, MethodNotGet,
+    WebSocketKeyHeaderMissing, WebSocketUpgradeRejection,
+};
+#[cfg(feature = "http2")]
+use rejection::{InvalidProtocolPseudoheader, MethodNotConnect};
 use std::borrow::Cow;
 use std::future::Future;
 use tungstenite::handshake::derive_accept_key;
@@ -395,7 +403,7 @@ impl<S> crate::routing::extract::FromRequest<S> for WebSocketUpgrade<DefaultOnFa
 where
     S: Send + Sync,
 {
-    type Rejection = Error;
+    type Rejection = WebSocketUpgradeRejection;
 
     fn from_request(
         req: hyper::Request<Body>,
@@ -414,61 +422,39 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
     /// # Errors
     ///
     /// Returns a rejection if this isn't a well-formed WebSocket upgrade request.
-    pub fn from_request_parts<S>(parts: &mut Parts, _state: &S) -> Result<Self, Error> {
+    pub fn from_request_parts<S>(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> Result<Self, WebSocketUpgradeRejection> {
         #[cfg(feature = "http2")]
         if parts.version == hyper::Version::HTTP_2 {
             return Self::from_h2_request_parts(parts);
         }
 
         if parts.version > hyper::Version::HTTP_11 {
-            return Err(Error::status(
-                StatusCode::UPGRADE_REQUIRED,
-                "WebSocket upgrades require HTTP/1.1 (or HTTP/2 extended CONNECT, with the `http2` feature enabled)",
-            ));
+            return Err(HttpVersionNotSupported.into());
         }
         if parts.method != Method::GET {
-            return Err(Error::status(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "Request method must be `GET`",
-            ));
+            return Err(MethodNotGet.into());
         }
         if !header_contains(&parts.headers, &header::CONNECTION, "upgrade") {
-            return Err(Error::status(
-                StatusCode::BAD_REQUEST,
-                "`Connection` header did not include 'upgrade'",
-            ));
+            return Err(InvalidConnectionHeader.into());
         }
         if !header_eq(&parts.headers, &header::UPGRADE, "websocket") {
-            return Err(Error::status(
-                StatusCode::BAD_REQUEST,
-                "`Upgrade` header did not include 'websocket'",
-            ));
+            return Err(InvalidUpgradeHeader.into());
         }
         if !header_eq(&parts.headers, &header::SEC_WEBSOCKET_VERSION, "13") {
-            return Err(Error::status(
-                StatusCode::BAD_REQUEST,
-                "`Sec-WebSocket-Version` header did not include '13'",
-            ));
+            return Err(InvalidWebSocketVersionHeader.into());
         }
         let sec_websocket_key = parts
             .headers
             .get(header::SEC_WEBSOCKET_KEY)
             .cloned()
-            .ok_or_else(|| {
-                Error::status(
-                    StatusCode::BAD_REQUEST,
-                    "`Sec-WebSocket-Key` header missing",
-                )
-            })?;
+            .ok_or(WebSocketKeyHeaderMissing)?;
         let on_upgrade = parts
             .extensions
             .remove::<hyper::upgrade::OnUpgrade>()
-            .ok_or_else(|| {
-                Error::status(
-                    StatusCode::UPGRADE_REQUIRED,
-                    "Request couldn't be upgraded: no upgrade state was present",
-                )
-            })?;
+            .ok_or(ConnectionNotUpgradable)?;
 
         let permit = reserve_connection_slot(parts)?;
         let sec_websocket_protocol = parse_sec_websocket_protocol(&parts.headers);
@@ -494,38 +480,24 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
     /// `:protocol: websocket`). Unlike HTTP/1.1, there is no `Sec-WebSocket-Key`/`-Accept`
     /// handshake — HTTP/2 already requires a validated transport, so RFC 8441 §5 drops it.
     #[cfg(feature = "http2")]
-    fn from_h2_request_parts(parts: &mut Parts) -> Result<Self, Error> {
+    fn from_h2_request_parts(parts: &mut Parts) -> Result<Self, WebSocketUpgradeRejection> {
         if parts.method != Method::CONNECT {
-            return Err(Error::status(
-                StatusCode::UPGRADE_REQUIRED,
-                "WebSocket upgrades over HTTP/2 require the extended CONNECT method (RFC 8441)",
-            ));
+            return Err(MethodNotConnect.into());
         }
         let is_websocket_protocol = parts
             .extensions
             .get::<hyper::ext::Protocol>()
             .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"));
         if !is_websocket_protocol {
-            return Err(Error::status(
-                StatusCode::BAD_REQUEST,
-                "`:protocol` pseudo-header must be `websocket`",
-            ));
+            return Err(InvalidProtocolPseudoheader.into());
         }
         if !header_eq(&parts.headers, &header::SEC_WEBSOCKET_VERSION, "13") {
-            return Err(Error::status(
-                StatusCode::BAD_REQUEST,
-                "`Sec-WebSocket-Version` header did not include '13'",
-            ));
+            return Err(InvalidWebSocketVersionHeader.into());
         }
         let on_upgrade = parts
             .extensions
             .remove::<hyper::upgrade::OnUpgrade>()
-            .ok_or_else(|| {
-                Error::status(
-                    StatusCode::UPGRADE_REQUIRED,
-                    "Request couldn't be upgraded: no upgrade state was present",
-                )
-            })?;
+            .ok_or(ConnectionNotUpgradable)?;
 
         let permit = reserve_connection_slot(parts)?;
         let sec_websocket_protocol = parse_sec_websocket_protocol(&parts.headers);
@@ -554,17 +526,17 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
 /// completing the upgrade and leaving the peer holding a connection nothing will service.
 fn reserve_connection_slot(
     parts: &Parts,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, Error> {
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, WebSocketUpgradeRejection> {
     let Some(limit) = parts.extensions.get::<WebSocketLimit>() else {
         // No budget attached — the request didn't come through a `Server`.
         return Ok(None);
     };
-    limit.0.clone().try_acquire_owned().map(Some).map_err(|_| {
-        Error::status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "WebSocket connection limit reached",
-        )
-    })
+    limit
+        .0
+        .clone()
+        .try_acquire_owned()
+        .map(Some)
+        .map_err(|_| ConnectionLimitReached.into())
 }
 
 fn parse_sec_websocket_protocol(headers: &HeaderMap) -> SubprotocolList {
@@ -604,15 +576,29 @@ mod tests {
         parts
     }
 
+    /// With the `http2` feature enabled, `HTTP/2` is a *valid* bootstrap (RFC 8441) rather than
+    /// an outright rejection — but it requires `CONNECT`, not `GET`, so a plain `GET` on
+    /// `HTTP/2` is rejected the same way a non-`GET` `HTTP/1.1` request would be: `405`,
+    /// matching axum's `MethodNotConnect`.
+    #[cfg(feature = "http2")]
     #[test]
-    fn rejects_http2_and_above() {
+    fn rejects_get_on_the_http2_connect_bootstrap() {
         let mut parts = make_ws_parts();
         parts.version = hyper::Version::HTTP_2;
         let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
-        assert_eq!(
-            err.as_status().map(|(s, _)| s),
-            Some(StatusCode::UPGRADE_REQUIRED)
-        );
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// A version above what either bootstrap supports (`HTTP/1.1`'s RFC 6455 handshake, or
+    /// `HTTP/2`'s RFC 8441 extended `CONNECT`) is rejected outright — axum has no equivalent
+    /// here, since axum treats every version above `HTTP/1.1` as the `HTTP/2` bootstrap
+    /// unconditionally.
+    #[test]
+    fn rejects_http_version_above_http2() {
+        let mut parts = make_ws_parts();
+        parts.version = hyper::Version::HTTP_3;
+        let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
+        assert_eq!(err.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     #[test]
@@ -620,10 +606,7 @@ mod tests {
         let mut parts = make_ws_parts();
         parts.method = Method::POST;
         let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
-        assert_eq!(
-            err.as_status().map(|(s, _)| s),
-            Some(StatusCode::METHOD_NOT_ALLOWED)
-        );
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[test]
@@ -633,10 +616,7 @@ mod tests {
             .headers
             .insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
         let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
-        assert_eq!(
-            err.as_status().map(|(s, _)| s),
-            Some(StatusCode::BAD_REQUEST)
-        );
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -646,10 +626,7 @@ mod tests {
             .headers
             .insert(header::UPGRADE, HeaderValue::from_static("h2c"));
         let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
-        assert_eq!(
-            err.as_status().map(|(s, _)| s),
-            Some(StatusCode::BAD_REQUEST)
-        );
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -659,10 +636,7 @@ mod tests {
             .headers
             .insert(header::SEC_WEBSOCKET_VERSION, HeaderValue::from_static("8"));
         let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
-        assert_eq!(
-            err.as_status().map(|(s, _)| s),
-            Some(StatusCode::BAD_REQUEST)
-        );
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -670,10 +644,7 @@ mod tests {
         let mut parts = make_ws_parts();
         let _ = parts.headers.remove(header::SEC_WEBSOCKET_KEY);
         let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
-        assert_eq!(
-            err.as_status().map(|(s, _)| s),
-            Some(StatusCode::BAD_REQUEST)
-        );
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -691,10 +662,7 @@ mod tests {
             .unwrap();
         let (mut parts, ()) = req.into_parts();
         let err = WebSocketUpgrade::from_request_parts(&mut parts, &()).unwrap_err();
-        assert_eq!(
-            err.as_status().map(|(s, _)| s),
-            Some(StatusCode::UPGRADE_REQUIRED)
-        );
+        assert_eq!(err.status(), StatusCode::UPGRADE_REQUIRED);
     }
 
     #[test]
