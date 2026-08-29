@@ -76,7 +76,7 @@ impl std::fmt::Debug for WebSocket {
 }
 
 fn protocol_error(err: &WsError) -> Error {
-    Error::Internal(err.to_string())
+    Error::internal(err.to_string())
 }
 
 /// XORs `data` in place against the 4-byte rolling `mask`, per RFC 6455 §5.3 — processed 8 (then
@@ -121,16 +121,16 @@ const fn is_valid_close_code(code: u16) -> bool {
 fn parse_close(payload: &[u8]) -> Result<Option<CloseFrame>, Error> {
     match payload {
         [] => Ok(None),
-        [_] => Err(Error::Internal("invalid WebSocket close frame".to_string())),
+        [_] => Err(Error::internal("invalid WebSocket close frame".to_string())),
         [a, b, rest @ ..] => {
             let code = u16::from_be_bytes([*a, *b]);
             if !is_valid_close_code(code) {
-                return Err(Error::Internal(format!(
+                return Err(Error::internal(format!(
                     "received an invalid or reserved WebSocket close code: {code}"
                 )));
             }
             let reason = std::str::from_utf8(rest)
-                .map_err(|_| Error::Internal("WebSocket close reason is not UTF-8".to_string()))?;
+                .map_err(|_| Error::internal("WebSocket close reason is not UTF-8".to_string()))?;
             Ok(Some(CloseFrame {
                 code: code.into(),
                 reason: reason.to_string().into(),
@@ -154,7 +154,7 @@ fn validate_frame_header(
     deflate_negotiated: bool,
 ) -> Result<(), Error> {
     if header.rsv2 || header.rsv3 {
-        return Err(Error::Internal(
+        return Err(Error::internal(
             "received a WebSocket frame with an unsupported reserved bit set".to_string(),
         ));
     }
@@ -162,19 +162,19 @@ fn validate_frame_header(
         let rsv1_allowed = deflate_negotiated
             && matches!(header.opcode, OpCode::Data(OpData::Text | OpData::Binary));
         if !rsv1_allowed {
-            return Err(Error::Internal(
+            return Err(Error::internal(
                 "received a WebSocket frame with RSV1 set where it is not permitted".to_string(),
             ));
         }
     }
     if matches!(header.opcode, OpCode::Control(_)) {
         if !header.is_final {
-            return Err(Error::Internal(
+            return Err(Error::internal(
                 "WebSocket control frames must not be fragmented".to_string(),
             ));
         }
         if payload_len > 125 {
-            return Err(Error::Internal(
+            return Err(Error::internal(
                 "WebSocket control frame payload exceeds 125 bytes".to_string(),
             ));
         }
@@ -250,7 +250,7 @@ impl WebSocket {
     ) -> Result<Option<Message>, Error> {
         let bytes = if compressed {
             let deflate = self.deflate.as_mut().ok_or_else(|| {
-                Error::Internal("RSV1 set but permessage-deflate was not negotiated".to_string())
+                Error::internal("RSV1 set but permessage-deflate was not negotiated".to_string())
             })?;
             Bytes::from(deflate.decompress(&payload, self.config.max_message_size)?)
         } else {
@@ -259,11 +259,11 @@ impl WebSocket {
         match opcode {
             OpData::Text => {
                 let text = Utf8Bytes::try_from(bytes)
-                    .map_err(|e| Error::Internal(format!("invalid UTF-8 in text message: {e}")))?;
+                    .map_err(|e| Error::internal(format!("invalid UTF-8 in text message: {e}")))?;
                 Ok(Some(Message::Text(text)))
             }
             OpData::Binary => Ok(Some(Message::Binary(bytes))),
-            OpData::Continue | OpData::Reserved(_) => Err(Error::Internal(format!(
+            OpData::Continue | OpData::Reserved(_) => Err(Error::internal(format!(
                 "cannot finish a WebSocket message with opcode {opcode:?}"
             ))),
         }
@@ -282,14 +282,14 @@ impl WebSocket {
             }
             OpCode::Control(Control::Pong) => Ok(Some(Message::Pong(payload))),
             OpCode::Control(Control::Close) => self.handle_close(&payload),
-            OpCode::Control(Control::Reserved(code)) => Err(Error::Internal(format!(
+            OpCode::Control(Control::Reserved(code)) => Err(Error::internal(format!(
                 "received reserved WebSocket control opcode {code}"
             ))),
             OpCode::Data(data @ (OpData::Text | OpData::Binary)) => {
                 self.handle_data_frame(data, &header, payload)
             }
             OpCode::Data(OpData::Continue) => self.handle_continue_frame(&header, &payload),
-            OpCode::Data(OpData::Reserved(code)) => Err(Error::Internal(format!(
+            OpCode::Data(OpData::Reserved(code)) => Err(Error::internal(format!(
                 "received reserved WebSocket data opcode {code}"
             ))),
         }
@@ -308,7 +308,7 @@ impl WebSocket {
         } else if self.config.accept_unmasked_frames {
             Ok(raw)
         } else {
-            Err(Error::Internal(
+            Err(Error::internal(
                 "received an unmasked frame from the client".to_string(),
             ))
         }
@@ -331,7 +331,7 @@ impl WebSocket {
         payload: Bytes,
     ) -> Result<Option<Message>, Error> {
         if self.fragment.is_some() {
-            return Err(Error::Internal(
+            return Err(Error::internal(
                 "received a new data frame while a fragmented message was in progress".to_string(),
             ));
         }
@@ -360,7 +360,7 @@ impl WebSocket {
     ) -> Result<Option<Message>, Error> {
         let len = {
             let fragment = self.fragment.as_mut().ok_or_else(|| {
-                Error::Internal(
+                Error::internal(
                     "received a continuation frame with no message in progress".to_string(),
                 )
             })?;
@@ -377,7 +377,7 @@ impl WebSocket {
             buffer,
         }) = self.fragment.take()
         else {
-            return Err(Error::Internal(
+            return Err(Error::internal(
                 "WebSocket fragment vanished mid-reassembly".to_string(),
             ));
         };
@@ -388,7 +388,7 @@ impl WebSocket {
         if let Some(max) = self.config.max_message_size
             && len > max
         {
-            return Err(Error::Internal(
+            return Err(Error::internal(
                 "WebSocket message exceeds the configured maximum size".to_string(),
             ));
         }
@@ -586,7 +586,7 @@ impl WebSocket {
 }
 
 fn map_poll_sender_err<T>(_: tokio_util::sync::PollSendError<T>) -> Error {
-    Error::Internal("WebSocket connection closed".to_string())
+    Error::internal("WebSocket connection closed".to_string())
 }
 
 struct SplitStream {

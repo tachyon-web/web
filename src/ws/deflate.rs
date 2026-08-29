@@ -238,7 +238,7 @@ impl PerMessageDeflate {
             let status = self
                 .compress
                 .compress_vec(data, &mut out, FlushCompress::Sync)
-                .map_err(|e| crate::http::error::Error::Internal(e.to_string()))?;
+                .map_err(|e| crate::http::error::Error::internal(e.to_string()))?;
             let consumed =
                 usize::try_from(self.compress.total_in().saturating_sub(total_in_before))
                     .unwrap_or(usize::MAX);
@@ -249,7 +249,7 @@ impl PerMessageDeflate {
             // looping on it would grow `out`'s capacity geometrically without ever consuming
             // more input, so bail rather than spin.
             if status != Status::Ok {
-                return Err(crate::http::error::Error::Internal(
+                return Err(crate::http::error::Error::internal(
                     "permessage-deflate compressor stalled before consuming the message"
                         .to_string(),
                 ));
@@ -293,9 +293,9 @@ impl PerMessageDeflate {
                     &mut out,
                     FlushDecompress::Sync,
                 )
-                .map_err(|e| crate::http::error::Error::Internal(e.to_string()))?;
+                .map_err(|e| crate::http::error::Error::internal(e.to_string()))?;
             if out.len() > max_size {
-                return Err(crate::http::error::Error::Internal(
+                return Err(crate::http::error::Error::internal(
                     "decompressed message exceeds the configured maximum size".to_string(),
                 ));
             }
@@ -312,7 +312,7 @@ impl PerMessageDeflate {
             // `max_size` check guards, stays put) until the process ran out of memory. Any
             // non-`Ok` status means no more progress is coming, so stop.
             if status != Status::Ok {
-                return Err(crate::http::error::Error::Internal(
+                return Err(crate::http::error::Error::internal(
                     "permessage-deflate stream ended before the full message was decompressed"
                         .to_string(),
                 ));

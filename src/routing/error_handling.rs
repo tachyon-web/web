@@ -153,7 +153,7 @@ mod tests {
         }
 
         fn call(&mut self, _req: Request<Body>) -> Self::Future {
-            Box::pin(async { Err(Error::Internal("boom".to_string())) })
+            Box::pin(async { Err(Error::internal("boom".to_string())) })
         }
     }
 

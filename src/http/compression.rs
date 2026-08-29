@@ -715,7 +715,7 @@ impl Compression {
                     // about what the client is holding.
                     Err(None) => {
                         use crate::http::response::IntoResponse;
-                        return crate::http::error::Error::Internal(
+                        return crate::http::error::Error::internal(
                             "response compression failed".to_string(),
                         )
                         .into_response();

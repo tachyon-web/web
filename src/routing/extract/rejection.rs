@@ -143,16 +143,17 @@ composite_rejection! {
 
 impl From<CoreError> for BytesRejection {
     fn from(e: CoreError) -> Self {
-        match e {
-            CoreError::Rejection { status, message } if status == StatusCode::PAYLOAD_TOO_LARGE => {
-                Self::LengthLimitError(LengthLimitError(message))
+        match e.as_status() {
+            Some((status, message)) if status == StatusCode::PAYLOAD_TOO_LARGE => {
+                Self::LengthLimitError(LengthLimitError(message.to_string()))
             }
-            CoreError::Rejection { status, message } => {
-                Self::FailedToBufferBody(FailedToBufferBody { status, message })
-            }
-            other @ CoreError::Internal(_) => Self::FailedToBufferBody(FailedToBufferBody {
+            Some((status, message)) => Self::FailedToBufferBody(FailedToBufferBody {
+                status,
+                message: message.to_string(),
+            }),
+            None => Self::FailedToBufferBody(FailedToBufferBody {
                 status: StatusCode::BAD_REQUEST,
-                message: other.to_string(),
+                message: e.to_string(),
             }),
         }
     }
@@ -328,10 +329,7 @@ mod tests {
 
     #[test]
     fn bytes_rejection_from_length_limit_preserves_status() {
-        let core = CoreError::Rejection {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            message: "too big".to_string(),
-        };
+        let core = CoreError::status(StatusCode::PAYLOAD_TOO_LARGE, "too big");
         let rej = BytesRejection::from(core);
         assert!(matches!(rej, BytesRejection::LengthLimitError(_)));
         assert_eq!(rej.into_response().status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -339,7 +337,7 @@ mod tests {
 
     #[test]
     fn bytes_rejection_from_other_error_is_failed_to_buffer() {
-        let core = CoreError::Internal("disk on fire".to_string());
+        let core = CoreError::new(std::io::Error::other("disk on fire"));
         let rej = BytesRejection::from(core);
         assert!(matches!(rej, BytesRejection::FailedToBufferBody(_)));
         assert_eq!(rej.into_response().status(), StatusCode::BAD_REQUEST);

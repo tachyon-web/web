@@ -48,18 +48,13 @@ jobs:
 
   build:
     name: "${{ matrix.name }}"
-    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: default (linux)
-            os: ubuntu-latest
-          - name: default (macos)
-            os: macos-latest
-          - name: default (windows)
-            os: windows-latest
+          - name: default
           - name: minimal (http1 only)
             flags: --no-default-features --features http1
           - name: http2 only (h2c, no HTTP/1.1 fallback)

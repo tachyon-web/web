@@ -44,10 +44,10 @@ impl HyperBody for DeadlineBody {
             .deadline
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(REQUEST_TIMEOUT)));
         if deadline.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Some(Err(crate::http::error::Error::Rejection {
-                status: hyper::StatusCode::REQUEST_TIMEOUT,
-                message: "Timed out reading request body".to_string(),
-            })));
+            return Poll::Ready(Some(Err(crate::http::error::Error::status(
+                hyper::StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+            ))));
         }
         match this.inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),

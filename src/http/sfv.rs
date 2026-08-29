@@ -174,10 +174,10 @@ impl From<sfv::Error> for SfvError {
 
 impl From<SfvError> for crate::http::error::Error {
     fn from(e: SfvError) -> Self {
-        Self::Rejection {
-            status: hyper::StatusCode::BAD_REQUEST,
-            message: format!("malformed structured field: {e}"),
-        }
+        Self::status(
+            hyper::StatusCode::BAD_REQUEST,
+            format!("malformed structured field: {e}"),
+        )
     }
 }
 
@@ -738,10 +738,10 @@ where
         let result = (|| {
             let bytes =
                 join_header(&parts.headers, T::HEADER_NAME, &mut buf).ok_or_else(|| {
-                    crate::http::error::Error::Rejection {
-                        status: hyper::StatusCode::BAD_REQUEST,
-                        message: format!("missing `{}` header", T::HEADER_NAME),
-                    }
+                    crate::http::error::Error::status(
+                        hyper::StatusCode::BAD_REQUEST,
+                        format!("missing `{}` header", T::HEADER_NAME),
+                    )
                 })??;
             T::parse_field(bytes)
                 .map(Self)
@@ -981,11 +981,10 @@ mod tests {
             let err = StructuredHeader::<Priority>::from_request_parts(parts, &())
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                err,
-                crate::http::error::Error::Rejection { status, .. }
-                    if status == hyper::StatusCode::BAD_REQUEST
-            ));
+            assert_eq!(
+                err.as_status().map(|(status, _)| status),
+                Some(hyper::StatusCode::BAD_REQUEST)
+            );
         }
     }
 

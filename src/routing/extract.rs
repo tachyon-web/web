@@ -1143,10 +1143,10 @@ impl<S: Sync> FromRequestParts<S> for Host {
             } else if let Some(host) = parts.uri.host() {
                 Ok(Self(host.to_string()))
             } else {
-                Err(Error::Rejection {
-                    status: StatusCode::BAD_REQUEST,
-                    message: "Missing Host header or authority in URI".to_string(),
-                })
+                Err(Error::status(
+                    StatusCode::BAD_REQUEST,
+                    "Missing Host header or authority in URI",
+                ))
             }
         })
     }
@@ -1230,17 +1230,15 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-            parts
-                .extensions
-                .get::<Self>()
-                .cloned()
-                .ok_or_else(|| Error::Rejection {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: format!(
+            parts.extensions.get::<Self>().cloned().ok_or_else(|| {
+                Error::status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
                         "Missing ConnectInfo<{}> extension",
                         std::any::type_name::<T>()
                     ),
-                })
+                )
+            })
         })
     }
 }

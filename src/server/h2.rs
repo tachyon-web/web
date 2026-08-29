@@ -190,10 +190,10 @@ impl HyperBody for H2Body {
             .deadline
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(REQUEST_TIMEOUT)));
         if deadline.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Some(Err(crate::http::error::Error::Rejection {
-                status: StatusCode::REQUEST_TIMEOUT,
-                message: "Timed out reading request body".to_string(),
-            })));
+            return Poll::Ready(Some(Err(crate::http::error::Error::status(
+                StatusCode::REQUEST_TIMEOUT,
+                "Timed out reading request body",
+            ))));
         }
 
         if !this.data_done {
@@ -206,7 +206,7 @@ impl HyperBody for H2Body {
                     return Poll::Ready(Some(Ok(Frame::data(data))));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(crate::http::error::Error::Internal(
+                    return Poll::Ready(Some(Err(crate::http::error::Error::internal(
                         e.to_string(),
                     ))));
                 }
@@ -218,7 +218,7 @@ impl HyperBody for H2Body {
         match this.inner.poll_trailers(cx) {
             Poll::Ready(Ok(Some(trailers))) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
             Poll::Ready(Ok(None)) => Poll::Ready(None),
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(crate::http::error::Error::Internal(
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(crate::http::error::Error::internal(
                 e.to_string(),
             )))),
             Poll::Pending => Poll::Pending,

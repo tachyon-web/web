@@ -224,10 +224,10 @@ mod tests {
             _parts: &mut hyper::http::request::Parts,
             _state: &S,
         ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-            std::future::ready(Err(crate::http::error::Error::Rejection {
-                status: hyper::StatusCode::BAD_REQUEST,
-                message: "parts fail".to_string(),
-            }))
+            std::future::ready(Err(crate::http::error::Error::status(
+                hyper::StatusCode::BAD_REQUEST,
+                "parts fail",
+            )))
         }
     }
 
@@ -238,10 +238,10 @@ mod tests {
             _req: Request<Body>,
             _state: &S,
         ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-            std::future::ready(Err(crate::http::error::Error::Rejection {
-                status: hyper::StatusCode::BAD_REQUEST,
-                message: "req fail".to_string(),
-            }))
+            std::future::ready(Err(crate::http::error::Error::status(
+                hyper::StatusCode::BAD_REQUEST,
+                "req fail",
+            )))
         }
     }
 

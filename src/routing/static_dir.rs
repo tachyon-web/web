@@ -614,7 +614,7 @@ impl hyper::body::Body for FileBody {
         let mut read_buf = tokio::io::ReadBuf::new(&mut this.buf);
         match std::pin::Pin::new(&mut this.file).poll_read(cx, &mut read_buf) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(crate::http::error::Error::Internal(
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(crate::http::error::Error::internal(
                 e.to_string(),
             )))),
             Poll::Ready(Ok(())) => {

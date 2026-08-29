@@ -84,13 +84,13 @@ mod core_error_response_shape {
     use tachyon_web::http::error::Error;
     use tachyon_web::http::response::IntoResponse;
 
-    /// `Error::Internal`'s message is deliberately not echoed to the client (it may carry
+    /// An opaque `Error`'s message is deliberately not echoed to the client (it may carry
     /// server internals) — the body is always this fixed string. If Phase 1's redesign
     /// changes what travels through the opaque `Error`, this is the text that must keep
     /// showing up unless the change is intentional.
     #[tokio::test]
     async fn internal_error_body_is_the_generic_fallback_text() {
-        let err = Error::Internal("some internal detail".to_string());
+        let err = Error::new(std::io::Error::other("some internal detail"));
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = tachyon_web::http::response::to_bytes(resp.into_body(), 1024)

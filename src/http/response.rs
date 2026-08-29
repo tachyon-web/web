@@ -84,17 +84,17 @@ impl Body {
                 if e.downcast_ref::<http_body_util::LengthLimitError>()
                     .is_some()
                 {
-                    Err(crate::http::error::Error::Rejection {
-                        status: StatusCode::PAYLOAD_TOO_LARGE,
-                        message: "Request body exceeds the maximum allowed size".to_string(),
-                    })
+                    Err(crate::http::error::Error::status(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Request body exceeds the maximum allowed size",
+                    ))
                 } else {
                     match e.downcast::<crate::http::error::Error>() {
                         Ok(original) => Err(*original),
-                        Err(e) => Err(crate::http::error::Error::Rejection {
-                            status: StatusCode::BAD_REQUEST,
-                            message: format!("Failed to read request body: {e}"),
-                        }),
+                        Err(e) => Err(crate::http::error::Error::status(
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to read request body: {e}"),
+                        )),
                     }
                 }
             }
@@ -500,18 +500,18 @@ where
 
     fn into_response_parts(self, mut res: ResponseParts) -> Result<ResponseParts, Self::Error> {
         for (key, value) in self.0 {
-            let key = key
-                .try_into()
-                .map_err(|_| crate::http::error::Error::Rejection {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: "AppendHeaders: invalid header name".to_string(),
-                })?;
-            let value = value
-                .try_into()
-                .map_err(|_| crate::http::error::Error::Rejection {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: "AppendHeaders: invalid header value".to_string(),
-                })?;
+            let key = key.try_into().map_err(|_| {
+                crate::http::error::Error::status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "AppendHeaders: invalid header name",
+                )
+            })?;
+            let value = value.try_into().map_err(|_| {
+                crate::http::error::Error::status(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "AppendHeaders: invalid header value",
+                )
+            })?;
             res.headers_mut().append(key, value);
         }
         Ok(res)
@@ -773,7 +773,7 @@ mod tests {
 
         let stream_body = BoxBody::new(
             http_body_util::Empty::<Bytes>::new()
-                .map_err(|e| crate::http::error::Error::Internal(e.to_string())),
+                .map_err(|e| crate::http::error::Error::internal(e.to_string())),
         );
         let b3 = Body::Stream(stream_body);
         assert!(format!("{b3:?}").contains("Stream"));
