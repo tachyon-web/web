@@ -253,6 +253,7 @@ where
         CompiledMethodRouter {
             handlers,
             param_names: self.param_names.clone(),
+            #[cfg(feature = "matched-path")]
             matched_path: self.matched_path.clone(),
             nest_prefix: self.nest_prefix.clone(),
         }
@@ -292,6 +293,7 @@ where
 pub(crate) struct CompiledMethodRouter {
     handlers: [Option<Route>; METHOD_COUNT],
     param_names: Arc<[Arc<str>]>,
+    #[cfg(feature = "matched-path")]
     matched_path: Arc<str>,
     nest_prefix: Option<Arc<str>>,
 }

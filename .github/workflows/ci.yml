@@ -41,7 +41,7 @@ jobs:
         run: cargo clippy --locked -p tachyon-web --all-targets
       - uses: dtolnay/rust-toolchain@1.92
       - name: msrv (1.92)
-        run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,sfv,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
+        run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,sfv,tower-log,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
       - uses: dtolnay/rust-toolchain@nightly
       - name: axum API parity
         run: python3 scripts/api_diff.py
