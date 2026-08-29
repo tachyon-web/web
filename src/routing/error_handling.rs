@@ -16,6 +16,7 @@ use crate::http::response::{Body, IntoResponse, Response};
 use bytes::Bytes;
 use hyper::Request;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
@@ -23,61 +24,85 @@ use tower::{Layer, Service};
 /// A `tower::Layer` that turns any fallible inner `Service` into an
 /// infallible one, converting `Err` values via a user-supplied closure.
 /// Matches `axum::error_handling::HandleErrorLayer`.
-pub struct HandleErrorLayer<F> {
+///
+/// `T` matches axum's shape (it's `PhantomData`-only there too, in the base case) but isn't
+/// yet load-bearing here: axum uses it to let `f` additionally take `FromRequestParts`
+/// extractors ahead of the error (`|State(s), err| ...`) via a family of tuple impls this
+/// crate hasn't ported — `f` must be a plain `FnOnce(Error) -> Fut` for now.
+pub struct HandleErrorLayer<F, T = ()> {
     f: F,
+    _extractor: PhantomData<fn() -> T>,
 }
 
-impl<F> HandleErrorLayer<F> {
+impl<F, T> HandleErrorLayer<F, T> {
     /// Wraps `f`, which is called with the inner service's error whenever it
     /// fails, to produce the response returned in its place.
     pub const fn new(f: F) -> Self {
-        Self { f }
+        Self {
+            f,
+            _extractor: PhantomData,
+        }
     }
 }
 
-impl<F: Clone> Clone for HandleErrorLayer<F> {
+impl<F: Clone, T> Clone for HandleErrorLayer<F, T> {
     fn clone(&self) -> Self {
-        Self { f: self.f.clone() }
+        Self {
+            f: self.f.clone(),
+            _extractor: PhantomData,
+        }
     }
 }
 
-impl<F> std::fmt::Debug for HandleErrorLayer<F> {
+impl<F, T> std::fmt::Debug for HandleErrorLayer<F, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HandleErrorLayer").finish_non_exhaustive()
     }
 }
 
-impl<S, F> Layer<S> for HandleErrorLayer<F>
+impl<S, F, T> Layer<S> for HandleErrorLayer<F, T>
 where
     F: Clone,
 {
-    type Service = HandleError<S, F>;
+    type Service = HandleError<S, F, T>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        HandleError {
-            inner,
-            f: self.f.clone(),
-        }
+        HandleError::new(inner, self.f.clone())
     }
 }
 
 /// The `tower::Service` produced by [`HandleErrorLayer`]. Matches
-/// `axum::error_handling::HandleError`.
-pub struct HandleError<S, F> {
+/// `axum::error_handling::HandleError`. See [`HandleErrorLayer`]'s docs for the current
+/// scope of the phantom `T` parameter.
+pub struct HandleError<S, F, T = ()> {
     inner: S,
     f: F,
+    _extractor: PhantomData<fn() -> T>,
 }
 
-impl<S: Clone, F: Clone> Clone for HandleError<S, F> {
-    fn clone(&self) -> Self {
+impl<S, F, T> HandleError<S, F, T> {
+    /// Wraps `inner`, converting its errors via `f`. Matches
+    /// `axum::error_handling::HandleError::new`.
+    pub const fn new(inner: S, f: F) -> Self {
         Self {
-            inner: self.inner.clone(),
-            f: self.f.clone(),
+            inner,
+            f,
+            _extractor: PhantomData,
         }
     }
 }
 
-impl<S, F> std::fmt::Debug for HandleError<S, F> {
+impl<S: Clone, F: Clone, T> Clone for HandleError<S, F, T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            f: self.f.clone(),
+            _extractor: PhantomData,
+        }
+    }
+}
+
+impl<S, F, T> std::fmt::Debug for HandleError<S, F, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HandleError").finish_non_exhaustive()
     }
@@ -88,7 +113,7 @@ impl<S, F> std::fmt::Debug for HandleError<S, F> {
 pub type HandleErrorFuture =
     Pin<Box<dyn Future<Output = Result<Response, std::convert::Infallible>> + Send>>;
 
-impl<S, F, Fut, Res, RespBody> Service<Request<Body>> for HandleError<S, F>
+impl<S, F, Fut, Res, RespBody> Service<Request<Body>> for HandleError<S, F, ()>
 where
     S: Service<Request<Body>, Response = hyper::Response<RespBody>> + Clone + Send + Sync + 'static,
     S::Error: Into<Error> + Send,

@@ -77,8 +77,15 @@ const fn method_index(m: &Method) -> Option<usize> {
 type BoxedIntoRoute<S> = Arc<dyn Fn(Arc<S>) -> Route + Send + Sync>;
 
 /// Router that dispatches requests to different handlers based on the HTTP method.
-#[derive(Clone)]
-pub struct MethodRouter<S> {
+///
+/// `E` matches axum's `MethodRouter<S, E = Infallible>` shape, but is a phantom marker here
+/// rather than a real, propagated error type: every slot is still always built from a
+/// [`Handler`] or a `tower::Service` whose error is collapsed into a response immediately
+/// (via [`Route`]), so `E` is never actually produced. This means, unlike axum, attaching a
+/// fallible `tower::Layer` via [`MethodRouter::layer`] never requires wrapping it in
+/// [`error_handling::HandleErrorLayer`] first — any `E` (including axum's real, fallible
+/// ones) type-checks here with no extra step.
+pub struct MethodRouter<S, E = std::convert::Infallible> {
     handlers: [Option<BoxedIntoRoute<S>>; METHOD_COUNT],
     /// Path-parameter names in declaration order, populated by `Router::compile()`. Cloning
     /// an `Arc<str>` into `PathParams` is a refcount bump rather than a per-request
@@ -90,9 +97,22 @@ pub struct MethodRouter<S> {
     /// The accumulated prefix to strip from the request `Uri` before dispatch, when this
     /// route was reached through one or more [`Router::nest`] calls.
     nest_prefix: Option<Arc<str>>,
+    _marker: std::marker::PhantomData<fn() -> E>,
 }
 
-impl<S> std::fmt::Debug for MethodRouter<S> {
+impl<S, E> Clone for MethodRouter<S, E> {
+    fn clone(&self) -> Self {
+        Self {
+            handlers: self.handlers.clone(),
+            param_names: self.param_names.clone(),
+            matched_path: self.matched_path.clone(),
+            nest_prefix: self.nest_prefix.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<S, E> std::fmt::Debug for MethodRouter<S, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut dbg = f.debug_struct("MethodRouter");
         for (name, handler) in METHOD_NAMES.iter().zip(&self.handlers) {
@@ -105,7 +125,7 @@ impl<S> std::fmt::Debug for MethodRouter<S> {
     }
 }
 
-impl<S> Default for MethodRouter<S>
+impl<S, E> Default for MethodRouter<S, E>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -114,7 +134,7 @@ where
     }
 }
 
-impl<S> MethodRouter<S>
+impl<S, E> MethodRouter<S, E>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -126,6 +146,7 @@ where
             param_names: Arc::from([]),
             matched_path: Arc::from(""),
             nest_prefix: None,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -175,7 +196,7 @@ where
     /// `MethodRouter` **so far** — matching `axum::routing::MethodRouter::layer`.
     /// Call this after the verb builders (`.get()`/`.post()`/...) it should cover.
     #[must_use]
-    pub fn layer<L, RespBody>(mut self, layer: L) -> Self
+    pub fn layer<L, RespBody, NewError>(mut self, layer: L) -> MethodRouter<S, NewError>
     where
         L: tower::Layer<Route> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<Request<Body>, Response = Response<RespBody>>
@@ -197,7 +218,13 @@ where
                 }));
             }
         }
-        self
+        MethodRouter {
+            handlers: self.handlers,
+            param_names: self.param_names,
+            matched_path: self.matched_path,
+            nest_prefix: self.nest_prefix,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Sends a `103 Early Hints` response carrying `links` before this route's handler runs.
@@ -261,7 +288,7 @@ where
 
     /// Capture a state and transition this method router to another state type.
     #[must_use]
-    pub fn with_state<S2>(self, state: &Arc<S>) -> MethodRouter<S2>
+    pub fn with_state<S2>(self, state: &Arc<S>) -> MethodRouter<S2, E>
     where
         S2: Clone + Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
@@ -282,6 +309,7 @@ where
             param_names: self.param_names,
             matched_path: self.matched_path,
             nest_prefix: self.nest_prefix,
+            _marker: std::marker::PhantomData,
         }
     }
 }
@@ -326,7 +354,13 @@ impl CompiledMethodRouter {
 /// all structurally identical apart from which slot of `handlers` they fill.
 macro_rules! method_routes {
     ($( ($name:ident, $svc_name:ident, $idx:ident, $verb:literal) ),+ $(,)?) => {
-        impl<S> MethodRouter<S>
+        // Handler-chaining methods are only available while `E = Infallible` — matching
+        // Axum's own restriction (`impl<S> MethodRouter<S, Infallible>`), since a `Handler`
+        // never fails, so chaining one onto an already-layered, non-`Infallible` router
+        // wouldn't have a sensible `E` to report. Reaching for one of these after `.layer()`
+        // is a genuine ordering bug axum also rejects, just via a different mechanism (a
+        // missing `on`/`get`/... method rather than a fallback inherent one).
+        impl<S> MethodRouter<S, std::convert::Infallible>
         where
             S: Clone + Send + Sync + 'static,
         {
@@ -340,7 +374,14 @@ macro_rules! method_routes {
                 {
                     self.set($idx, handler)
                 }
+            )+
+        }
 
+        impl<S, E> MethodRouter<S, E>
+        where
+            S: Clone + Send + Sync + 'static,
+        {
+            $(
                 #[doc = concat!(
                     "Add a raw `tower::Service` handler for HTTP ", $verb,
                     " requests, matching `axum::routing::method_routing::", stringify!($svc_name), "`."
@@ -488,7 +529,7 @@ impl std::ops::BitOr for MethodFilter {
     }
 }
 
-impl<S> MethodRouter<S>
+impl<S> MethodRouter<S, std::convert::Infallible>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -511,7 +552,12 @@ where
         }
         self.set(last, handler)
     }
+}
 
+impl<S, E> MethodRouter<S, E>
+where
+    S: Clone + Send + Sync + 'static,
+{
     /// Add a raw `tower::Service` handler for every HTTP method set in `filter`, matching
     /// `axum::routing::MethodRouter::on_service`.
     #[must_use]
@@ -827,11 +873,32 @@ where
         self
     }
 
-    /// A dummy/compatibility method that returns the router itself, matching Axum's API
-    /// when preparing a router to be run with a server listener.
+    /// Converts this router into a `tower::make::MakeService`, matching
+    /// `axum::routing::Router::into_make_service`. Only meaningful once `S = ()` (i.e. after
+    /// [`Router::with_state`], if the router uses [`State`](crate::routing::extract::State)
+    /// extractors at all) — that's also where [`Router<()>`] already implements
+    /// `tower::Service` directly, which [`tower_compat::IntoMakeService`] just clones out
+    /// per connection.
     #[must_use]
-    pub const fn into_make_service(self) -> Self {
-        self
+    pub const fn into_make_service(self) -> tower_compat::IntoMakeService<Self> {
+        tower_compat::IntoMakeService::new(self)
+    }
+
+    /// Converts this router into a borrowed `tower::Service` with a fixed body type `B`,
+    /// matching `axum::routing::Router::as_service`. Useful for calling a router directly
+    /// (e.g. via `tower::ServiceExt::oneshot`) without going through a real server — see
+    /// [`Router::into_service`] for an owned equivalent.
+    #[must_use]
+    pub fn as_service<B>(&mut self) -> tower_compat::RouterAsService<'_, B, S> {
+        tower_compat::RouterAsService::new(self)
+    }
+
+    /// Converts this router into an owned `tower::Service` with a fixed body type `B`,
+    /// matching `axum::routing::Router::into_service`. See [`Router::as_service`] for a
+    /// borrowed equivalent.
+    #[must_use]
+    pub fn into_service<B>(self) -> tower_compat::RouterIntoService<B, S> {
+        tower_compat::RouterIntoService::new(self)
     }
 
     /// Serve an entire directory as static files — the simplest, Nginx-like API.
