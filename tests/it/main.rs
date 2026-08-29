@@ -36,6 +36,7 @@ mod compression_tests;
     feature = "cookies"
 ))]
 mod integration_tests;
+mod parity_characterization_tests;
 mod server_tests;
 // Its only test drives the server with an HTTP/1.1 client.
 #[cfg(feature = "http1")]
