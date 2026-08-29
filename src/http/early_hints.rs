@@ -743,13 +743,16 @@ impl EarlyHints {
     fn send_headers_via(channel: &HintChannel, headers: HeaderMap) -> bool {
         use std::sync::atomic::Ordering;
 
-        if channel
+        // `fetch_update` was renamed to `try_update`, but the replacement is unstable
+        // (rust-lang/rust#135894) below the crate's MSRV (1.92) — switch once that lands.
+        #[allow(deprecated)]
+        let update_failed = channel
             .sent
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sent| {
                 (sent < MAX_HINTS_PER_REQUEST).then_some(sent.saturating_add(1))
             })
-            .is_err()
-        {
+            .is_err();
+        if update_failed {
             tracing::debug!("early-hint dropped: request already sent {MAX_HINTS_PER_REQUEST}");
             return false;
         }

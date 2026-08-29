@@ -123,9 +123,8 @@ impl HyperBody for Body {
         match self.get_mut() {
             Self::Full(full) => match Pin::new(full).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(
-                    crate::http::error::Error::Internal(e.to_string()),
-                ))),
+                // `Full<Bytes>::Error` is `Infallible` — there is no value of `e` to format.
+                Poll::Ready(Some(Err(e))) => match e {},
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             },
