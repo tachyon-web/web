@@ -498,7 +498,9 @@ where
         H: Handler<T, S>,
         T: Send + 'static,
     {
-        let indices: Vec<usize> = (0..METHOD_COUNT).filter(|&idx| filter.contains_idx(idx)).collect();
+        let indices: Vec<usize> = (0..METHOD_COUNT)
+            .filter(|&idx| filter.contains_idx(idx))
+            .collect();
         let Some((&last, init)) = indices.split_last() else {
             return self;
         };
@@ -523,7 +525,9 @@ where
         RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
         RespBody::Error: Into<crate::http::error::Error>,
     {
-        let indices: Vec<usize> = (0..METHOD_COUNT).filter(|&idx| filter.contains_idx(idx)).collect();
+        let indices: Vec<usize> = (0..METHOD_COUNT)
+            .filter(|&idx| filter.contains_idx(idx))
+            .collect();
         let Some((&last, init)) = indices.split_last() else {
             return self;
         };
@@ -735,14 +739,16 @@ where
                 get(|| async { "User-agent: *\nDisallow: /\n" }),
             );
         }
-        self.layer(middleware::from_fn(|req: Request<Body>, next: middleware::Next| async move {
-            let mut resp = next.run(req).await;
-            let _ = resp.headers_mut().insert(
-                hyper::header::HeaderName::from_static("x-robots-tag"),
-                hyper::header::HeaderValue::from_static("noindex, nofollow"),
-            );
-            resp
-        }))
+        self.layer(middleware::from_fn(
+            |req: Request<Body>, next: middleware::Next| async move {
+                let mut resp = next.run(req).await;
+                let _ = resp.headers_mut().insert(
+                    hyper::header::HeaderName::from_static("x-robots-tag"),
+                    hyper::header::HeaderValue::from_static("noindex, nofollow"),
+                );
+                resp
+            },
+        ))
     }
 
     /// Set the application state for this router, transitioning it to

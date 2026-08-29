@@ -145,7 +145,8 @@ pub struct FromFnWithStateLayer<F, S2> {
 
 impl<F, S2> std::fmt::Debug for FromFnWithStateLayer<F, S2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromFnWithStateLayer").finish_non_exhaustive()
+        f.debug_struct("FromFnWithStateLayer")
+            .finish_non_exhaustive()
     }
 }
 
@@ -332,7 +333,8 @@ pub struct MapRequestWithStateLayer<F, S2> {
 
 impl<F, S2> std::fmt::Debug for MapRequestWithStateLayer<F, S2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapRequestWithStateLayer").finish_non_exhaustive()
+        f.debug_struct("MapRequestWithStateLayer")
+            .finish_non_exhaustive()
     }
 }
 
@@ -381,7 +383,8 @@ pub struct MapRequestWithState<F, S2> {
 
 impl<F, S2> std::fmt::Debug for MapRequestWithState<F, S2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapRequestWithState").finish_non_exhaustive()
+        f.debug_struct("MapRequestWithState")
+            .finish_non_exhaustive()
     }
 }
 
@@ -518,7 +521,8 @@ pub struct MapResponseWithStateLayer<F, S2> {
 
 impl<F, S2> std::fmt::Debug for MapResponseWithStateLayer<F, S2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapResponseWithStateLayer").finish_non_exhaustive()
+        f.debug_struct("MapResponseWithStateLayer")
+            .finish_non_exhaustive()
     }
 }
 
@@ -572,7 +576,8 @@ pub struct MapResponseWithState<F, S2> {
 
 impl<F, S2> std::fmt::Debug for MapResponseWithState<F, S2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapResponseWithState").finish_non_exhaustive()
+        f.debug_struct("MapResponseWithState")
+            .finish_non_exhaustive()
     }
 }
 
@@ -714,7 +719,8 @@ pub struct FromExtractorWithStateLayer<E, S2> {
 
 impl<E, S2> std::fmt::Debug for FromExtractorWithStateLayer<E, S2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromExtractorWithStateLayer").finish_non_exhaustive()
+        f.debug_struct("FromExtractorWithStateLayer")
+            .finish_non_exhaustive()
     }
 }
 
@@ -764,7 +770,8 @@ pub struct FromExtractorWithState<E, S2> {
 
 impl<E, S2> std::fmt::Debug for FromExtractorWithState<E, S2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromExtractorWithState").finish_non_exhaustive()
+        f.debug_struct("FromExtractorWithState")
+            .finish_non_exhaustive()
     }
 }
 
@@ -833,13 +840,12 @@ mod tests {
     async fn from_fn_with_state_hands_state_to_the_closure() {
         async fn tag(state: std::sync::Arc<str>, req: Request<Body>, next: Next) -> Response {
             let mut resp = next.run(req).await;
-            resp.headers_mut()
-                .insert("x-state", state.parse().unwrap());
+            resp.headers_mut().insert("x-state", state.parse().unwrap());
             resp
         }
 
-        let mut svc =
-            from_fn_with_state(std::sync::Arc::<str>::from("bound"), tag).layer(route_returning("hi"));
+        let mut svc = from_fn_with_state(std::sync::Arc::<str>::from("bound"), tag)
+            .layer(route_returning("hi"));
         let req = Request::builder().body(Body::empty()).unwrap();
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.headers().get("x-state").unwrap(), "bound");

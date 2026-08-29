@@ -256,6 +256,7 @@ pub use http::response::{
     AppendHeaders, ErrorResponse, Html, IntoResponse, IntoResponseParts, NoContent, Redirect,
     ResponseParts, TryIntoHeaderError, to_bytes,
 };
+pub use routing::error_handling;
 pub use routing::extract;
 #[cfg(feature = "cookies")]
 pub use routing::extract::Cookies;
@@ -271,7 +272,6 @@ pub use routing::extract::{
     ConnectInfo, Extension, FromRef, FromRequest, FromRequestParts, Host, Path, RawQuery,
     RequestExt, RequestPartsExt, State,
 };
-pub use routing::error_handling;
 pub use routing::handler::{BoxedFuture, BoxedHandler, Handler};
 pub use routing::middleware;
 pub use routing::middleware::Next;

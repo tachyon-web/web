@@ -161,9 +161,8 @@ pub struct DefaultBodyLimitService {
 impl tower::Service<hyper::Request<Body>> for DefaultBodyLimitService {
     type Response = hyper::Response<Body>;
     type Error = Infallible;
-    type Future = std::pin::Pin<
-        Box<dyn Future<Output = Result<hyper::Response<Body>, Infallible>> + Send>,
-    >;
+    type Future =
+        std::pin::Pin<Box<dyn Future<Output = Result<hyper::Response<Body>, Infallible>> + Send>>;
 
     fn poll_ready(
         &mut self,
@@ -205,9 +204,7 @@ where
         _parts: &mut hyper::http::request::Parts,
         state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready({
-        Ok(Self(T::from_ref(state)))
-        })
+        std::future::ready(Ok(Self(T::from_ref(state))))
     }
 }
 
@@ -681,24 +678,24 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        // Routes with no path parameters never insert a `PathParams`
-        // extension (see `CompiledRouter::handle_request`'s parameterless
-        // fast path), so a missing extension means "zero params" rather than
-        // an error — extractors like `Path<()>` must still succeed on those
-        // routes instead of getting a spurious 500.
-        let params = parts
-            .extensions
-            .get::<PathParams>()
-            .map_or(&[][..], |p| p.0.as_slice());
+            // Routes with no path parameters never insert a `PathParams`
+            // extension (see `CompiledRouter::handle_request`'s parameterless
+            // fast path), so a missing extension means "zero params" rather than
+            // an error — extractors like `Path<()>` must still succeed on those
+            // routes instead of getting a spurious 500.
+            let params = parts
+                .extensions
+                .get::<PathParams>()
+                .map_or(&[][..], |p| p.0.as_slice());
 
-        T::deserialize(PathDeserializer { params })
-            .map(Path)
-            .map_err(|e: serde::de::value::Error| {
-                rejection::FailedToDeserializePathParams(format!(
-                    "Failed to deserialize path parameters: {e}"
-                ))
-                .into()
-            })
+            T::deserialize(PathDeserializer { params })
+                .map(Path)
+                .map_err(|e: serde::de::value::Error| {
+                    rejection::FailedToDeserializePathParams(format!(
+                        "Failed to deserialize path parameters: {e}"
+                    ))
+                    .into()
+                })
         })
     }
 }
@@ -720,17 +717,17 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        let query_str = parts.uri.query().unwrap_or("");
-        let iter = QueryIter { input: query_str };
-        let map_de = serde::de::value::MapDeserializer::new(iter);
-        T::deserialize(map_de)
-            .map(Query)
-            .map_err(|e: serde::de::value::Error| {
-                rejection::FailedToDeserializeQueryString(format!(
-                    "Failed to deserialize query parameters: {e}"
-                ))
-                .into()
-            })
+            let query_str = parts.uri.query().unwrap_or("");
+            let iter = QueryIter { input: query_str };
+            let map_de = serde::de::value::MapDeserializer::new(iter);
+            T::deserialize(map_de)
+                .map(Query)
+                .map_err(|e: serde::de::value::Error| {
+                    rejection::FailedToDeserializeQueryString(format!(
+                        "Failed to deserialize query parameters: {e}"
+                    ))
+                    .into()
+                })
         })
     }
 }
@@ -748,9 +745,7 @@ impl<S: Sync> FromRequestParts<S> for RawQuery {
         parts: &mut hyper::http::request::Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready({
-        Ok(Self(parts.uri.query().map(str::to_string)))
-        })
+        std::future::ready(Ok(Self(parts.uri.query().map(str::to_string))))
     }
 }
 
@@ -835,9 +830,7 @@ impl<S: Sync> FromRequestParts<S> for HeaderMap {
         parts: &mut hyper::http::request::Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready({
-        Ok(parts.headers.clone())
-        })
+        std::future::ready(Ok(parts.headers.clone()))
     }
 }
 
@@ -848,9 +841,7 @@ impl<S: Sync> FromRequestParts<S> for Method {
         parts: &mut hyper::http::request::Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready({
-        Ok(parts.method.clone())
-        })
+        std::future::ready(Ok(parts.method.clone()))
     }
 }
 
@@ -861,9 +852,7 @@ impl<S: Sync> FromRequestParts<S> for Uri {
         parts: &mut hyper::http::request::Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready({
-        Ok(parts.uri.clone())
-        })
+        std::future::ready(Ok(parts.uri.clone()))
     }
 }
 
@@ -889,8 +878,9 @@ impl<S: Sync> FromRequest<S> for String {
             .collect_bytes(limit)
             .await
             .map_err(rejection::BytesRejection::from)?;
-        Self::from_utf8(body.to_vec())
-            .map_err(|e| rejection::InvalidUtf8(format!("Request body is not valid UTF-8: {e}")).into())
+        Self::from_utf8(body.to_vec()).map_err(|e| {
+            rejection::InvalidUtf8(format!("Request body is not valid UTF-8: {e}")).into()
+        })
     }
 }
 
@@ -914,17 +904,17 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        let query_str = parts.uri.query().unwrap_or("");
-        let iter = QueryIter { input: query_str };
-        let map_de = serde::de::value::MapDeserializer::new(iter);
-        T::deserialize(map_de)
-            .map(Form)
-            .map_err(|e: serde::de::value::Error| {
-                rejection::FailedToDeserializeForm(format!(
-                    "Failed to deserialize form payload: {e}"
-                ))
-                .into()
-            })
+            let query_str = parts.uri.query().unwrap_or("");
+            let iter = QueryIter { input: query_str };
+            let map_de = serde::de::value::MapDeserializer::new(iter);
+            T::deserialize(map_de)
+                .map(Form)
+                .map_err(|e: serde::de::value::Error| {
+                    rejection::FailedToDeserializeForm(format!(
+                        "Failed to deserialize form payload: {e}"
+                    ))
+                    .into()
+                })
         })
     }
 }
@@ -965,16 +955,19 @@ where
             .collect_bytes(limit)
             .await
             .map_err(rejection::BytesRejection::from)?;
-        let body_str = std::str::from_utf8(&body)
-            .map_err(|_| rejection::FailedToDeserializeFormBody("Form body is not valid UTF-8".to_string()))?;
+        let body_str = std::str::from_utf8(&body).map_err(|_| {
+            rejection::FailedToDeserializeFormBody("Form body is not valid UTF-8".to_string())
+        })?;
         let iter = QueryIter { input: body_str };
         let map_de = serde::de::value::MapDeserializer::new(iter);
-        T::deserialize(map_de).map(Form).map_err(|e: serde::de::value::Error| {
-            rejection::FailedToDeserializeFormBody(format!(
-                "Failed to deserialize form payload: {e}"
-            ))
-            .into()
-        })
+        T::deserialize(map_de)
+            .map(Form)
+            .map_err(|e: serde::de::value::Error| {
+                rejection::FailedToDeserializeFormBody(format!(
+                    "Failed to deserialize form payload: {e}"
+                ))
+                .into()
+            })
     }
 }
 
@@ -993,18 +986,18 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        parts
-            .extensions
-            .get::<T>()
-            .cloned()
-            .map(Extension)
-            .ok_or_else(|| {
-                rejection::MissingExtension(format!(
-                    "Missing extension: {}",
-                    std::any::type_name::<T>()
-                ))
-                .into()
-            })
+            parts
+                .extensions
+                .get::<T>()
+                .cloned()
+                .map(Extension)
+                .ok_or_else(|| {
+                    rejection::MissingExtension(format!(
+                        "Missing extension: {}",
+                        std::any::type_name::<T>()
+                    ))
+                    .into()
+                })
         })
     }
 }
@@ -1073,15 +1066,15 @@ impl<S: Sync> FromRequestParts<S> for Cookies {
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        let mut jar = CookieJar::new();
-        if let Some(cookie_header) = parts.headers.get(hyper::header::COOKIE)
-            && let Ok(cookie_str) = cookie_header.to_str()
-        {
-            for c in Cookie::split_parse_encoded(cookie_str).flatten() {
-                jar.add_original(c.into_owned());
+            let mut jar = CookieJar::new();
+            if let Some(cookie_header) = parts.headers.get(hyper::header::COOKIE)
+                && let Ok(cookie_str) = cookie_header.to_str()
+            {
+                for c in Cookie::split_parse_encoded(cookie_str).flatten() {
+                    jar.add_original(c.into_owned());
+                }
             }
-        }
-        Ok(Self { jar })
+            Ok(Self { jar })
         })
     }
 }
@@ -1141,20 +1134,20 @@ impl<S: Sync> FromRequestParts<S> for Host {
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        if let Some(host) = parts
-            .headers
-            .get(hyper::header::HOST)
-            .and_then(|h| h.to_str().ok())
-        {
-            Ok(Self(host.to_string()))
-        } else if let Some(host) = parts.uri.host() {
-            Ok(Self(host.to_string()))
-        } else {
-            Err(Error::Rejection {
-                status: StatusCode::BAD_REQUEST,
-                message: "Missing Host header or authority in URI".to_string(),
-            })
-        }
+            if let Some(host) = parts
+                .headers
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+            {
+                Ok(Self(host.to_string()))
+            } else if let Some(host) = parts.uri.host() {
+                Ok(Self(host.to_string()))
+            } else {
+                Err(Error::Rejection {
+                    status: StatusCode::BAD_REQUEST,
+                    message: "Missing Host header or authority in URI".to_string(),
+                })
+            }
         })
     }
 }
@@ -1173,11 +1166,11 @@ impl<S: Sync> FromRequestParts<S> for OriginalUri {
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        let uri = parts
-            .extensions
-            .get::<Self>()
-            .map_or_else(|| parts.uri.clone(), |ou| ou.0.clone());
-        Ok(Self(uri))
+            let uri = parts
+                .extensions
+                .get::<Self>()
+                .map_or_else(|| parts.uri.clone(), |ou| ou.0.clone());
+            Ok(Self(uri))
         })
     }
 }
@@ -1212,11 +1205,7 @@ impl<S: Sync> FromRequestParts<S> for MatchedPath {
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        parts
-            .extensions
-            .get::<Self>()
-            .cloned()
-            .ok_or_else(|| {
+            parts.extensions.get::<Self>().cloned().ok_or_else(|| {
                 rejection::MatchedPathMissing(
                     "No matched path found in request extensions".to_string(),
                 )
@@ -1241,17 +1230,17 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-        parts
-            .extensions
-            .get::<Self>()
-            .cloned()
-            .ok_or_else(|| Error::Rejection {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!(
-                    "Missing ConnectInfo<{}> extension",
-                    std::any::type_name::<T>()
-                ),
-            })
+            parts
+                .extensions
+                .get::<Self>()
+                .cloned()
+                .ok_or_else(|| Error::Rejection {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!(
+                        "Missing ConnectInfo<{}> extension",
+                        std::any::type_name::<T>()
+                    ),
+                })
         })
     }
 }
@@ -1473,11 +1462,7 @@ mod tests {
 
     #[tokio::test]
     async fn option_extractor_is_some_on_success_and_none_on_rejection() {
-        let mut present = Request::builder()
-            .body(())
-            .unwrap()
-            .into_parts()
-            .0;
+        let mut present = Request::builder().body(()).unwrap().into_parts().0;
         present.extensions.insert(7u32);
         let ext_or_none = Option::<Extension<u32>>::from_request_parts(&mut present, &())
             .await
@@ -1622,7 +1607,9 @@ mod tests {
         let (mut parts, body) = req.into_parts();
 
         // HeaderMap
-        let headers = HeaderMap::from_request_parts(&mut parts, &()).await.unwrap();
+        let headers = HeaderMap::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(headers.get("x-test").unwrap(), "hello");
 
         // Method
@@ -1881,15 +1868,25 @@ mod tests {
     async fn test_path_scalar_wrong_param_count() {
         // Zero params for a bare scalar target.
         let mut zero = make_path_parts(vec![]);
-        assert!(Path::<u32>::from_request_parts(&mut zero, &()).await.is_err());
+        assert!(
+            Path::<u32>::from_request_parts(&mut zero, &())
+                .await
+                .is_err()
+        );
 
         // More than one param for a bare scalar target.
         let mut two = make_path_parts(vec![("a", "1"), ("b", "2")]);
-        assert!(Path::<u32>::from_request_parts(&mut two, &()).await.is_err());
+        assert!(
+            Path::<u32>::from_request_parts(&mut two, &())
+                .await
+                .is_err()
+        );
 
         // Exactly one param succeeds.
         let mut one = make_path_parts(vec![("id", "7")]);
-        let Path(v) = Path::<u32>::from_request_parts(&mut one, &()).await.unwrap();
+        let Path(v) = Path::<u32>::from_request_parts(&mut one, &())
+            .await
+            .unwrap();
         assert_eq!(v, 7);
     }
 
@@ -1923,7 +1920,9 @@ mod tests {
 
         // `()` as the whole target reaches `deserialize_unit` and ignores any params.
         let mut parts = make_path_parts(vec![("a", "1"), ("b", "2")]);
-        let Path(unit_val) = Path::<()>::from_request_parts(&mut parts, &()).await.unwrap();
+        let Path(unit_val) = Path::<()>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(unit_val, ());
 
         // A derived unit struct reaches `deserialize_unit_struct`.

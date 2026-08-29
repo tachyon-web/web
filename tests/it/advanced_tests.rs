@@ -149,11 +149,7 @@ async fn test_layer_ordering_and_state() {
     // middleware that needs shared state closes over it directly — the same
     // pattern any Axum middleware written with a plain closure (rather than
     // `middleware::from_fn_with_state`) already uses.
-    async fn first_mw(
-        counter: Arc<AtomicUsize>,
-        req: Request<Body>,
-        next: Next,
-    ) -> Response<Body> {
+    async fn first_mw(counter: Arc<AtomicUsize>, req: Request<Body>, next: Next) -> Response<Body> {
         let order = counter.fetch_add(1, Ordering::SeqCst);
         let mut res = next.run(req).await;
         let _ = res.headers_mut().insert(
@@ -163,11 +159,7 @@ async fn test_layer_ordering_and_state() {
         res
     }
 
-    async fn last_mw(
-        counter: Arc<AtomicUsize>,
-        req: Request<Body>,
-        next: Next,
-    ) -> Response<Body> {
+    async fn last_mw(counter: Arc<AtomicUsize>, req: Request<Body>, next: Next) -> Response<Body> {
         let order = counter.fetch_add(1, Ordering::SeqCst);
         let mut res = next.run(req).await;
         let _ = res.headers_mut().insert(

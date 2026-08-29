@@ -736,12 +736,13 @@ where
     ) -> impl std::future::Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
         let mut buf = JoinBuf::new();
         let result = (|| {
-            let bytes = join_header(&parts.headers, T::HEADER_NAME, &mut buf).ok_or_else(|| {
-                crate::http::error::Error::Rejection {
-                    status: hyper::StatusCode::BAD_REQUEST,
-                    message: format!("missing `{}` header", T::HEADER_NAME),
-                }
-            })??;
+            let bytes =
+                join_header(&parts.headers, T::HEADER_NAME, &mut buf).ok_or_else(|| {
+                    crate::http::error::Error::Rejection {
+                        status: hyper::StatusCode::BAD_REQUEST,
+                        message: format!("missing `{}` header", T::HEADER_NAME),
+                    }
+                })??;
             T::parse_field(bytes)
                 .map(Self)
                 .map_err(crate::http::error::Error::from)
@@ -961,19 +962,17 @@ mod tests {
     #[cfg(feature = "sfv")]
     async fn extractor_parses_rejects_and_joins() {
         let mut parts = parts_with(&["u=1, i"]);
-        let StructuredHeader(p) =
-            StructuredHeader::<Priority>::from_request_parts(&mut parts, &())
-                .await
-                .unwrap();
+        let StructuredHeader(p) = StructuredHeader::<Priority>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(p.urgency(), 1);
         assert!(p.incremental);
 
         // Repeated lines are joined into one field.
         let mut parts = parts_with(&["u=2", "i"]);
-        let StructuredHeader(p) =
-            StructuredHeader::<Priority>::from_request_parts(&mut parts, &())
-                .await
-                .unwrap();
+        let StructuredHeader(p) = StructuredHeader::<Priority>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
         assert_eq!(p.urgency(), 2);
         assert!(p.incremental);
 

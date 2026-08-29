@@ -69,11 +69,8 @@ impl Route {
     pub(crate) fn layer<L, RespBody>(self, layer: L) -> Self
     where
         L: Layer<Self>,
-        L::Service: Service<Request<Body>, Response = Response<RespBody>>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
+        L::Service:
+            Service<Request<Body>, Response = Response<RespBody>> + Clone + Send + Sync + 'static,
         <L::Service as Service<Request<Body>>>::Future: Send + 'static,
         <L::Service as Service<Request<Body>>>::Error: Into<Error> + Send,
         RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,

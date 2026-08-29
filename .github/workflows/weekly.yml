@@ -16,6 +16,7 @@ jobs:
   audit:
     name: cargo-audit (advisories filed since last run)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

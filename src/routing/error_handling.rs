@@ -90,11 +90,7 @@ pub type HandleErrorFuture =
 
 impl<S, F, Fut, Res, RespBody> Service<Request<Body>> for HandleError<S, F>
 where
-    S: Service<Request<Body>, Response = hyper::Response<RespBody>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    S: Service<Request<Body>, Response = hyper::Response<RespBody>> + Clone + Send + Sync + 'static,
     S::Error: Into<Error> + Send,
     S::Future: Send + 'static,
     F: FnOnce(Error) -> Fut + Clone + Send + Sync + 'static,

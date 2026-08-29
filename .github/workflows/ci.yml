@@ -21,6 +21,7 @@ jobs:
   checks:
     name: fmt / clippy / msrv / parity
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -48,6 +49,7 @@ jobs:
   build:
     name: "${{ matrix.name }}"
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -64,10 +66,10 @@ jobs:
             flags: --no-default-features --features http2
           - name: extractors (no default features)
             flags: --no-default-features --features http1,json,form,query,cookies,matched-path,original-uri
-          - name: transports + interop (ws, sse, tower, tls, acme, http/3)
-            flags: --features ws,sse,tower,tower-log,tls,cert-gen,lets-encrypt,http3
+          - name: transports + interop (ws, sse, tower-log, tls, acme, http/3)
+            flags: --features ws,sse,tower-log,tls,cert-gen,lets-encrypt,http3
           - name: full (no tor/i2p)
-            flags: --features ws,sse,sfv,tower,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
+            flags: --features ws,sse,sfv,tower-log,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -86,6 +88,7 @@ jobs:
   docs:
     name: rustdoc
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       RUSTDOCFLAGS: -D warnings
     steps:

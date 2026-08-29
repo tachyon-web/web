@@ -14,7 +14,11 @@ use tachyon_web::tls::acme::{
 #[tokio::test]
 async fn test_challenge_store_lifecycle() {
     unregister_challenge("does-not-exist");
-    assert_eq!(get_challenge("does-not-exist"), None, "unregister of a nonexistent token is a no-op");
+    assert_eq!(
+        get_challenge("does-not-exist"),
+        None,
+        "unregister of a nonexistent token is a no-op"
+    );
 
     let (token_a, token_b) = ("lifecycle-tok-a".to_string(), "lifecycle-tok-b".to_string());
     register_challenge(token_a.clone(), "first-auth".to_string());
@@ -31,7 +35,11 @@ async fn test_challenge_store_lifecycle() {
     assert_eq!(get_challenge(&token_b), Some("auth-b".to_string()));
 
     unregister_challenge(&token_a);
-    assert_eq!(get_challenge(&token_a), None, "removing token_a must not affect token_b");
+    assert_eq!(
+        get_challenge(&token_a),
+        None,
+        "removing token_a must not affect token_b"
+    );
     assert_eq!(
         get_challenge(&token_b),
         Some("auth-b".to_string()),

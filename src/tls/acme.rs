@@ -13,13 +13,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::TokioExecutor;
 use instant_acme::{
     Account, AccountBuilder, AccountCredentials, BodyWrapper, ChallengeType, Identifier,
     NewAccount, NewOrder, OrderStatus,
 };
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::TokioExecutor;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};

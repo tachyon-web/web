@@ -306,13 +306,31 @@ where
     // lifetime (it's captured by the async block that runs `serve_fn`), so waiting for the
     // channel to close — every clone dropped, meaning every worker thread has exited,
     // whether from returning or panicking — is a reliable "the whole pool has died" signal.
-    let hangup = tokio::task::spawn_blocking(move || while bind_rx.recv().is_ok() {});
-    match hangup.await {
+    //
+    // This waits on a plain `std::thread`, not `tokio::task::spawn_blocking`: a
+    // `spawn_blocking` closure is tracked by the runtime's blocking pool, and — because it
+    // can't be preempted — `Runtime::drop` blocks the dropping thread until it returns.
+    // Under normal operation it never does (the accept loops run forever), so a caller that
+    // `tokio::spawn`s this and later drops or aborts that task (a test tearing down its own
+    // runtime, for instance) would hang forever on the runtime's own shutdown, long after
+    // the task itself was supposedly cancelled. A bare OS thread carries no such obligation:
+    // the runtime shuts down without waiting for it, and this future itself stays cancellable
+    // through the `oneshot` receiver like any other `.await` point.
+    let (hangup_tx, hangup_rx) = tokio::sync::oneshot::channel();
+    let _ = std::thread::Builder::new()
+        .name("tachyon-worker-hangup".to_string())
+        .spawn(move || {
+            while bind_rx.recv().is_ok() {}
+            let _ = hangup_tx.send(());
+        });
+    match hangup_rx.await {
         Ok(()) => Err(std::io::Error::other(
             "all worker threads exited without accepting a connection — check for an early \
              error from `serve_fn` (e.g. FIPS enforcement) in the logs above",
         )),
-        Err(join_err) => Err(std::io::Error::other(join_err)),
+        Err(_) => Err(std::io::Error::other(
+            "hangup watcher thread dropped without reporting",
+        )),
     }
 }
 
