@@ -26,9 +26,46 @@ use tokio_util::sync::PollSender;
 use tungstenite::Error as WsError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::protocol::frame::coding::{Control, Data as OpData, OpCode};
-use tungstenite::protocol::frame::{CloseFrame, Frame, FrameHeader, FrameSocket, Utf8Bytes};
+use tungstenite::protocol::frame::{
+    CloseFrame as TungsteniteCloseFrame, Frame, FrameHeader, FrameSocket, Utf8Bytes,
+};
 
-pub use tungstenite::Message;
+/// A WebSocket close code, per RFC 6455 §7.4. Matches `axum::extract::ws::CloseCode`.
+pub type CloseCode = u16;
+
+/// A WebSocket close frame: the code and optional human-readable reason sent/received in a
+/// `Message::Close`. Matches `axum::extract::ws::CloseFrame`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseFrame {
+    /// The close code.
+    pub code: CloseCode,
+    /// The reason for closing, if any.
+    pub reason: Utf8Bytes,
+}
+
+impl From<CloseFrame> for TungsteniteCloseFrame {
+    fn from(frame: CloseFrame) -> Self {
+        Self {
+            code: frame.code.into(),
+            reason: frame.reason,
+        }
+    }
+}
+
+/// A WebSocket message. Matches `axum::extract::ws::Message`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    /// A text message.
+    Text(Utf8Bytes),
+    /// A binary message.
+    Binary(Bytes),
+    /// A ping message.
+    Ping(Bytes),
+    /// A pong message.
+    Pong(Bytes),
+    /// A close message, with an optional close frame.
+    Close(Option<CloseFrame>),
+}
 
 type Io = AllowStd<TokioIo<hyper::upgrade::Upgraded>>;
 
@@ -132,7 +169,7 @@ fn parse_close(payload: &[u8]) -> Result<Option<CloseFrame>, Error> {
             let reason = std::str::from_utf8(rest)
                 .map_err(|_| Error::internal("WebSocket close reason is not UTF-8".to_string()))?;
             Ok(Some(CloseFrame {
-                code: code.into(),
+                code,
                 reason: reason.to_string().into(),
             }))
         }
@@ -317,7 +354,8 @@ impl WebSocket {
     fn handle_close(&mut self, payload: &Bytes) -> Result<Option<Message>, Error> {
         let close_frame = parse_close(payload)?;
         if !self.sent_close {
-            self.outgoing.push_back(Frame::close(close_frame.clone()));
+            self.outgoing
+                .push_back(Frame::close(close_frame.clone().map(Into::into)));
             self.sent_close = true;
         }
         self.closed = true;
@@ -471,12 +509,8 @@ impl WebSocket {
                 Ok(())
             }
             Message::Close(frame) => {
-                self.outgoing.push_back(Frame::close(frame));
+                self.outgoing.push_back(Frame::close(frame.map(Into::into)));
                 self.sent_close = true;
-                Ok(())
-            }
-            Message::Frame(frame) => {
-                self.outgoing.push_back(frame);
                 Ok(())
             }
         }
@@ -688,7 +722,7 @@ mod tests {
         let mut payload = vec![0x03, 0xe8]; // 1000 big-endian
         payload.extend_from_slice(b"bye");
         let frame = parse_close(&payload).unwrap().unwrap();
-        assert_eq!(u16::from(frame.code), 1000);
+        assert_eq!(frame.code, 1000);
         assert_eq!(frame.reason.to_string(), "bye");
     }
 }

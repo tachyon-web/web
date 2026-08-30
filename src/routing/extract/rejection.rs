@@ -45,6 +45,31 @@ macro_rules! leaf_rejection {
     };
 }
 
+/// Defines a fixed-message leaf rejection: a true unit struct with a fixed status code and
+/// body text baked in, matching axum-core's `define_rejection!` for rejections that carry no
+/// per-occurrence detail.
+macro_rules! unit_rejection {
+    ($(#[$m:meta])* pub struct $name:ident => $status:ident, $body:literal) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str($body)
+            }
+        }
+
+        impl std::error::Error for $name {}
+
+        impl IntoResponse for $name {
+            fn into_response(self) -> Response {
+                (StatusCode::$status, $body).into_response()
+            }
+        }
+    };
+}
+
 /// Defines a composite rejection: an enum over other rejection types, each
 /// wrapped in its own variant, with `IntoResponse`/`Display`/`From<Variant>`
 /// all derived mechanically from the variant list.
@@ -95,78 +120,46 @@ leaf_rejection! {
     pub struct LengthLimitError => PAYLOAD_TOO_LARGE
 }
 
-/// The request body could not be read to completion (I/O error, malformed
-/// chunked transfer, a body-read deadline expiring, ...). Matches
-/// `axum_core::extract::rejection::FailedToBufferBody`.
-///
-/// Unlike a `leaf_rejection!`-generated type, this carries its own status
-/// code rather than a fixed one: the underlying [`CoreError`] this is built
-/// from can legitimately be any status (e.g. a `408 Request Timeout` from a
-/// body-read deadline, not just a generic `400`), and collapsing that to a
-/// fixed code would silently change the response your client actually sees.
-pub struct FailedToBufferBody {
-    status: StatusCode,
-    message: String,
-}
-
-impl std::fmt::Debug for FailedToBufferBody {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FailedToBufferBody")
-            .field("status", &self.status)
-            .field("message", &self.message)
-            .finish()
-    }
-}
-
-impl std::fmt::Display for FailedToBufferBody {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for FailedToBufferBody {}
-
-impl IntoResponse for FailedToBufferBody {
-    fn into_response(self) -> Response {
-        (self.status, self.message).into_response()
-    }
-}
-
 leaf_rejection! {
-    /// A body-extraction failure that doesn't fit any of the more specific rejection
-    /// variants above. Matches `axum_core::extract::rejection::UnknownBodyError`.
+    /// The request body could not be read to completion.
     ///
-    /// Tachyon-web's own [`Body::collect_bytes`](crate::http::response::Body::collect_bytes)
-    /// already classifies every failure as either [`LengthLimitError`] or
-    /// [`FailedToBufferBody`], so this type is never constructed internally — it exists for
-    /// structural parity with axum, for callers building their own composite rejections.
-    pub struct UnknownBodyError => INTERNAL_SERVER_ERROR
+    /// Covers any reason other than exceeding a length limit (I/O error, malformed
+    /// chunked transfer, ...). Matches `axum_core::extract::rejection::UnknownBodyError`.
+    pub struct UnknownBodyError => BAD_REQUEST
+}
+
+composite_rejection! {
+    /// The request body could not be buffered. Matches
+    /// `axum_core::extract::rejection::FailedToBufferBody`.
+    pub enum FailedToBufferBody {
+        LengthLimitError(LengthLimitError),
+        UnknownBodyError(UnknownBodyError),
+    }
+}
+
+impl From<CoreError> for FailedToBufferBody {
+    fn from(e: CoreError) -> Self {
+        match e.as_status() {
+            Some((status, message)) if status == StatusCode::PAYLOAD_TOO_LARGE => {
+                Self::LengthLimitError(LengthLimitError(message.to_string()))
+            }
+            Some((_, message)) => Self::UnknownBodyError(UnknownBodyError(message.to_string())),
+            None => Self::UnknownBodyError(UnknownBodyError(e.to_string())),
+        }
+    }
 }
 
 composite_rejection! {
     /// Rejection for the raw [`bytes::Bytes`] extractor. Matches
     /// `axum_core::extract::rejection::BytesRejection`.
     pub enum BytesRejection {
-        LengthLimitError(LengthLimitError),
         FailedToBufferBody(FailedToBufferBody),
     }
 }
 
 impl From<CoreError> for BytesRejection {
     fn from(e: CoreError) -> Self {
-        match e.as_status() {
-            Some((status, message)) if status == StatusCode::PAYLOAD_TOO_LARGE => {
-                Self::LengthLimitError(LengthLimitError(message.to_string()))
-            }
-            Some((status, message)) => Self::FailedToBufferBody(FailedToBufferBody {
-                status,
-                message: message.to_string(),
-            }),
-            None => Self::FailedToBufferBody(FailedToBufferBody {
-                status: StatusCode::BAD_REQUEST,
-                message: e.to_string(),
-            }),
-        }
+        Self::FailedToBufferBody(FailedToBufferBody::from(e))
     }
 }
 
@@ -180,7 +173,7 @@ composite_rejection! {
     /// Rejection for the [`String`] extractor. Matches
     /// `axum_core::extract::rejection::StringRejection`.
     pub enum StringRejection {
-        BytesRejection(BytesRejection),
+        FailedToBufferBody(FailedToBufferBody),
         InvalidUtf8(InvalidUtf8),
     }
 }
@@ -430,11 +423,11 @@ impl IntoResponse for FailedToDeserializePathParams {
     }
 }
 
-leaf_rejection! {
+unit_rejection! {
     /// The route matched but no path-parameter extension was present at all
     /// — an internal routing bug rather than a client error. Matches
     /// `axum::extract::rejection::MissingPathParams`.
-    pub struct MissingPathParams => INTERNAL_SERVER_ERROR
+    pub struct MissingPathParams => INTERNAL_SERVER_ERROR, "No paths parameters found for matched route"
 }
 
 composite_rejection! {
@@ -517,10 +510,10 @@ composite_rejection! {
 // --- Json ------------------------------------------------------------------
 
 #[cfg(feature = "json")]
-leaf_rejection! {
+unit_rejection! {
     /// The request's `Content-Type` wasn't a JSON media type. Matches
     /// `axum::extract::rejection::MissingJsonContentType`.
-    pub struct MissingJsonContentType => UNSUPPORTED_MEDIA_TYPE
+    pub struct MissingJsonContentType => UNSUPPORTED_MEDIA_TYPE, "Expected request with `Content-Type: application/json`"
 }
 
 #[cfg(feature = "json")]
@@ -552,10 +545,10 @@ composite_rejection! {
 // --- Form ------------------------------------------------------------------
 
 #[cfg(feature = "form")]
-leaf_rejection! {
+unit_rejection! {
     /// The request's `Content-Type` wasn't `application/x-www-form-urlencoded`.
     /// Matches `axum::extract::rejection::InvalidFormContentType`.
-    pub struct InvalidFormContentType => UNSUPPORTED_MEDIA_TYPE
+    pub struct InvalidFormContentType => UNSUPPORTED_MEDIA_TYPE, "Form requests must have `Content-Type: application/x-www-form-urlencoded`"
 }
 
 #[cfg(feature = "form")]
@@ -615,11 +608,11 @@ composite_rejection! {
 // --- MatchedPath -------------------------------------------------------
 
 #[cfg(feature = "matched-path")]
-leaf_rejection! {
+unit_rejection! {
     /// No matched route pattern was found in the request's extensions
     /// (the request never matched a route). Matches
     /// `axum::extract::rejection::MatchedPathMissing`.
-    pub struct MatchedPathMissing => INTERNAL_SERVER_ERROR
+    pub struct MatchedPathMissing => INTERNAL_SERVER_ERROR, "No matched path found"
 }
 
 #[cfg(feature = "matched-path")]
@@ -698,7 +691,10 @@ mod tests {
     fn bytes_rejection_from_length_limit_preserves_status() {
         let core = CoreError::status(StatusCode::PAYLOAD_TOO_LARGE, "too big");
         let rej = BytesRejection::from(core);
-        assert!(matches!(rej, BytesRejection::LengthLimitError(_)));
+        assert!(matches!(
+            rej,
+            BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_))
+        ));
         assert_eq!(rej.into_response().status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -714,7 +710,7 @@ mod tests {
     #[test]
     fn json_rejection_variants_map_to_expected_status_codes() {
         assert_eq!(
-            JsonRejection::from(MissingJsonContentType("x".into()))
+            JsonRejection::from(MissingJsonContentType)
                 .into_response()
                 .status(),
             StatusCode::UNSUPPORTED_MEDIA_TYPE

@@ -28,7 +28,9 @@ use tower::{Service, ServiceExt};
 /// As in Axum, application state flows to a middleware function only
 /// through extractor arguments (or a bound closure for
 /// [`from_fn_with_state`]), never through `Next` itself.
-pub struct Next(pub(crate) Route);
+pub struct Next {
+    pub(crate) inner: Route,
+}
 
 impl std::fmt::Debug for Next {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,8 +42,8 @@ impl Next {
     /// Executes the next handler in the pipeline.
     #[inline]
     pub async fn run(self, req: Request<Body>) -> Response<Body> {
-        let Self(mut route) = self;
-        match route.ready().await {
+        let Self { mut inner } = self;
+        match inner.ready().await {
             Ok(ready) => match ready.call(req).await {
                 Ok(resp) => resp,
                 Err(infallible) => match infallible {},

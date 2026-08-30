@@ -78,7 +78,12 @@ pub trait FromRequestParts<S: Sync>: Sized + Send {
 /// [`crate::routing::extract::BodyStream`]). Extractors that only need the parts
 /// (headers, method, URI, state) should implement [`FromRequestParts`] instead,
 /// which stays synchronous and is cheaper to call.
-pub trait FromRequest<S: Sync>: Sized + Send {
+///
+/// `M` is a phantom marker occupying the same generic slot Axum uses to let a single type
+/// implement both [`FromRequestParts`] and `FromRequest` without a coherence conflict — this
+/// crate achieves the same result via per-type macro-generated impls instead, so `M` exists here
+/// purely for signature parity.
+pub trait FromRequest<S: Sync, M = ()>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
 
@@ -88,7 +93,7 @@ pub trait FromRequest<S: Sync>: Sized + Send {
     ///
     /// Returns a rejection if the extraction from the request body/parts fails.
     fn from_request(
-        req: hyper::Request<Body>,
+        req: crate::http::Request,
         state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send;
 }
@@ -189,7 +194,7 @@ pub trait OptionalFromRequest<S: Sync>: Sized + Send {
     /// Returns a rejection for a failure that shouldn't collapse to `None` (e.g. a
     /// malformed value, as opposed to the value simply being missing).
     fn from_request(
-        req: hyper::Request<Body>,
+        req: crate::http::Request,
         state: &S,
     ) -> impl Future<Output = Result<Option<Self>, Self::Rejection>> + Send;
 }

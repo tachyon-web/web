@@ -61,17 +61,13 @@ use std::future::Future;
 use tungstenite::handshake::derive_accept_key;
 
 pub use deflate::DeflateConfig;
-pub use socket::{Message, WebSocket};
+pub use socket::{CloseCode, CloseFrame, Message, WebSocket};
+pub use tungstenite::protocol::WebSocketConfig;
 pub use tungstenite::protocol::frame::Utf8Bytes;
-pub use tungstenite::protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode};
 
 /// Named WebSocket close-code constants (RFC 6455 §7.4).
 ///
-/// Matches `axum::extract::ws::close_code`. tachyon's [`CloseCode`] is
-/// `tungstenite`'s own enum rather than axum's bare `u16` alias (see the
-/// module-level `[DIFFERS]` entry in `AXUM_PARITY_GAPS.md`), so these are
-/// plain `u16` constants for direct comparison against a raw close-frame
-/// code, exactly as in axum.
+/// Matches `axum::extract::ws::close_code`.
 pub mod close_code {
     /// Normal, successful closure — the purpose the connection was opened for has been fulfilled.
     pub const NORMAL: u16 = 1000;

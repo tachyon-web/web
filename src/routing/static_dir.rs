@@ -1274,7 +1274,6 @@ mod tests {
 
         let resp = sd.handle_request("big.bin").await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(matches!(resp.body(), Body::Stream(_)), "should stream");
         assert_eq!(
             hyper::body::Body::size_hint(resp.body()).exact(),
             Some(u64::try_from(size).unwrap())

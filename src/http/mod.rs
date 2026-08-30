@@ -9,4 +9,9 @@ pub mod sfv;
 
 // Re-export standard HTTP types for convenience so users don't need to depend on `hyper` or `http` directly.
 pub use hyper::header;
-pub use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
+pub use hyper::{HeaderMap, Method, StatusCode, Uri};
+pub use response::Response;
+
+/// A Tachyon HTTP request, generic over its body type (defaulting to
+/// [`response::Body`]). Matches `axum_core::extract::Request`.
+pub type Request<T = response::Body> = hyper::Request<T>;

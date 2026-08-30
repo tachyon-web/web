@@ -688,41 +688,38 @@ impl Compression {
         }
 
         let (mut parts, body) = response.into_parts();
-        let new_body = match body {
-            Body::Empty => return Response::from_parts(parts, Body::Empty),
-            Body::Full(_) | Body::Stream(_) if size.exact() == Some(0) => {
-                return Response::from_parts(parts, body);
+        let new_body = if size.exact() == Some(0) {
+            return Response::from_parts(parts, body);
+        } else if size.exact().is_some() {
+            // A body with a fully known length is already (or trivially) in memory, so it
+            // can be compressed in one shot — which both compresses better than framed
+            // streaming and lets the exact `Content-Length` be restored below.
+            let Ok(bytes) = collect_full(body).await else {
+                return Response::from_parts(parts, Body::empty());
+            };
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) < self.min_size {
+                return Response::from_parts(parts, Body::full(bytes));
             }
-            // A `Full` body is already entirely in memory, so it can be compressed in one
-            // shot — which both compresses better than framed streaming and lets the
-            // exact `Content-Length` be restored below.
-            Body::Full(_) => {
-                let Ok(bytes) = collect_full(body).await else {
-                    return Response::from_parts(parts, Body::Empty);
-                };
-                if u64::try_from(bytes.len()).unwrap_or(u64::MAX) < self.min_size {
-                    return Response::from_parts(parts, Body::full(bytes));
+            match self.compress_in_memory(encoding, bytes).await {
+                Ok(compressed) => {
+                    set_content_length(&mut parts.headers, compressed.len());
+                    Body::full(compressed)
                 }
-                match self.compress_in_memory(encoding, bytes).await {
-                    Ok(compressed) => {
-                        set_content_length(&mut parts.headers, compressed.len());
-                        Body::full(compressed)
-                    }
-                    Err(Some(original)) => {
-                        return Response::from_parts(parts, Body::full(original));
-                    }
-                    // The body is gone; a `500` is the only response left that doesn't lie
-                    // about what the client is holding.
-                    Err(None) => {
-                        use crate::http::response::IntoResponse;
-                        return crate::http::error::Error::internal(
-                            "response compression failed".to_string(),
-                        )
-                        .into_response();
-                    }
+                Err(Some(original)) => {
+                    return Response::from_parts(parts, Body::full(original));
+                }
+                // The body is gone; a `500` is the only response left that doesn't lie
+                // about what the client is holding.
+                Err(None) => {
+                    use crate::http::response::IntoResponse;
+                    return crate::http::error::Error::internal(
+                        "response compression failed".to_string(),
+                    )
+                    .into_response();
                 }
             }
-            Body::Stream(_) => match compressed_stream_body(body, encoding, self.level) {
+        } else {
+            match compressed_stream_body(body, encoding, self.level) {
                 Ok(new_body) => {
                     // The coded length is unknowable until the last frame, so the response
                     // becomes chunked (HTTP/1.1) or simply length-less (HTTP/2, HTTP/3).
@@ -730,7 +727,7 @@ impl Compression {
                     new_body
                 }
                 Err(body) => return Response::from_parts(parts, body),
-            },
+            }
         };
 
         let _ = parts

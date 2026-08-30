@@ -13,9 +13,9 @@ use std::future::Future;
 use crate::routing::extract::{FromRequestParts, rejection};
 
 /// Derives sub-state from the app state, matching `axum::extract::FromRef`.
-pub trait FromRef<S> {
+pub trait FromRef<T> {
     /// Extract a reference/clone from the parent state.
-    fn from_ref(state: &S) -> Self;
+    fn from_ref(input: &T) -> Self;
 }
 
 impl<T: Clone> FromRef<T> for T {
@@ -26,7 +26,7 @@ impl<T: Clone> FromRef<T> for T {
 
 /// Extractor for application state.
 #[derive(Debug, Clone, Copy)]
-pub struct State<T>(pub T);
+pub struct State<S>(pub S);
 
 impl<S: Sync, T> FromRequestParts<S> for State<T>
 where
@@ -339,12 +339,11 @@ impl<S: Sync> FromRequestParts<S> for MatchedPath {
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         std::future::ready({
-            parts.extensions.get::<Self>().cloned().ok_or_else(|| {
-                rejection::MatchedPathMissing(
-                    "No matched path found in request extensions".to_string(),
-                )
-                .into()
-            })
+            parts
+                .extensions
+                .get::<Self>()
+                .cloned()
+                .ok_or_else(|| rejection::MatchedPathMissing.into())
         })
     }
 }

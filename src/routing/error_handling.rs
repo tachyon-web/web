@@ -110,8 +110,23 @@ impl<S, F, T> std::fmt::Debug for HandleError<S, F, T> {
 
 /// The future returned by [`HandleError`]'s `Service::call`. Matches
 /// `axum::error_handling::future::HandleErrorFuture`.
-pub type HandleErrorFuture =
-    Pin<Box<dyn Future<Output = Result<Response, std::convert::Infallible>> + Send>>;
+pub struct HandleErrorFuture {
+    future: Pin<Box<dyn Future<Output = Result<Response, std::convert::Infallible>> + Send>>,
+}
+
+impl std::fmt::Debug for HandleErrorFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandleErrorFuture").finish_non_exhaustive()
+    }
+}
+
+impl Future for HandleErrorFuture {
+    type Output = Result<Response, std::convert::Infallible>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
+    }
+}
 
 impl<S, F, Fut, Res, RespBody> Service<Request<Body>> for HandleError<S, F, ()>
 where
@@ -141,19 +156,21 @@ where
         let f = self.f.clone();
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        Box::pin(async move {
-            let result = match inner.ready().await {
-                Ok(ready) => ready.call(req).await,
-                Err(e) => Err(e),
-            };
-            match result {
-                Ok(resp) => {
-                    let (parts, body) = resp.into_parts();
-                    Ok(hyper::Response::from_parts(parts, Body::stream(body)))
+        HandleErrorFuture {
+            future: Box::pin(async move {
+                let result = match inner.ready().await {
+                    Ok(ready) => ready.call(req).await,
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(resp) => {
+                        let (parts, body) = resp.into_parts();
+                        Ok(hyper::Response::from_parts(parts, Body::stream(body)))
+                    }
+                    Err(e) => Ok(f(e.into()).await.into_response()),
                 }
-                Err(e) => Ok(f(e.into()).await.into_response()),
-            }
-        })
+            }),
+        }
     }
 }
 

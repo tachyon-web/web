@@ -163,10 +163,7 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !is_json_content_type(ct) {
-            return Err(rejection::MissingJsonContentType(format!(
-                "Expected Content-Type: application/json, got: '{ct}'"
-            ))
-            .into());
+            return Err(rejection::MissingJsonContentType.into());
         }
         let limit = max_body_size(req.extensions());
         let body = req
@@ -234,7 +231,7 @@ impl<S: Sync> FromRequest<S> for String {
             .into_body()
             .collect_bytes(limit)
             .await
-            .map_err(rejection::BytesRejection::from)?;
+            .map_err(rejection::FailedToBufferBody::from)?;
         Self::from_utf8(body.to_vec()).map_err(|e| {
             rejection::InvalidUtf8(format!("Request body is not valid UTF-8: {e}")).into()
         })
@@ -300,10 +297,7 @@ where
             .unwrap_or("");
         let essence = ct.split(';').next().unwrap_or("").trim();
         if !essence.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
-            return Err(rejection::InvalidFormContentType(format!(
-                "Expected Content-Type: application/x-www-form-urlencoded, got: '{ct}'"
-            ))
-            .into());
+            return Err(rejection::InvalidFormContentType.into());
         }
         let limit = max_body_size(req.extensions());
         let body = req
@@ -358,10 +352,7 @@ where
             .unwrap_or("");
         let essence = ct.split(';').next().unwrap_or("").trim();
         if !essence.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
-            return Err(rejection::InvalidFormContentType(format!(
-                "Expected Content-Type: application/x-www-form-urlencoded, got: '{ct}'"
-            ))
-            .into());
+            return Err(rejection::InvalidFormContentType.into());
         }
         let limit = max_body_size(req.extensions());
         let body = req

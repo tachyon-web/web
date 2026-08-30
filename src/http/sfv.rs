@@ -188,10 +188,10 @@ impl crate::http::response::IntoResponse for SfvError {
 }
 
 /// Result alias for this module.
-pub type Result<T> = std::result::Result<T, SfvError>;
+pub type SfvResult<T> = std::result::Result<T, SfvError>;
 
 /// Checks the size bound before handing bytes to the parser.
-const fn checked(input: &[u8]) -> Result<&[u8]> {
+const fn checked(input: &[u8]) -> SfvResult<&[u8]> {
     if input.len() > MAX_INPUT {
         return Err(SfvError::TooLong { len: input.len() });
     }
@@ -207,7 +207,7 @@ const fn checked(input: &[u8]) -> Result<&[u8]> {
 /// Returns [`SfvError`] if the field is oversized or not a well-formed
 /// `sf-dictionary`.
 #[cfg(feature = "sfv")]
-pub fn parse_dictionary(input: &[u8]) -> Result<Dictionary> {
+pub fn parse_dictionary(input: &[u8]) -> SfvResult<Dictionary> {
     Ok(Parser::new(checked(input)?).parse_dictionary()?)
 }
 
@@ -219,7 +219,7 @@ pub fn parse_dictionary(input: &[u8]) -> Result<Dictionary> {
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed `sf-list`.
 #[cfg(feature = "sfv")]
-pub fn parse_list(input: &[u8]) -> Result<List> {
+pub fn parse_list(input: &[u8]) -> SfvResult<List> {
     Ok(Parser::new(checked(input)?).parse_list()?)
 }
 
@@ -231,7 +231,7 @@ pub fn parse_list(input: &[u8]) -> Result<List> {
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed `sf-item`.
 #[cfg(feature = "sfv")]
-pub fn parse_item(input: &[u8]) -> Result<Item> {
+pub fn parse_item(input: &[u8]) -> SfvResult<Item> {
     Ok(Parser::new(checked(input)?).parse_item()?)
 }
 
@@ -296,14 +296,14 @@ pub trait FromSfvValue: Sized {
     /// # Errors
     ///
     /// Returns [`SfvError::WrongType`] if the item holds another type.
-    fn from_bare_item(item: BareItemFromInput<'_>, key: &'static str) -> Result<Self>;
+    fn from_bare_item(item: BareItemFromInput<'_>, key: &'static str) -> SfvResult<Self>;
 
     /// Produces a value for an absent key. Only `Option<T>` succeeds here.
     ///
     /// # Errors
     ///
     /// Returns [`SfvError::MissingKey`] unless the type has a natural empty value.
-    fn missing(key: &'static str) -> Result<Self> {
+    fn missing(key: &'static str) -> SfvResult<Self> {
         Err(SfvError::MissingKey { key })
     }
 }
@@ -313,7 +313,7 @@ macro_rules! impl_from_sfv_value {
         impl FromSfvValue for $ty {
             const EXPECTED: &'static str = $expected;
 
-            fn from_bare_item($item: BareItemFromInput<'_>, $key: &'static str) -> Result<Self> {
+            fn from_bare_item($item: BareItemFromInput<'_>, $key: &'static str) -> SfvResult<Self> {
                 $body.ok_or(SfvError::WrongType {
                     key: $key,
                     expected: $expected,
@@ -350,11 +350,11 @@ impl_from_sfv_value!(Vec<u8>, "a byte sequence", |item, _key| match item {
 impl<T: FromSfvValue> FromSfvValue for Option<T> {
     const EXPECTED: &'static str = T::EXPECTED;
 
-    fn from_bare_item(item: BareItemFromInput<'_>, key: &'static str) -> Result<Self> {
+    fn from_bare_item(item: BareItemFromInput<'_>, key: &'static str) -> SfvResult<Self> {
         T::from_bare_item(item, key).map(Some)
     }
 
-    fn missing(_key: &'static str) -> Result<Self> {
+    fn missing(_key: &'static str) -> SfvResult<Self> {
         Ok(None)
     }
 }
@@ -369,11 +369,11 @@ impl<T: FromSfvValue> FromSfvValue for Option<T> {
 pub trait SlotSink {
     /// Stores a value parsed for `key`, replacing any earlier one (RFC 9651
     /// requires last-wins for duplicate keys).
-    fn accept(&mut self, item: BareItemFromInput<'_>, key: &'static str) -> Result<()>;
+    fn accept(&mut self, item: BareItemFromInput<'_>, key: &'static str) -> SfvResult<()>;
 }
 
 impl<T: FromSfvValue> SlotSink for Option<T> {
-    fn accept(&mut self, item: BareItemFromInput<'_>, key: &'static str) -> Result<()> {
+    fn accept(&mut self, item: BareItemFromInput<'_>, key: &'static str) -> SfvResult<()> {
         *self = Some(T::from_bare_item(item, key)?);
         Ok(())
     }
@@ -398,7 +398,7 @@ pub type ErrorSlot = Cell<Option<SfvError>>;
 /// Pairs with reading `errors` back out once parsing returns control to the
 /// caller of [`parse_with_visitor`].
 #[doc(hidden)]
-pub fn capture<T>(errors: &ErrorSlot, result: Result<T>) -> Result<T> {
+pub fn capture<T>(errors: &ErrorSlot, result: SfvResult<T>) -> SfvResult<T> {
     result.map_err(|e| {
         errors.set(Some(e));
         SfvError::Aborted
@@ -432,10 +432,10 @@ impl<'a> Slot<'a> {
 impl<'de> sfv::visitor::EntryVisitor<'de> for Slot<'_> {
     type Error = SfvError;
 
-    fn item(self) -> Result<impl sfv::visitor::ItemVisitor<'de>> {
+    fn item(self) -> SfvResult<impl sfv::visitor::ItemVisitor<'de>> {
         let Self { sink, key, errors } = self;
         Ok(
-            move |item: BareItemFromInput<'de>| -> Result<sfv::visitor::Ignored> {
+            move |item: BareItemFromInput<'de>| -> SfvResult<sfv::visitor::Ignored> {
                 capture(errors, sink.accept(item, key))?;
                 // Parameters on a declared key are validated by the parser but
                 // carry no meaning for a scalar field, so they are discarded.
@@ -444,7 +444,7 @@ impl<'de> sfv::visitor::EntryVisitor<'de> for Slot<'_> {
         )
     }
 
-    fn inner_list(self) -> Result<impl sfv::visitor::InnerListVisitor<'de>> {
+    fn inner_list(self) -> SfvResult<impl sfv::visitor::InnerListVisitor<'de>> {
         let Self { key, errors, .. } = self;
         capture::<sfv::visitor::Never>(errors, Err(SfvError::UnexpectedInnerList { key }))
     }
@@ -627,7 +627,7 @@ macro_rules! __sfv_dictionary_impl {
 ///
 /// Returns [`SfvError`] if the field is oversized, malformed, or the visitor
 /// rejects it.
-pub fn parse_with_visitor<'de, V>(input: &'de [u8], visitor: V) -> Result<V::Out>
+pub fn parse_with_visitor<'de, V>(input: &'de [u8], visitor: V) -> SfvResult<V::Out>
 where
     V: sfv::visitor::DictionaryVisitor<'de, Error = SfvError>,
 {
@@ -648,7 +648,7 @@ pub trait FromStructuredHeader: Sized {
     ///
     /// Returns [`SfvError`] if the field is malformed, oversized, or a required
     /// key is missing or mistyped.
-    fn parse_field(bytes: &[u8]) -> Result<Self>;
+    fn parse_field(bytes: &[u8]) -> SfvResult<Self>;
 }
 
 /// Extractor for a typed structured-field header.

@@ -8,7 +8,7 @@
 
 use crate::http::error::Error;
 use crate::http::response::{Body, IntoResponse};
-use crate::routing::handler::{BoxedFuture, Handler, ResponseFuture};
+use crate::routing::handler::{BoxedFuture, Handler, HandlerResponseFuture};
 use bytes::Bytes;
 use hyper::{Request, Response};
 use std::convert::Infallible;
@@ -65,17 +65,13 @@ impl<E> Route<E> {
 
     /// Builds the base `Route` for a bare [`Handler`], bound to `state` —
     /// the starting point every `.layer()` call wraps further.
-    pub(crate) fn from_handler<H, T, S>(handler: H, state: Arc<S>) -> Self
+    pub(crate) fn from_handler<H, T, S>(handler: H, state: &Arc<S>) -> Self
     where
         H: Handler<T, S> + Clone + Send + Sync + 'static,
-        T: Send + 'static,
-        S: Send + Sync + 'static,
+        T: 'static,
+        S: Clone + Send + Sync + 'static,
     {
-        Self::new(HandlerService {
-            handler,
-            state,
-            _marker: PhantomData,
-        })
+        Self::new(HandlerService::new(handler, (**state).clone()))
     }
 
     /// Applies a `tower::Layer` to this route, matching `axum::routing::Route::layer`
@@ -232,40 +228,44 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let clone = self.0.clone();
         let mut inner = std::mem::replace(&mut self.0, clone);
-        ResponseAxumBodyFuture(Box::pin(async move {
-            let result = match inner.ready().await {
-                Ok(ready) => ready.call(req).await,
-                Err(e) => Err(e),
-            };
-            Ok(match result {
-                Ok(resp) => {
-                    let (parts, body) = resp.into_parts();
-                    Response::from_parts(parts, Body::stream(body))
-                }
-                Err(e) => Into::<Error>::into(e).into_response(),
-            })
-        }))
+        ResponseAxumBodyFuture {
+            inner: Box::pin(async move {
+                let result = match inner.ready().await {
+                    Ok(ready) => ready.call(req).await,
+                    Err(e) => Err(e),
+                };
+                Ok(match result {
+                    Ok(resp) => {
+                        let (parts, body) = resp.into_parts();
+                        Response::from_parts(parts, Body::stream(body))
+                    }
+                    Err(e) => Into::<Error>::into(e).into_response(),
+                })
+            }),
+            _marker: PhantomData,
+        }
     }
 }
 
 /// Response future for [`ResponseAxumBody`]. Matches
 /// `axum::middleware::ResponseAxumBodyFuture`.
-pub struct ResponseAxumBodyFuture(
-    Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
-);
+pub struct ResponseAxumBodyFuture<Fut = ()> {
+    inner: Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
+    _marker: PhantomData<fn() -> Fut>,
+}
 
-impl std::fmt::Debug for ResponseAxumBodyFuture {
+impl<Fut> std::fmt::Debug for ResponseAxumBodyFuture<Fut> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResponseAxumBodyFuture")
             .finish_non_exhaustive()
     }
 }
 
-impl Future for ResponseAxumBodyFuture {
+impl<Fut> Future for ResponseAxumBodyFuture<Fut> {
     type Output = Result<Response<Body>, Infallible>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().inner.as_mut().poll(cx)
     }
 }
 
@@ -318,13 +318,15 @@ where
     RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
     RespBody::Error: Into<Error>,
 {
-    fn call(self, mut req: Request<Body>, _state: Arc<S>) -> BoxedFuture {
+    type Future = BoxedFuture;
+
+    fn call(self, mut req: Request<Body>, _state: S) -> BoxedFuture {
         if let Some(prefix) = &self.strip_prefix {
             crate::routing::strip_uri_prefix(&mut req, prefix);
         }
 
         let mut service = self.service;
-        ResponseFuture::Boxed(Box::pin(async move {
+        HandlerResponseFuture::Boxed(Box::pin(async move {
             match service.ready().await {
                 Ok(ready) => match ready.call(req).await {
                     Ok(resp) => {
@@ -375,18 +377,28 @@ where
 /// A handler bound to `state`, matching `axum::handler::Handler::with_state`.
 ///
 /// Lets a bare handler be served directly (no `Router`) or passed to any Tower/Hyper API
-/// expecting a `Service<Request<Body>>`. Built via [`HandlerExt::with_state`].
+/// expecting a `Service<Request<Body>>`. Built via [`Handler::with_state`].
 pub struct HandlerService<H, T, S> {
     handler: H,
-    state: Arc<S>,
+    state: S,
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<H: Clone, T, S> Clone for HandlerService<H, T, S> {
+impl<H, T, S> HandlerService<H, T, S> {
+    pub(crate) const fn new(handler: H, state: S) -> Self {
+        Self {
+            handler,
+            state,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<H: Clone, T, S: Clone> Clone for HandlerService<H, T, S> {
     fn clone(&self) -> Self {
         Self {
             handler: self.handler.clone(),
-            state: Arc::clone(&self.state),
+            state: self.state.clone(),
             _marker: PhantomData,
         }
     }
@@ -401,7 +413,7 @@ impl<H, T, S> std::fmt::Debug for HandlerService<H, T, S> {
 impl<H, T, S> Service<Request<Body>> for HandlerService<H, T, S>
 where
     H: Handler<T, S> + Clone,
-    S: Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     type Response = Response<Body>;
     type Error = Infallible;
@@ -413,37 +425,51 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let handler = self.handler.clone();
-        let state = Arc::clone(&self.state);
-        IntoServiceFuture(Box::pin(async move { Ok(handler.call(req, state).await) }))
+        let state = self.state.clone();
+        IntoServiceFuture {
+            inner: Box::pin(async move { Ok(handler.call(req, state).await) }),
+            _marker: PhantomData,
+        }
     }
 }
 
 /// Response future for [`HandlerService`]'s `Service` impl. Matches
 /// `axum::handler::future::IntoServiceFuture`.
-pub struct IntoServiceFuture(
-    Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
-);
+pub struct IntoServiceFuture<F = ()> {
+    inner: Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
+    _marker: PhantomData<fn() -> F>,
+}
 
-impl std::fmt::Debug for IntoServiceFuture {
+impl<F> std::fmt::Debug for IntoServiceFuture<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IntoServiceFuture").finish_non_exhaustive()
     }
 }
 
-impl Future for IntoServiceFuture {
+impl<F> Future for IntoServiceFuture<F> {
     type Output = Result<Response<Body>, Infallible>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().inner.as_mut().poll(cx)
     }
 }
 
 /// A handler wrapped with a `tower::Layer`, matching `axum::handler::Handler::layer` —
-/// produced by [`HandlerExt::layer`].
+/// produced by [`Handler::layer`].
 pub struct Layered<L, H, T, S> {
     layer: L,
     handler: H,
     _marker: PhantomData<fn() -> (T, S)>,
+}
+
+impl<L, H, T, S> Layered<L, H, T, S> {
+    pub(crate) const fn new(layer: L, handler: H) -> Self {
+        Self {
+            layer,
+            handler,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<L: Clone, H: Clone, T, S> Clone for Layered<L, H, T, S> {
@@ -465,8 +491,8 @@ impl<L, H, T, S> std::fmt::Debug for Layered<L, H, T, S> {
 impl<L, H, T, S, RespBody> Handler<T, S> for Layered<L, H, T, S>
 where
     H: Handler<T, S> + Clone,
-    S: Send + Sync + 'static,
-    T: Send + 'static,
+    S: Clone + Send + Sync + 'static,
+    T: 'static,
     L: Layer<HandlerService<H, T, S>> + Clone + Send + Sync + 'static,
     L::Service: Service<Request<Body>, Response = Response<RespBody>> + Send + 'static,
     <L::Service as Service<Request<Body>>>::Future: Send + 'static,
@@ -474,101 +500,86 @@ where
     RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
     RespBody::Error: Into<Error>,
 {
-    fn call(self, req: Request<Body>, state: Arc<S>) -> BoxedFuture {
-        let inner = HandlerService {
-            handler: self.handler,
-            state,
-            _marker: PhantomData,
-        };
+    type Future = BoxedFuture;
+
+    fn call(self, req: Request<Body>, state: S) -> BoxedFuture {
+        let inner = HandlerService::new(self.handler, state);
         let mut layered = self.layer.layer(inner);
-        let fut = LayeredFuture(Box::pin(async move {
-            match layered.ready().await {
-                Ok(ready) => match ready.call(req).await {
-                    Ok(resp) => {
-                        let (parts, body) = resp.into_parts();
-                        Response::from_parts(parts, Body::stream(body))
-                    }
+        let fut = LayeredFuture {
+            inner: Box::pin(async move {
+                match layered.ready().await {
+                    Ok(ready) => match ready.call(req).await {
+                        Ok(resp) => {
+                            let (parts, body) = resp.into_parts();
+                            Response::from_parts(parts, Body::stream(body))
+                        }
+                        Err(e) => Into::<Error>::into(e).into_response(),
+                    },
                     Err(e) => Into::<Error>::into(e).into_response(),
-                },
-                Err(e) => Into::<Error>::into(e).into_response(),
-            }
-        }));
-        ResponseFuture::Boxed(Box::pin(fut))
+                }
+            }),
+            _marker: PhantomData::<fn() -> L::Service>,
+        };
+        HandlerResponseFuture::Boxed(Box::pin(fut))
     }
 }
 
 /// The future backing [`Layered`]'s `Handler::call`, produced while awaiting its
 /// wrapped `tower::Layer` pipeline. Matches `axum::handler::future::LayeredFuture`.
-pub struct LayeredFuture(Pin<Box<dyn Future<Output = Response<Body>> + Send>>);
+pub struct LayeredFuture<S>
+where
+    S: Service<crate::http::Request>,
+{
+    inner: Pin<Box<dyn Future<Output = Response<Body>> + Send>>,
+    _marker: PhantomData<fn() -> S>,
+}
 
-impl std::fmt::Debug for LayeredFuture {
+impl<S> std::fmt::Debug for LayeredFuture<S>
+where
+    S: Service<crate::http::Request>,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LayeredFuture").finish_non_exhaustive()
     }
 }
 
-impl Future for LayeredFuture {
+impl<S> Future for LayeredFuture<S>
+where
+    S: Service<crate::http::Request>,
+{
     type Output = Response<Body>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().inner.as_mut().poll(cx)
     }
 }
-
-/// Adds Axum's per-handler `Handler::layer`/`Handler::with_state` methods.
-pub trait HandlerExt<T, S>: Handler<T, S> {
-    /// Wraps this handler with a `tower::Layer`, matching
-    /// `axum::handler::Handler::layer`.
-    fn layer<L>(self, layer: L) -> Layered<L, Self, T, S>
-    where
-        Self: Sized,
-        L: Layer<HandlerService<Self, T, S>> + Clone + Send + Sync + 'static,
-    {
-        Layered {
-            layer,
-            handler: self,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Binds `state`, producing a `tower::Service` that no longer needs it supplied per
-    /// call — matches `axum::handler::Handler::with_state`.
-    fn with_state(self, state: S) -> HandlerService<Self, T, S>
-    where
-        Self: Sized,
-    {
-        HandlerService {
-            handler: self,
-            state: Arc::new(state),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<H, T, S> HandlerExt<T, S> for H where H: Handler<T, S> {}
 
 /// Adds `Handler::into_service`/`Handler::into_make_service` sugar for stateless handlers.
 ///
 /// Applies to handlers already at `Handler<T, ()>`, skipping the explicit
-/// `.with_state(())` call that [`HandlerExt::with_state`] otherwise requires. Matches
+/// `.with_state(())` call that [`Handler::with_state`] otherwise requires. Matches
 /// `axum::handler::HandlerWithoutStateExt`.
 pub trait HandlerWithoutStateExt<T>: Handler<T, ()> {
     /// Converts this handler directly into a `tower::Service`, matching
     /// `axum::handler::HandlerWithoutStateExt::into_service`.
-    fn into_service(self) -> HandlerService<Self, T, ()>
-    where
-        Self: Sized,
-    {
+    fn into_service(self) -> HandlerService<Self, T, ()> {
         self.with_state(())
     }
 
     /// Converts this handler directly into a `tower::make::MakeService`, matching
     /// `axum::handler::HandlerWithoutStateExt::into_make_service`.
-    fn into_make_service(self) -> IntoMakeService<HandlerService<Self, T, ()>>
-    where
-        Self: Sized,
-    {
+    fn into_make_service(self) -> IntoMakeService<HandlerService<Self, T, ()>> {
         self.into_service().into_make_service()
+    }
+
+    /// Converts this handler directly into a `tower::make::MakeService` that also
+    /// derives a [`ConnectInfo<C>`](crate::routing::extract::ConnectInfo) from each
+    /// accepted [`IncomingStream`], matching
+    /// `axum::handler::HandlerWithoutStateExt::into_make_service_with_connect_info`.
+    fn into_make_service_with_connect_info<C>(
+        self,
+    ) -> IntoMakeServiceWithConnectInfo<HandlerService<Self, T, ()>, C> {
+        self.into_service().into_make_service_with_connect_info()
     }
 }
 
@@ -828,7 +839,7 @@ pub trait ServiceExt<R>: Service<R> + Sized {
     /// Converts this service into a [`crate::routing::error_handling::HandleError`], which
     /// handles its errors by converting them into responses. Matches
     /// `axum::ServiceExt::handle_error`.
-    fn handle_error<F>(self, f: F) -> crate::routing::error_handling::HandleError<Self, F> {
+    fn handle_error<F, T>(self, f: F) -> crate::routing::error_handling::HandleError<Self, F, T> {
         crate::routing::error_handling::HandleError::new(self, f)
     }
 }
@@ -880,12 +891,12 @@ impl IncomingStream {
 /// accepted connection. Matches `axum::extract::connect_info::Connected`.
 pub trait Connected<T>: Clone + Send + Sync + 'static {
     /// Builds the connect-info value for this connection.
-    fn connect_info(target: T) -> Self;
+    fn connect_info(stream: T) -> Self;
 }
 
 impl Connected<IncomingStream> for std::net::SocketAddr {
-    fn connect_info(target: IncomingStream) -> Self {
-        target.remote_addr
+    fn connect_info(stream: IncomingStream) -> Self {
+        stream.remote_addr
     }
 }
 
@@ -970,7 +981,7 @@ where
 {
     type Response = ConnectInfoService<S, C>;
     type Error = Infallible;
-    type Future = std::future::Ready<Result<Self::Response, Infallible>>;
+    type Future = ResponseFuture<S, C>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -978,10 +989,32 @@ where
 
     fn call(&mut self, target: IncomingStream) -> Self::Future {
         let connect_info = C::connect_info(target);
-        std::future::ready(Ok(ConnectInfoService {
-            svc: self.svc.clone(),
-            connect_info,
-        }))
+        ResponseFuture {
+            inner: std::future::ready(Ok(ConnectInfoService {
+                svc: self.svc.clone(),
+                connect_info,
+            })),
+        }
+    }
+}
+
+/// Response future for [`IntoMakeServiceWithConnectInfo`]. Matches
+/// `axum::extract::connect_info::ResponseFuture`.
+pub struct ResponseFuture<S, C> {
+    inner: std::future::Ready<Result<ConnectInfoService<S, C>, Infallible>>,
+}
+
+impl<S, C> std::fmt::Debug for ResponseFuture<S, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseFuture").finish_non_exhaustive()
+    }
+}
+
+impl<S, C> Future for ResponseFuture<S, C> {
+    type Output = Result<ConnectInfoService<S, C>, Infallible>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx)
     }
 }
 
@@ -992,10 +1025,10 @@ where
 /// that use `ConnectInfo` without going through a real accept loop. Matches
 /// `axum::extract::connect_info::MockConnectInfo`.
 #[derive(Debug, Clone, Copy)]
-pub struct MockConnectInfo<C>(pub C);
+pub struct MockConnectInfo<T>(pub T);
 
-impl<C: Clone, S> Layer<S> for MockConnectInfo<C> {
-    type Service = ConnectInfoService<S, C>;
+impl<T: Clone, S> Layer<S> for MockConnectInfo<T> {
+    type Service = ConnectInfoService<S, T>;
 
     fn layer(&self, inner: S) -> Self::Service {
         ConnectInfoService {
@@ -1079,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_layer_wraps_and_normalizes_an_arbitrary_tower_layer() {
-        let base = Route::<Infallible>::from_handler(hello, Arc::new(()));
+        let base = Route::<Infallible>::from_handler(hello, &Arc::new(()));
         let mut layered: Route<Infallible> = base.layer(TagHeaderLayer);
         let req = Request::builder().body(Body::empty()).unwrap();
         let resp = layered.call(req).await.unwrap();
@@ -1089,7 +1122,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_layer_composes_across_multiple_applications() {
-        let base = Route::<Infallible>::from_handler(hello, Arc::new(()));
+        let base = Route::<Infallible>::from_handler(hello, &Arc::new(()));
         let once: Route<Infallible> = base.layer(TagHeaderLayer);
         let twice: Route<Infallible> = once.layer(TagHeaderLayer);
         let req = Request::builder().body(Body::empty()).unwrap();

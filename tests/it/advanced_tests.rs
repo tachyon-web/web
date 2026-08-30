@@ -143,13 +143,16 @@ async fn test_layer_ordering_and_state() {
     use hyper::{Request, Response};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tachyon_web::extract::State;
     use tachyon_web::middleware::{self, Next};
 
-    // `Next` carries no state (matching Axum's real, state-erased `Next`), so
-    // middleware that needs shared state closes over it directly — the same
-    // pattern any Axum middleware written with a plain closure (rather than
-    // `middleware::from_fn_with_state`) already uses.
-    async fn first_mw(counter: Arc<AtomicUsize>, req: Request<Body>, next: Next) -> Response<Body> {
+    // State is threaded via the `State<T>` extractor, matching Axum's real
+    // `from_fn_with_state` semantics — `Next` itself carries no state.
+    async fn first_mw(
+        State(counter): State<Arc<AtomicUsize>>,
+        req: Request<Body>,
+        next: Next,
+    ) -> Response<Body> {
         let order = counter.fetch_add(1, Ordering::SeqCst);
         let mut res = next.run(req).await;
         let _ = res.headers_mut().insert(
@@ -159,7 +162,11 @@ async fn test_layer_ordering_and_state() {
         res
     }
 
-    async fn last_mw(counter: Arc<AtomicUsize>, req: Request<Body>, next: Next) -> Response<Body> {
+    async fn last_mw(
+        State(counter): State<Arc<AtomicUsize>>,
+        req: Request<Body>,
+        next: Next,
+    ) -> Response<Body> {
         let order = counter.fetch_add(1, Ordering::SeqCst);
         let mut res = next.run(req).await;
         let _ = res.headers_mut().insert(
@@ -198,12 +205,11 @@ async fn test_layer_ordering_and_state() {
 
 #[tokio::test]
 async fn test_eager_polling_safety_and_allocations() {
-    use std::sync::Arc;
     use std::time::Duration;
     use tachyon_web::http::Request;
-    use tachyon_web::routing::handler::{Handler, ResponseFuture};
+    use tachyon_web::routing::handler::{Handler, HandlerResponseFuture};
 
-    // Arity-0 async fn with no awaits: fresh value per call, no box (ResponseFuture::Ready).
+    // Arity-0 async fn with no awaits: fresh value per call, no box (HandlerResponseFuture::Ready).
     async fn get_time() -> String {
         format!(
             "time: {:?}",
@@ -215,9 +221,9 @@ async fn test_eager_polling_safety_and_allocations() {
     }
 
     let req1 = Request::builder().body(Body::empty()).unwrap();
-    let res_fut1 = get_time.call(req1, Arc::new(()));
+    let res_fut1 = get_time.call(req1, ());
     assert!(
-        matches!(res_fut1, ResponseFuture::Ready(_)),
+        matches!(res_fut1, HandlerResponseFuture::Ready(_)),
         "Expected Ready for instant route"
     );
     let response1 = res_fut1.await;
@@ -227,8 +233,8 @@ async fn test_eager_polling_safety_and_allocations() {
     tokio::time::sleep(Duration::from_millis(1)).await;
 
     let req2 = Request::builder().body(Body::empty()).unwrap();
-    let res_fut2 = get_time.call(req2, Arc::new(()));
-    assert!(matches!(res_fut2, ResponseFuture::Ready(_)));
+    let res_fut2 = get_time.call(req2, ());
+    assert!(matches!(res_fut2, HandlerResponseFuture::Ready(_)));
     let response2 = res_fut2.await;
     let body2 = response_to_string(response2).await;
 
@@ -237,31 +243,31 @@ async fn test_eager_polling_safety_and_allocations() {
         "Dynamic time handler must return different values on different requests"
     );
 
-    // Arity-0 async fn that genuinely awaits: falls back to ResponseFuture::Boxed.
+    // Arity-0 async fn that genuinely awaits: falls back to HandlerResponseFuture::Boxed.
     async fn wait_a_bit() -> &'static str {
         tokio::time::sleep(Duration::from_millis(5)).await;
         "done"
     }
 
     let req3 = Request::builder().body(Body::empty()).unwrap();
-    let res_fut3 = wait_a_bit.call(req3, Arc::new(()));
+    let res_fut3 = wait_a_bit.call(req3, ());
     assert!(
-        matches!(res_fut3, ResponseFuture::Boxed(_)),
+        matches!(res_fut3, HandlerResponseFuture::Boxed(_)),
         "Expected Boxed for yielding route"
     );
     let response3 = res_fut3.await;
     let body3 = response_to_string(response3).await;
     assert_eq!(body3, "done");
 
-    // Arity-0 sync fn: ResponseFuture::Ready.
+    // Arity-0 sync fn: HandlerResponseFuture::Ready.
     fn sync_handler() -> &'static str {
         "sync-ok"
     }
 
     let req4 = Request::builder().body(Body::empty()).unwrap();
-    let res_fut4 = sync_handler.call(req4, Arc::new(()));
+    let res_fut4 = sync_handler.call(req4, ());
     assert!(
-        matches!(res_fut4, ResponseFuture::Ready(_)),
+        matches!(res_fut4, HandlerResponseFuture::Ready(_)),
         "Expected Ready for sync route"
     );
     let response4 = res_fut4.await;
@@ -270,16 +276,16 @@ async fn test_eager_polling_safety_and_allocations() {
 
     // The last extractor is `FromRequest`, which is async (it may need to await the
     // body streaming in), so any handler with at least one argument goes through
-    // `ResponseFuture::Boxed` — only arity-0 handlers can take the `Ready` fast path.
+    // `HandlerResponseFuture::Boxed` — only arity-0 handlers can take the `Ready` fast path.
     use tachyon_web::routing::extract::State;
     fn sync_state_handler(State(state_val): State<String>) -> String {
         format!("state: {}", state_val)
     }
 
     let req5 = Request::builder().body(Body::empty()).unwrap();
-    let res_fut5 = sync_state_handler.call(req5, Arc::new("app-state-value".to_string()));
+    let res_fut5 = sync_state_handler.call(req5, "app-state-value".to_string());
     assert!(
-        matches!(res_fut5, ResponseFuture::Boxed(_)),
+        matches!(res_fut5, HandlerResponseFuture::Boxed(_)),
         "Expected Boxed for extractor route (last extractor is async)"
     );
     let response5 = res_fut5.await;

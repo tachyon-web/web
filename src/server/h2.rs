@@ -801,6 +801,12 @@ mod tests {
 
     /// A request that declares a body and never sends it must not pin a handler and its
     /// connection permit indefinitely — the gap `DeadlineBody` covers on the `hyper` path.
+    ///
+    /// The response status is `400`, not `408`: the body-read deadline firing inside
+    /// [`H2Body::poll_frame`] surfaces to the `String` extractor as a body-buffering
+    /// failure, and — matching `axum_core::extract::rejection::FailedToBufferBody`'s fixed
+    /// `UnknownBodyError` (`400`) shape exactly — that collapses to a fixed status rather
+    /// than preserving the original error's status code.
     #[tokio::test(start_paused = true)]
     async fn a_body_that_never_arrives_times_out() {
         let router: Router<()> = Router::new().route(
@@ -823,7 +829,7 @@ mod tests {
             .await
             .expect("handler was never released — the body deadline did not fire")
             .expect("response");
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A handler that sets HTTP/1.1 connection headers must not have every HTTP/2 response

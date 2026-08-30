@@ -94,6 +94,12 @@ async fn post_with_undelivered_body(
 // waiting for the body if it actually extracts it. A `413`/timeout can only surface once
 // something reads the body, so this route uses `Bytes` (rather than an arity-0 handler)
 // to exercise the read path.
+//
+// The response is `400`, not `408`: the body-read deadline firing surfaces to the `Bytes`
+// extractor as a body-buffering failure, and — matching
+// `axum_core::extract::rejection::FailedToBufferBody`'s fixed `UnknownBodyError` (`400`)
+// shape exactly — that collapses to a fixed status rather than preserving the original
+// error's status code.
 #[cfg(feature = "http1")]
 #[tokio::test(start_paused = true)]
 async fn test_server_request_timeout() {
@@ -105,7 +111,7 @@ async fn test_server_request_timeout() {
     let mut resp_bytes = vec![0; 512];
     let n = stream.read(&mut resp_bytes).await.unwrap();
     let resp_str = String::from_utf8_lossy(resp_bytes.get(..n).unwrap());
-    assert!(resp_str.contains("408"), "response was: {resp_str}");
+    assert!(resp_str.contains("400"), "response was: {resp_str}");
 
     server_handle.abort();
 }

@@ -8,6 +8,7 @@ use tachyon_web::http::header::AUTHORIZATION;
 use tachyon_web::http::{Request, StatusCode};
 use tachyon_web::{
     Next, Router,
+    extract::State,
     middleware::{from_fn, from_fn_with_state},
     response::{Body, IntoResponse},
     routing::get,
@@ -28,7 +29,11 @@ async fn request_timer(req: Request<Body>, next: Next) -> impl IntoResponse {
     response
 }
 
-async fn mock_auth(state: AppState, req: Request<Body>, next: Next) -> impl IntoResponse {
+async fn mock_auth(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
     let expected_auth_header = format!("Bearer {}", state.expected_token);
 
     let is_authorized = req

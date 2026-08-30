@@ -8,7 +8,6 @@ pub use sse::Sse;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
-use http_body_util::Full;
 use http_body_util::combinators::UnsyncBoxBody as BoxBody;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use hyper::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -19,38 +18,35 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// The unified body type for Tachyon-Web responses.
-#[derive(Default)]
-pub enum Body {
-    /// A single full chunk of bytes in memory.
-    Full(Full<Bytes>),
-    /// An empty body.
-    #[default]
-    Empty,
-    /// A boxed stream body for streaming data (like SSE or large files).
-    Stream(BoxBody<Bytes, crate::http::error::Error>),
+/// The unified body type for Tachyon-Web responses. Matches `axum_core::body::Body`.
+#[derive(Debug)]
+pub struct Body(BoxBody<Bytes, crate::http::error::Error>);
+
+fn boxed<B>(body: B) -> BoxBody<Bytes, crate::http::error::Error>
+where
+    B: HyperBody<Data = Bytes> + Send + 'static,
+    B::Error: Into<crate::http::error::Error>,
+{
+    BoxBody::new(body.map_err(Into::into))
 }
 
-impl std::fmt::Debug for Body {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full(full) => f.debug_tuple("Full").field(full).finish(),
-            Self::Empty => f.write_str("Empty"),
-            Self::Stream(_) => f.debug_tuple("Stream").field(&"<stream>").finish(),
-        }
+impl Default for Body {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 
 impl Body {
     /// Create a new empty body.
     #[must_use]
-    pub const fn empty() -> Self {
-        Self::Empty
+    pub fn empty() -> Self {
+        Self::stream(http_body_util::Empty::new())
     }
 
     /// Create a new body from a single chunk of bytes.
+    #[must_use]
     pub fn full(bytes: Bytes) -> Self {
-        Self::Full(Full::new(bytes))
+        Self::stream(http_body_util::Full::new(bytes))
     }
 
     /// Create a streaming body from an implementation.
@@ -59,32 +55,24 @@ impl Body {
         B: HyperBody<Data = Bytes> + Send + 'static,
         B::Error: Into<crate::http::error::Error>,
     {
-        Self::Stream(BoxBody::new(body.map_err(std::convert::Into::into)))
+        Self(boxed(body))
     }
 
     /// Converts this body into a [`Stream`](futures_core::Stream) of its data frames,
     /// discarding trailers. Matches `axum_core::body::Body::into_data_stream`.
     #[must_use]
     pub const fn into_data_stream(self) -> BodyDataStream {
-        BodyDataStream(self)
+        BodyDataStream { inner: self }
     }
 
     /// Buffers the entire body into memory, rejecting bodies larger than `limit`
     /// bytes with a `413 Payload Too Large` rejection instead of allocating
     /// unbounded memory.
     ///
-    /// Works uniformly across all three variants — for `Full`/`Empty` this
-    /// resolves immediately with no I/O; for `Stream` it awaits incoming frames.
-    ///
     /// # Errors
     /// Returns a `413` rejection if the body exceeds `limit`, or a `400` rejection
     /// if reading the body otherwise fails (e.g. a malformed chunked transfer).
     pub async fn collect_bytes(self, limit: usize) -> Result<Bytes, crate::http::error::Error> {
-        // `hyper_handler` maps every already-ended body to `Empty`, so this is the common
-        // shape for a bodyless request reaching a body-consuming extractor.
-        if matches!(self, Self::Empty) {
-            return Ok(Bytes::new());
-        }
         match http_body_util::Limited::new(self, limit).collect().await {
             Ok(collected) => Ok(collected.to_bytes()),
             Err(e) => {
@@ -127,39 +115,23 @@ impl HyperBody for Body {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.get_mut() {
-            Self::Full(full) => match Pin::new(full).poll_frame(cx) {
-                Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
-                // `Full<Bytes>::Error` is `Infallible` — there is no value of `e` to format.
-                Poll::Ready(Some(Err(e))) => match e {},
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            },
-            Self::Empty => Poll::Ready(None),
-            Self::Stream(stream) => Pin::new(stream).poll_frame(cx),
-        }
+        Pin::new(&mut self.get_mut().0).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
-        match self {
-            Self::Full(full) => full.is_end_stream(),
-            Self::Empty => true,
-            Self::Stream(stream) => stream.is_end_stream(),
-        }
+        self.0.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
-        match self {
-            Self::Full(full) => full.size_hint(),
-            Self::Empty => SizeHint::with_exact(0),
-            Self::Stream(stream) => stream.size_hint(),
-        }
+        self.0.size_hint()
     }
 }
 
 /// A stream of a [`Body`]'s data frames, with trailers discarded. Returned by
 /// [`Body::into_data_stream`]. Matches `axum_core::body::BodyDataStream`.
-pub struct BodyDataStream(Body);
+pub struct BodyDataStream {
+    inner: Body,
+}
 
 impl std::fmt::Debug for BodyDataStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -172,7 +144,7 @@ impl futures_core::Stream for BodyDataStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            let body = Pin::new(&mut self.as_mut().get_mut().0);
+            let body = Pin::new(&mut self.as_mut().get_mut().inner);
             match body.poll_frame(cx) {
                 // A trailers frame is skipped; keep polling for the next data frame.
                 Poll::Ready(Some(Ok(frame))) => {
@@ -188,8 +160,9 @@ impl futures_core::Stream for BodyDataStream {
     }
 }
 
-/// A Tachyon HTTP response, named to match `axum::response::Response` exactly.
-pub type Response = HttpResponse<Body>;
+/// A Tachyon HTTP response, generic over its body type (defaulting to [`Body`]).
+/// Matches `axum_core::response::Response`.
+pub type Response<T = Body> = HttpResponse<T>;
 
 /// Trait for generating an HTTP response.
 pub trait IntoResponse {
@@ -203,10 +176,10 @@ impl IntoResponse for Response {
     }
 }
 
-impl IntoResponse for HttpResponse<Full<Bytes>> {
+impl IntoResponse for HttpResponse<http_body_util::Full<Bytes>> {
     fn into_response(self) -> Response {
         let (parts, body) = self.into_parts();
-        HttpResponse::from_parts(parts, Body::Full(body))
+        HttpResponse::from_parts(parts, Body::stream(body))
     }
 }
 
@@ -800,21 +773,18 @@ mod tests {
     #[test]
     fn test_body_debug_and_size_hint() {
         let b1 = Body::empty();
-        assert!(format!("{b1:?}").contains("Empty"));
+        assert!(!format!("{b1:?}").is_empty());
         assert!(b1.is_end_stream());
         assert_eq!(b1.size_hint().exact(), Some(0));
 
         let b2 = Body::full(Bytes::from("test"));
-        assert!(format!("{b2:?}").contains("Full"));
         assert!(!b2.is_end_stream());
         assert_eq!(b2.size_hint().exact(), Some(4));
 
-        let stream_body = BoxBody::new(
+        let b3 = Body::stream(
             http_body_util::Empty::<Bytes>::new()
                 .map_err(|e| crate::http::error::Error::internal(e.to_string())),
         );
-        let b3 = Body::Stream(stream_body);
-        assert!(format!("{b3:?}").contains("Stream"));
         assert!(b3.is_end_stream());
         assert_eq!(b3.size_hint().exact(), Some(0));
     }
@@ -849,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_into_response_implementations() {
-        let full_resp = HttpResponse::new(Full::new(Bytes::from("abc")));
+        let full_resp = HttpResponse::new(http_body_util::Full::new(Bytes::from("abc")));
         let r1 = full_resp.into_response();
         assert_eq!(r1.status(), StatusCode::OK);
 

@@ -8,19 +8,20 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use tower::Layer;
 
 use crate::http::response::{Body, IntoResponse};
 use crate::routing::extract::{FromRequest, FromRequestParts};
 
 /// A future that might be immediately ready, avoiding heap allocation.
-pub enum ResponseFuture {
+pub enum HandlerResponseFuture {
     /// The response was resolved immediately without any async waiting.
     Ready(Option<Response<Body>>),
     /// The response is pending and boxed.
     Boxed(Pin<Box<dyn Future<Output = Response<Body>> + Send + 'static>>),
 }
 
-impl std::fmt::Debug for ResponseFuture {
+impl std::fmt::Debug for HandlerResponseFuture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Ready(res) => f.debug_tuple("Ready").field(res).finish(),
@@ -29,7 +30,7 @@ impl std::fmt::Debug for ResponseFuture {
     }
 }
 
-impl Future for ResponseFuture {
+impl Future for HandlerResponseFuture {
     type Output = Response<Body>;
 
     /// Polling a `Ready` twice is a caller bug; it degrades to a `500` rather than panicking
@@ -37,7 +38,7 @@ impl Future for ResponseFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match &mut *self {
             Self::Ready(res) => Poll::Ready(res.take().unwrap_or_else(|| {
-                tracing::error!("ResponseFuture polled after completion");
+                tracing::error!("HandlerResponseFuture polled after completion");
                 let mut resp = Response::new(Body::empty());
                 *resp.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
                 resp
@@ -52,7 +53,7 @@ fn noop_waker() -> Waker {
 }
 
 /// A pinned, boxed, `Send` future returning an HTTP response, or an immediately resolved response.
-pub type BoxedFuture = ResponseFuture;
+pub type BoxedFuture = HandlerResponseFuture;
 
 /// A type-erased handler: `Arc<dyn Fn(Request<Body>, Arc<S>) -> BoxedFuture>`.
 pub type BoxedHandler<S> =
@@ -69,8 +70,8 @@ pub struct SyncHandler<T>(std::marker::PhantomData<T>);
 /// Blanket-implemented for `async fn`s (marked `AsyncHandler`) and for sync `fn`s and closures
 /// (marked `SyncHandler`).
 ///
-/// Arity-0 handlers take a fast path: a sync one returns `ResponseFuture::Ready` with no box
-/// allocation, and an async one is polled once eagerly, falling back to `ResponseFuture::Boxed`
+/// Arity-0 handlers take a fast path: a sync one returns `HandlerResponseFuture::Ready` with no box
+/// allocation, and an async one is polled once eagerly, falling back to `HandlerResponseFuture::Boxed`
 /// only if it actually yields. The eagerly-polled future is kept and reused rather than
 /// re-invoked, so side effects before the first `.await` still run exactly once.
 ///
@@ -81,8 +82,26 @@ pub struct SyncHandler<T>(std::marker::PhantomData<T>);
 /// A sync handler runs on the Tokio worker that picked up the request. Blocking inside one
 /// stalls that worker — keep them to instant CPU work, and use `spawn_blocking` for I/O.
 pub trait Handler<T, S>: Clone + Send + Sync + 'static {
+    /// The future returned by [`Handler::call`].
+    type Future: Future<Output = Response<Body>> + Send + 'static;
+
     /// Consume `self` and produce a future that resolves to the response.
-    fn call(self, req: Request<Body>, state: Arc<S>) -> BoxedFuture;
+    fn call(self, req: crate::http::Request, state: S) -> Self::Future;
+
+    /// Wraps this handler with a `tower::Layer`, matching `axum::handler::Handler::layer`.
+    fn layer<L>(self, layer: L) -> crate::routing::tower_compat::Layered<L, Self, T, S>
+    where
+        L: Layer<crate::routing::tower_compat::HandlerService<Self, T, S>> + Clone,
+        L::Service: tower::Service<crate::http::Request>,
+    {
+        crate::routing::tower_compat::Layered::new(layer, self)
+    }
+
+    /// Binds `state`, producing a `tower::Service` that no longer needs it supplied per
+    /// call — matches `axum::handler::Handler::with_state`.
+    fn with_state(self, state: S) -> crate::routing::tower_compat::HandlerService<Self, T, S> {
+        crate::routing::tower_compat::HandlerService::new(self, state)
+    }
 }
 
 // Async version
@@ -93,7 +112,9 @@ where
     Res: IntoResponse + Send + 'static,
     S: Send + Sync + 'static,
 {
-    fn call(self, _req: Request<Body>, _state: Arc<S>) -> BoxedFuture {
+    type Future = BoxedFuture;
+
+    fn call(self, _req: Request<Body>, _state: S) -> BoxedFuture {
         // Poll the *same* future instance that's returned as `Boxed` on `Pending` —
         // re-invoking `self()` to get a "fresh" future (the previous approach) runs
         // the handler body a second time from scratch, silently double-executing any
@@ -106,9 +127,9 @@ where
         let mut cx = Context::from_waker(&waker);
 
         match boxed.as_mut().poll(&mut cx) {
-            Poll::Ready(res) => ResponseFuture::Ready(Some(res.into_response())),
+            Poll::Ready(res) => HandlerResponseFuture::Ready(Some(res.into_response())),
             Poll::Pending => {
-                ResponseFuture::Boxed(Box::pin(async move { boxed.await.into_response() }))
+                HandlerResponseFuture::Boxed(Box::pin(async move { boxed.await.into_response() }))
             }
         }
     }
@@ -121,8 +142,10 @@ where
     Res: IntoResponse + Send + 'static,
     S: Send + Sync + 'static,
 {
-    fn call(self, _req: Request<Body>, _state: Arc<S>) -> BoxedFuture {
-        ResponseFuture::Ready(Some(self().into_response()))
+    type Future = BoxedFuture;
+
+    fn call(self, _req: Request<Body>, _state: S) -> BoxedFuture {
+        HandlerResponseFuture::Ready(Some(self().into_response()))
     }
 }
 
@@ -138,23 +161,25 @@ macro_rules! impl_handler {
             $last: FromRequest<S> + Send + 'static,
             S: Send + Sync + 'static,
         {
+            type Future = BoxedFuture;
+
             #[allow(non_snake_case, unused_mut)]
-            fn call(self, req: Request<Body>, state: Arc<S>) -> BoxedFuture {
+            fn call(self, req: Request<Body>, state: S) -> BoxedFuture {
                 // Both `FromRequestParts` and the last `FromRequest` extractor are
                 // `async` (parts extractors may now await too, matching Axum's
                 // `FromRequestParts`), so none of them can be resolved before deciding
                 // Ready vs. Boxed. Every handler with at least one argument therefore
                 // goes through `Boxed` regardless of which extractor rejects first.
-                ResponseFuture::Boxed(Box::pin(async move {
+                HandlerResponseFuture::Boxed(Box::pin(async move {
                     let (mut parts, body) = req.into_parts();
                     $(
-                        let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &*state).await {
+                        let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &state).await {
                             Ok(v) => v,
                             Err(r) => return r.into_response(),
                         };
                     )*
                     let req = Request::from_parts(parts, body);
-                    let $last = match <$last as FromRequest<S>>::from_request(req, &*state).await {
+                    let $last = match <$last as FromRequest<S>>::from_request(req, &state).await {
                         Ok(v) => v,
                         Err(r) => return r.into_response(),
                     };
@@ -172,19 +197,21 @@ macro_rules! impl_handler {
             $last: FromRequest<S> + Send + 'static,
             S: Send + Sync + 'static,
         {
+            type Future = BoxedFuture;
+
             #[allow(non_snake_case, unused_mut)]
-            fn call(self, req: Request<Body>, state: Arc<S>) -> BoxedFuture {
+            fn call(self, req: Request<Body>, state: S) -> BoxedFuture {
                 // See the async version above for why this can't stay on the `Ready` path.
-                ResponseFuture::Boxed(Box::pin(async move {
+                HandlerResponseFuture::Boxed(Box::pin(async move {
                     let (mut parts, body) = req.into_parts();
                     $(
-                        let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &*state).await {
+                        let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &state).await {
                             Ok(v) => v,
                             Err(r) => return r.into_response(),
                         };
                     )*
                     let req = Request::from_parts(parts, body);
-                    let $last = match <$last as FromRequest<S>>::from_request(req, &*state).await {
+                    let $last = match <$last as FromRequest<S>>::from_request(req, &state).await {
                         Ok(v) => v,
                         Err(r) => return r.into_response(),
                     };
@@ -274,7 +301,7 @@ mod tests {
         }
 
         let req = Request::builder().body(Body::empty()).unwrap();
-        let fut = h1.call(req, Arc::new(()));
+        let fut = h1.call(req, ());
         let res = fut.await;
         assert_eq!(res.status(), hyper::StatusCode::BAD_REQUEST);
     }
@@ -291,7 +318,7 @@ mod tests {
         }
 
         let req = Request::builder().body(Body::empty()).unwrap();
-        let fut = probe.call(req, Arc::new(()));
+        let fut = probe.call(req, ());
         let res = fut.await;
         assert_eq!(res.status(), hyper::StatusCode::OK);
         assert_eq!(
@@ -311,7 +338,7 @@ mod tests {
         }
 
         let req = Request::builder().body(Body::empty()).unwrap();
-        let res = h.call(req, Arc::new(())).await;
+        let res = h.call(req, ()).await;
         assert_eq!(res.status(), hyper::StatusCode::BAD_REQUEST);
     }
 
@@ -322,7 +349,7 @@ mod tests {
         }
 
         let req = Request::builder().body(Body::empty()).unwrap();
-        let res = h.call(req, Arc::new(())).await;
+        let res = h.call(req, ()).await;
         assert_eq!(res.status(), hyper::StatusCode::OK);
     }
 
@@ -335,7 +362,7 @@ mod tests {
         }
 
         let req = Request::builder().body(Body::empty()).unwrap();
-        let res = h.call(req, Arc::new(())).await;
+        let res = h.call(req, ()).await;
         assert_eq!(res.status(), hyper::StatusCode::BAD_REQUEST);
     }
 
@@ -348,7 +375,7 @@ mod tests {
         }
 
         let req = Request::builder().body(Body::empty()).unwrap();
-        let res = h.call(req, Arc::new(())).await;
+        let res = h.call(req, ()).await;
         assert_eq!(res.status(), hyper::StatusCode::BAD_REQUEST);
     }
 
@@ -359,7 +386,7 @@ mod tests {
         }
 
         let req = Request::builder().body(Body::empty()).unwrap();
-        let res = h.call(req, Arc::new(())).await;
+        let res = h.call(req, ()).await;
         assert_eq!(res.status(), hyper::StatusCode::OK);
     }
 }

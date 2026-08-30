@@ -546,7 +546,7 @@ where
             strip_prefix: None,
         };
         self.fallback = Some(Arc::new(move |state| {
-            Route::from_handler(handler.clone(), state)
+            Route::from_handler(handler.clone(), &state)
         }));
         self.compiled = None;
         self
@@ -622,7 +622,7 @@ where
         T: Send + 'static,
     {
         self.fallback = Some(Arc::new(move |state| {
-            Route::from_handler(handler.clone(), state)
+            Route::from_handler(handler.clone(), &state)
         }));
         self.compiled = None;
         self
@@ -638,7 +638,7 @@ where
         T: Send + 'static,
     {
         self.method_not_allowed_fallback = Some(Arc::new(move |state| {
-            Route::from_handler(handler.clone(), state)
+            Route::from_handler(handler.clone(), &state)
         }));
         self.compiled = None;
         self
@@ -677,13 +677,15 @@ where
         if headers.is_empty() {
             return self;
         }
-        self.layer(middleware::from_fn(move |req, next| {
-            let headers = headers.clone();
-            async move {
-                fire_early_hints(&req, headers);
-                next.run(req).await
-            }
-        }))
+        self.layer(middleware::from_fn(
+            move |req: crate::http::Request, next: middleware::Next| {
+                let headers = headers.clone();
+                async move {
+                    fire_early_hints(&req, headers);
+                    next.run(req).await
+                }
+            },
+        ))
     }
 
     /// Compresses responses from this router's routes, negotiating the coding against each
@@ -710,23 +712,28 @@ where
         // One `Arc` for the whole router rather than a `Compression` clone per request: the
         // config is read-only once built, so every request can share the same one.
         let compression = std::sync::Arc::new(compression);
-        self.layer(middleware::from_fn(move |req, next| {
-            let compression = std::sync::Arc::clone(&compression);
-            async move {
-                // Taken before `next.run` consumes the request; the response it returns is
-                // what gets negotiated against. Cloning the `HeaderValue` rather than
-                // copying out a `String` keeps this to a refcount bump on its bytes.
-                let accept_encoding = req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
-                let response = next.run(req).await;
-                match accept_encoding
-                    .as_ref()
-                    .and_then(|value| value.to_str().ok())
-                {
-                    Some(accept_encoding) => compression.apply_to(accept_encoding, response).await,
-                    None => response,
+        self.layer(middleware::from_fn(
+            move |req: crate::http::Request, next: middleware::Next| {
+                let compression = std::sync::Arc::clone(&compression);
+                async move {
+                    // Taken before `next.run` consumes the request; the response it returns is
+                    // what gets negotiated against. Cloning the `HeaderValue` rather than
+                    // copying out a `String` keeps this to a refcount bump on its bytes.
+                    let accept_encoding =
+                        req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
+                    let response = next.run(req).await;
+                    match accept_encoding
+                        .as_ref()
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        Some(accept_encoding) => {
+                            compression.apply_to(accept_encoding, response).await
+                        }
+                        None => response,
+                    }
                 }
-            }
-        }))
+            },
+        ))
     }
 
     /// Route an incoming request directly, compiling the router on the fly.

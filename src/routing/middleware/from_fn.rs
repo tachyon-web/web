@@ -16,15 +16,14 @@
 //! so a middleware needing state either closes over it directly or uses the
 //! `_with_state` variant below.
 //!
-//! Each family below unifies its plain/`_with_state` pair into one type
-//! (`FromFnLayer<F, S, T>`, matching axum's own generics exactly), using the
-//! otherwise-unused `T` slot as a marker distinguishing the two `F` call
-//! shapes (`Fn(Request<Body>, Next)` vs `Fn(S, Request<Body>, Next)`) —
-//! axum's own `T` plays the analogous "which shape is `F`" role via its
-//! extractor-tuple, just for a richer set of shapes than this crate supports.
+//! `from_fn`/`map_request` support the same 0-to-16-extractor arity `Handler` does: `T`
+//! (`FromFnLayer<F, S, T>`/`MapRequestLayer<F, S, T>`'s otherwise-unused generic slot) is the
+//! tuple of leading `FromRequestParts` extractor types plus the trailing `FromRequest` one,
+//! matching axum's own generics exactly — resolved the same variadic way `Handler` resolves
+//! route handler arguments, via a macro-generated `Service` impl per arity.
 
 use crate::http::response::{Body, IntoResponse, Response};
-use crate::routing::extract::FromRequestParts;
+use crate::routing::extract::{FromRequest, FromRequestParts};
 use crate::routing::middleware::Next;
 use crate::routing::tower_compat::Route;
 use hyper::Request;
@@ -54,24 +53,12 @@ where
     })
 }
 
-/// Marks a [`FromFnLayer`]/[`MapRequestLayer`]/[`MapResponseLayer`] built via
-/// the plain (no state) constructor — `F` takes no leading state argument.
-#[derive(Debug, Clone, Copy)]
-pub struct NoState;
-
-/// Marks a [`FromFnLayer`]/[`MapRequestLayer`]/[`MapResponseLayer`] built via
-/// the `_with_state` constructor — `F` takes a bound state clone as its
-/// first argument.
-#[derive(Debug, Clone, Copy)]
-pub struct WithState;
-
 // --- from_fn -----------------------------------------------------------
 
-/// `tower::Layer` wrapping an `async fn(Request<Body>, Next) -> impl IntoResponse`.
+/// `tower::Layer` wrapping an `async fn(..extractors, Request<Body>, Next) -> impl IntoResponse`.
 ///
-/// Optionally with a bound state argument first. Matches
-/// `axum::middleware::from_fn` in spirit; see the module docs for how the
-/// signature differs. Built via [`from_fn`]/[`from_fn_with_state`].
+/// Optionally with a bound state argument first. Matches `axum::middleware::from_fn`.
+/// Built via [`from_fn`]/[`from_fn_with_state`].
 pub struct FromFnLayer<F, S = (), T = ()> {
     f: F,
     state: S,
@@ -95,27 +82,12 @@ impl<F: Clone, S: Clone, T> Clone for FromFnLayer<F, S, T> {
 }
 
 /// Wraps `f` for use with `.layer()`/`.route_layer()`.
-pub const fn from_fn<F, Fut, Res>(f: F) -> FromFnLayer<F, (), NoState>
-where
-    F: Fn(Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-{
-    FromFnLayer {
-        f,
-        state: (),
-        _extractor: PhantomData,
-    }
+pub const fn from_fn<F, T>(f: F) -> FromFnLayer<F, (), T> {
+    from_fn_with_state((), f)
 }
 
 /// Wraps `f`, binding `state` as its first argument.
-pub const fn from_fn_with_state<F, Fut, Res, S>(state: S, f: F) -> FromFnLayer<F, S, WithState>
-where
-    F: Fn(S, Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
+pub const fn from_fn_with_state<F, S, T>(state: S, f: F) -> FromFnLayer<F, S, T> {
     FromFnLayer {
         f,
         state,
@@ -161,83 +133,111 @@ impl<F: Clone, S: Clone, I: Clone, T> Clone for FromFn<F, S, I, T> {
     }
 }
 
-impl<F, Fut, Res, I> Service<Request<Body>> for FromFn<F, (), I, NoState>
-where
-    F: Fn(Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    I: Service<Request<Body>, Response = Response, Error = Infallible>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    I::Future: Send + 'static,
-{
-    type Response = Response;
-    type Error = Infallible;
-    type Future = FromFnResponseFuture;
+/// Generates one `Service<Request<Body>>` impl per extractor arity for [`FromFn`], mirroring
+/// [`crate::routing::handler::impl_handler`]'s arity dispatch: zero or more leading
+/// [`FromRequestParts`] extractors, then exactly one trailing [`FromRequest`] extractor
+/// (typically `Request<Body>` itself, whose identity `FromRequest` impl covers the plain
+/// `Fn(Request<Body>, Next)` shape), then [`Next`].
+macro_rules! impl_from_fn {
+    ( $($ty:ident),* ; $last:ident ) => {
+        #[allow(non_snake_case, unused_mut)]
+        impl<F, Fut, Res, S, I, $($ty,)* $last> Service<Request<Body>>
+            for FromFn<F, S, I, ( $($ty,)* $last, )>
+        where
+            F: Fn($($ty,)* $last, Next) -> Fut + Clone + Send + Sync + 'static,
+            $( $ty: FromRequestParts<S> + Send + 'static, )*
+            $last: FromRequest<S> + Send + 'static,
+            Fut: Future<Output = Res> + Send + 'static,
+            Res: IntoResponse + Send + 'static,
+            I: Service<Request<Body>, Response = Response, Error = Infallible>
+                + Clone
+                + Send
+                + Sync
+                + 'static,
+            I::Future: Send + 'static,
+            S: Clone + Send + Sync + 'static,
+        {
+            type Response = Response;
+            type Error = Infallible;
+            type Future = FromFnResponseFuture;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let f = self.f.clone();
-        let next = Next(Route::new(self.inner.clone()));
-        FromFnResponseFuture(Box::pin(
-            async move { Ok(f(req, next).await.into_response()) },
-        ))
-    }
+            fn call(&mut self, req: Request<Body>) -> Self::Future {
+                let f = self.f.clone();
+                let state = self.state.clone();
+                let next = Next {
+                    inner: Route::new(self.inner.clone()),
+                };
+                let (mut parts, body) = req.into_parts();
+                FromFnResponseFuture {
+                    inner: Box::pin(async move {
+                        $(
+                            let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &state).await {
+                                Ok(v) => v,
+                                Err(r) => return Ok(r.into_response()),
+                            };
+                        )*
+                        let req = Request::from_parts(parts, body);
+                        let $last = match <$last as FromRequest<S>>::from_request(req, &state).await {
+                            Ok(v) => v,
+                            Err(r) => return Ok(r.into_response()),
+                        };
+                        Ok(f($($ty,)* $last, next).await.into_response())
+                    }),
+                }
+            }
+        }
+    };
 }
 
-impl<F, Fut, Res, S, I> Service<Request<Body>> for FromFn<F, S, I, WithState>
-where
-    F: Fn(S, Request<Body>, Next) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-    I: Service<Request<Body>, Response = Response, Error = Infallible>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    I::Future: Send + 'static,
-{
-    type Response = Response;
-    type Error = Infallible;
-    type Future = FromFnResponseFuture;
+impl_from_fn!(; A1);
+impl_from_fn!(A1; A2);
+impl_from_fn!(A1, A2; A3);
+impl_from_fn!(A1, A2, A3; A4);
+impl_from_fn!(A1, A2, A3, A4; A5);
+impl_from_fn!(A1, A2, A3, A4, A5; A6);
+impl_from_fn!(A1, A2, A3, A4, A5, A6; A7);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7; A8);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8; A9);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8, A9; A10);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10; A11);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11; A12);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12; A13);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13; A14);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14; A15);
+impl_from_fn!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15; A16);
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+/// Houses [`FromFn`]'s response future under the local name `ResponseFuture` — matching
+/// `axum::middleware::future::ResponseFuture`'s own declared name exactly, in its own module so
+/// it doesn't collide with the other middleware families' identically-named future structs
+/// below, all publicly re-exported under their Axum-matching aliases.
+mod from_fn_future {
+    use super::{Context, Future, Infallible, Pin, Poll, Response};
+
+    /// Response future for [`super::FromFn`]. Matches `axum::middleware::future::ResponseFuture`
+    /// (re-exported here as [`super::FromFnResponseFuture`]).
+    pub struct ResponseFuture {
+        pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let f = self.f.clone();
-        let state = self.state.clone();
-        let next = Next(Route::new(self.inner.clone()));
-        FromFnResponseFuture(Box::pin(async move {
-            Ok(f(state, req, next).await.into_response())
-        }))
+    impl std::fmt::Debug for ResponseFuture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ResponseFuture").finish_non_exhaustive()
+        }
     }
-}
 
-/// Response future for [`FromFn`]. Matches `axum::middleware::future::FromFnResponseFuture`.
-pub struct FromFnResponseFuture(Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>);
+    impl Future for ResponseFuture {
+        type Output = Result<Response, Infallible>;
 
-impl std::fmt::Debug for FromFnResponseFuture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromFnResponseFuture")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Future for FromFnResponseFuture {
-    type Output = Result<Response, Infallible>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.get_mut().inner.as_mut().poll(cx)
+        }
     }
 }
+pub use from_fn_future::ResponseFuture as FromFnResponseFuture;
 
 // --- map_request / map_request_with_state ---------------------------------
 
@@ -271,30 +271,12 @@ impl<F: Clone, S: Clone, T> Clone for MapRequestLayer<F, S, T> {
 }
 
 /// Wraps `f` for use with `.layer()`/`.route_layer()`.
-pub const fn map_request<F, Fut, O>(f: F) -> MapRequestLayer<F, (), NoState>
-where
-    F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-    O: IntoMapRequestResult + Send + 'static,
-{
-    MapRequestLayer {
-        f,
-        state: (),
-        _extractor: PhantomData,
-    }
+pub const fn map_request<F, T>(f: F) -> MapRequestLayer<F, (), T> {
+    map_request_with_state((), f)
 }
 
 /// Wraps `f`, binding `state` as its first argument.
-pub const fn map_request_with_state<F, Fut, O, S>(
-    state: S,
-    f: F,
-) -> MapRequestLayer<F, S, WithState>
-where
-    F: Fn(S, Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-    O: IntoMapRequestResult + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
+pub const fn map_request_with_state<F, S, T>(state: S, f: F) -> MapRequestLayer<F, S, T> {
     MapRequestLayer {
         f,
         state,
@@ -340,92 +322,109 @@ impl<F: Clone, S: Clone, I: Clone, T> Clone for MapRequest<F, S, I, T> {
     }
 }
 
-impl<F, Fut, O, I> Service<Request<Body>> for MapRequest<F, (), I, NoState>
-where
-    F: Fn(Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-    O: IntoMapRequestResult + Send + 'static,
-    I: Service<Request<Body>, Response = Response, Error = Infallible>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    I::Future: Send + 'static,
-{
-    type Response = Response;
-    type Error = Infallible;
-    type Future = MapRequestResponseFuture;
+/// Generates one `Service<Request<Body>>` impl per extractor arity for [`MapRequest`], mirroring
+/// [`impl_from_fn`]'s arity dispatch, minus the trailing [`Next`] argument: `f`'s last argument
+/// is instead the mapped `Request<Body>` itself.
+macro_rules! impl_map_request {
+    ( $($ty:ident),* ; $last:ident ) => {
+        #[allow(non_snake_case, unused_mut)]
+        impl<F, Fut, O, S, I, $($ty,)* $last> Service<Request<Body>>
+            for MapRequest<F, S, I, ( $($ty,)* $last, )>
+        where
+            F: Fn($($ty,)* $last) -> Fut + Clone + Send + Sync + 'static,
+            $( $ty: FromRequestParts<S> + Send + 'static, )*
+            $last: FromRequest<S> + Send + 'static,
+            Fut: Future<Output = O> + Send + 'static,
+            O: IntoMapRequestResult + Send + 'static,
+            I: Service<Request<Body>, Response = Response, Error = Infallible>
+                + Clone
+                + Send
+                + Sync
+                + 'static,
+            I::Future: Send + 'static,
+            S: Clone + Send + Sync + 'static,
+        {
+            type Response = Response;
+            type Error = Infallible;
+            type Future = MapRequestResponseFuture;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let f = self.f.clone();
-        let inner = self.inner.clone();
-        MapRequestResponseFuture(Box::pin(async move {
-            match f(req).await.into_map_request_result() {
-                Ok(req) => Ok(drive(inner, req).await),
-                Err(resp) => Ok(resp),
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
             }
-        }))
-    }
-}
 
-impl<F, Fut, O, S, I> Service<Request<Body>> for MapRequest<F, S, I, WithState>
-where
-    F: Fn(S, Request<Body>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = O> + Send + 'static,
-    O: IntoMapRequestResult + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-    I: Service<Request<Body>, Response = Response, Error = Infallible>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    I::Future: Send + 'static,
-{
-    type Response = Response;
-    type Error = Infallible;
-    type Future = MapRequestResponseFuture;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let f = self.f.clone();
-        let state = self.state.clone();
-        let inner = self.inner.clone();
-        MapRequestResponseFuture(Box::pin(async move {
-            match f(state, req).await.into_map_request_result() {
-                Ok(req) => Ok(drive(inner, req).await),
-                Err(resp) => Ok(resp),
+            fn call(&mut self, req: Request<Body>) -> Self::Future {
+                let f = self.f.clone();
+                let state = self.state.clone();
+                let inner = self.inner.clone();
+                let (mut parts, body) = req.into_parts();
+                MapRequestResponseFuture {
+                    inner: Box::pin(async move {
+                        $(
+                            let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &state).await {
+                                Ok(v) => v,
+                                Err(r) => return Ok(r.into_response()),
+                            };
+                        )*
+                        let req = Request::from_parts(parts, body);
+                        let $last = match <$last as FromRequest<S>>::from_request(req, &state).await {
+                            Ok(v) => v,
+                            Err(r) => return Ok(r.into_response()),
+                        };
+                        match f($($ty,)* $last).await.into_map_request_result() {
+                            Ok(req) => Ok(drive(inner, req).await),
+                            Err(resp) => Ok(resp),
+                        }
+                    }),
+                }
             }
-        }))
-    }
+        }
+    };
 }
 
-/// Response future for [`MapRequest`]. Matches
-/// `axum::middleware::future::MapRequestResponseFuture`.
-pub struct MapRequestResponseFuture(
-    Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
-);
+impl_map_request!(; A1);
+impl_map_request!(A1; A2);
+impl_map_request!(A1, A2; A3);
+impl_map_request!(A1, A2, A3; A4);
+impl_map_request!(A1, A2, A3, A4; A5);
+impl_map_request!(A1, A2, A3, A4, A5; A6);
+impl_map_request!(A1, A2, A3, A4, A5, A6; A7);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7; A8);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8; A9);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8, A9; A10);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10; A11);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11; A12);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12; A13);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13; A14);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14; A15);
+impl_map_request!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15; A16);
 
-impl std::fmt::Debug for MapRequestResponseFuture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapRequestResponseFuture")
-            .finish_non_exhaustive()
+/// Houses [`MapRequest`]'s response future under the local name `ResponseFuture` — see
+/// [`from_fn_future`] for why each middleware family gets its own module.
+mod map_request_future {
+    use super::{Context, Future, Infallible, Pin, Poll, Response};
+
+    /// Response future for [`super::MapRequest`]. Matches
+    /// `axum::middleware::future::ResponseFuture` (re-exported here as
+    /// [`super::MapRequestResponseFuture`]).
+    pub struct ResponseFuture {
+        pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
+    }
+
+    impl std::fmt::Debug for ResponseFuture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ResponseFuture").finish_non_exhaustive()
+        }
+    }
+
+    impl Future for ResponseFuture {
+        type Output = Result<Response, Infallible>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.get_mut().inner.as_mut().poll(cx)
+        }
     }
 }
-
-impl Future for MapRequestResponseFuture {
-    type Output = Result<Response, Infallible>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
-    }
-}
+pub use map_request_future::ResponseFuture as MapRequestResponseFuture;
 
 /// Lets a [`map_request`]/[`map_request_with_state`] closure return either a bare
 /// `Request<Body>` or a `Result<Request<Body>, R>`.
@@ -433,7 +432,7 @@ impl Future for MapRequestResponseFuture {
 /// A bare `Request<Body>` always continues the pipeline; `Result::Err(R)`
 /// short-circuits it with `R`'s response instead. Matches
 /// `axum::middleware::IntoMapRequestResult`.
-pub trait IntoMapRequestResult {
+pub trait IntoMapRequestResult<B = Body> {
     /// Normalizes into a `Result` so both return shapes can be handled uniformly.
     ///
     /// # Errors
@@ -441,17 +440,17 @@ pub trait IntoMapRequestResult {
     /// Returns the short-circuit response when the closure this was built from
     /// itself returned `Err`.
     #[allow(clippy::result_large_err)] // matches axum's own signature exactly
-    fn into_map_request_result(self) -> Result<Request<Body>, Response>;
+    fn into_map_request_result(self) -> Result<Request<B>, Response>;
 }
 
-impl IntoMapRequestResult for Request<Body> {
+impl IntoMapRequestResult<Body> for Request<Body> {
     #[allow(clippy::result_large_err)]
-    fn into_map_request_result(self) -> Result<Request<Body>, Response> {
+    fn into_map_request_result(self) -> Result<Self, Response> {
         Ok(self)
     }
 }
 
-impl<R> IntoMapRequestResult for Result<Request<Body>, R>
+impl<R> IntoMapRequestResult<Body> for Result<Request<Body>, R>
 where
     R: IntoResponse,
 {
@@ -491,30 +490,12 @@ impl<F: Clone, S: Clone, T> Clone for MapResponseLayer<F, S, T> {
 }
 
 /// Wraps `f` for use with `.layer()`/`.route_layer()`.
-pub const fn map_response<F, Fut, Res>(f: F) -> MapResponseLayer<F, (), NoState>
-where
-    F: Fn(Response) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-{
-    MapResponseLayer {
-        f,
-        state: (),
-        _extractor: PhantomData,
-    }
+pub const fn map_response<F, T>(f: F) -> MapResponseLayer<F, (), T> {
+    map_response_with_state((), f)
 }
 
 /// Wraps `f`, binding `state` as its first argument.
-pub const fn map_response_with_state<F, Fut, Res, S>(
-    state: S,
-    f: F,
-) -> MapResponseLayer<F, S, WithState>
-where
-    F: Fn(S, Response) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
+pub const fn map_response_with_state<F, S, T>(state: S, f: F) -> MapResponseLayer<F, S, T> {
     MapResponseLayer {
         f,
         state,
@@ -560,88 +541,107 @@ impl<F: Clone, S: Clone, I: Clone, T> Clone for MapResponse<F, S, I, T> {
     }
 }
 
-impl<F, Fut, Res, I> Service<Request<Body>> for MapResponse<F, (), I, NoState>
-where
-    F: Fn(Response) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    I: Service<Request<Body>, Response = Response, Error = Infallible>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    I::Future: Send + 'static,
-{
-    type Response = Response;
-    type Error = Infallible;
-    type Future = MapResponseResponseFuture;
+/// Generates one `Service<Request<Body>>` impl per leading-extractor arity for [`MapResponse`]:
+/// zero or more [`FromRequestParts`] extractors are run against the request before it's driven
+/// through the inner service, and their values are handed to `f` alongside the resulting
+/// [`Response`].
+macro_rules! impl_map_response {
+    ( $($ty:ident),* ) => {
+        #[allow(non_snake_case, unused_mut, unused_variables)]
+        impl<F, Fut, Res, S, I, $($ty,)*> Service<Request<Body>> for MapResponse<F, S, I, ( $($ty,)* )>
+        where
+            F: Fn($($ty,)* Response) -> Fut + Clone + Send + Sync + 'static,
+            $( $ty: FromRequestParts<S> + Send + 'static, )*
+            Fut: Future<Output = Res> + Send + 'static,
+            Res: IntoResponse + Send + 'static,
+            I: Service<Request<Body>, Response = Response, Error = Infallible>
+                + Clone
+                + Send
+                + Sync
+                + 'static,
+            I::Future: Send + 'static,
+            S: Clone + Send + Sync + 'static,
+        {
+            type Response = Response;
+            type Error = Infallible;
+            type Future = MapResponseResponseFuture;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let f = self.f.clone();
-        let inner = self.inner.clone();
-        MapResponseResponseFuture(Box::pin(async move {
-            let resp = drive(inner, req).await;
-            Ok(f(resp).await.into_response())
-        }))
-    }
+            fn call(&mut self, req: Request<Body>) -> Self::Future {
+                let f = self.f.clone();
+                let state = self.state.clone();
+                let inner = self.inner.clone();
+                let (mut parts, body) = req.into_parts();
+                MapResponseResponseFuture {
+                    inner: Box::pin(async move {
+                        $(
+                            let $ty = match <$ty as FromRequestParts<S>>::from_request_parts(&mut parts, &state).await {
+                                Ok(v) => v,
+                                Err(r) => return Ok(r.into_response()),
+                            };
+                        )*
+                        let req = Request::from_parts(parts, body);
+                        let resp = drive(inner, req).await;
+                        Ok(f($($ty,)* resp).await.into_response())
+                    }),
+                }
+            }
+        }
+    };
 }
 
-impl<F, Fut, Res, S, I> Service<Request<Body>> for MapResponse<F, S, I, WithState>
-where
-    F: Fn(S, Response) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Res> + Send + 'static,
-    Res: IntoResponse + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-    I: Service<Request<Body>, Response = Response, Error = Infallible>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    I::Future: Send + 'static,
-{
-    type Response = Response;
-    type Error = Infallible;
-    type Future = MapResponseResponseFuture;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let f = self.f.clone();
-        let state = self.state.clone();
-        let inner = self.inner.clone();
-        MapResponseResponseFuture(Box::pin(async move {
-            let resp = drive(inner, req).await;
-            Ok(f(state, resp).await.into_response())
-        }))
-    }
-}
-
-/// Response future for [`MapResponse`]. Matches
-/// `axum::middleware::future::MapResponseResponseFuture`.
-pub struct MapResponseResponseFuture(
-    Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
+impl_map_response!();
+impl_map_response!(A1);
+impl_map_response!(A1, A2);
+impl_map_response!(A1, A2, A3);
+impl_map_response!(A1, A2, A3, A4);
+impl_map_response!(A1, A2, A3, A4, A5);
+impl_map_response!(A1, A2, A3, A4, A5, A6);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7, A8);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7, A8, A9);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
+impl_map_response!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14);
+impl_map_response!(
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
+);
+impl_map_response!(
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16
 );
 
-impl std::fmt::Debug for MapResponseResponseFuture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MapResponseResponseFuture")
-            .finish_non_exhaustive()
+/// Houses [`MapResponse`]'s response future under the local name `ResponseFuture` — see
+/// [`from_fn_future`] for why each middleware family gets its own module.
+mod map_response_future {
+    use super::{Context, Future, Infallible, Pin, Poll, Response};
+
+    /// Response future for [`super::MapResponse`]. Matches
+    /// `axum::middleware::future::ResponseFuture` (re-exported here as
+    /// [`super::MapResponseResponseFuture`]).
+    pub struct ResponseFuture {
+        pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
+    }
+
+    impl std::fmt::Debug for ResponseFuture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ResponseFuture").finish_non_exhaustive()
+        }
+    }
+
+    impl Future for ResponseFuture {
+        type Output = Result<Response, Infallible>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.get_mut().inner.as_mut().poll(cx)
+        }
     }
 }
-
-impl Future for MapResponseResponseFuture {
-    type Output = Result<Response, Infallible>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
-    }
-}
+pub use map_response_future::ResponseFuture as MapResponseResponseFuture;
 
 // --- from_extractor / from_extractor_with_state ----------------------------
 
@@ -665,10 +665,7 @@ impl<E, S> std::fmt::Debug for FromExtractorLayer<E, S> {
 
 /// Builds the layer for extractor `E`, matching `axum::middleware::from_extractor::<E>()`.
 #[must_use]
-pub fn from_extractor<E>() -> FromExtractorLayer<E, ()>
-where
-    E: FromRequestParts<()> + Send + 'static,
-{
+pub const fn from_extractor<E>() -> FromExtractorLayer<E, ()> {
     FromExtractorLayer {
         state: (),
         _marker: PhantomData,
@@ -736,7 +733,7 @@ where
 {
     type Response = Response;
     type Error = Infallible;
-    type Future = FromExtractorResponseFuture;
+    type Future = FromExtractorResponseFuture<Body, T, E, S>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -745,43 +742,71 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let inner = self.inner.clone();
         let state = self.state.clone();
-        FromExtractorResponseFuture(Box::pin(async move {
-            let (mut parts, body) = req.into_parts();
-            match E::from_request_parts(&mut parts, &state).await {
-                Ok(_) => Ok(drive(inner, Request::from_parts(parts, body)).await),
-                Err(rejection) => Ok(rejection.into_response()),
-            }
-        }))
+        FromExtractorResponseFuture {
+            inner: Box::pin(async move {
+                let (mut parts, body) = req.into_parts();
+                match E::from_request_parts(&mut parts, &state).await {
+                    Ok(_) => Ok(drive(inner, Request::from_parts(parts, body)).await),
+                    Err(rejection) => Ok(rejection.into_response()),
+                }
+            }),
+            _marker: PhantomData,
+        }
     }
 }
 
-/// Response future for [`FromExtractor`]. Matches
-/// `axum::middleware::future::FromExtractorResponseFuture`.
-pub struct FromExtractorResponseFuture(
-    Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
-);
+/// Houses [`FromExtractor`]'s response future under the local name `ResponseFuture` — see
+/// [`from_fn_future`] for why each middleware family gets its own module.
+mod from_extractor_future {
+    use super::{
+        Context, FromRequestParts, Future, Infallible, PhantomData, Pin, Poll, Request, Response,
+        Service,
+    };
 
-impl std::fmt::Debug for FromExtractorResponseFuture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FromExtractorResponseFuture")
-            .finish_non_exhaustive()
+    /// The extractor-tuple marker `ResponseFuture` carries but never constructs.
+    type ExtractorMarker<B, T, E, S> = fn() -> (B, T, E, S);
+
+    /// Response future for [`super::FromExtractor`]. Matches
+    /// `axum::middleware::future::ResponseFuture` (re-exported here as
+    /// [`super::FromExtractorResponseFuture`]).
+    pub struct ResponseFuture<B, T, E, S>
+    where
+        E: FromRequestParts<S>,
+        T: Service<Request<B>>,
+        S: Sync,
+    {
+        pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
+        pub(super) _marker: PhantomData<ExtractorMarker<B, T, E, S>>,
+    }
+
+    impl<B, T, E, S> std::fmt::Debug for ResponseFuture<B, T, E, S>
+    where
+        E: FromRequestParts<S>,
+        T: Service<Request<B>>,
+        S: Sync,
+    {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ResponseFuture").finish_non_exhaustive()
+        }
+    }
+
+    impl<B, T, E, S> Future for ResponseFuture<B, T, E, S>
+    where
+        E: FromRequestParts<S>,
+        T: Service<Request<B>>,
+        S: Sync,
+    {
+        type Output = Result<Response, Infallible>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.get_mut().inner.as_mut().poll(cx)
+        }
     }
 }
-
-impl Future for FromExtractorResponseFuture {
-    type Output = Result<Response, Infallible>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.as_mut().poll(cx)
-    }
-}
+pub use from_extractor_future::ResponseFuture as FromExtractorResponseFuture;
 
 /// Builds the layer for extractor `E`, bound to `state`.
-pub fn from_extractor_with_state<E, S>(state: S) -> FromExtractorLayer<E, S>
-where
-    E: FromRequestParts<S> + Send + 'static,
-    S: Clone + Send + Sync + 'static,
-{
+pub const fn from_extractor_with_state<E, S>(state: S) -> FromExtractorLayer<E, S> {
     FromExtractorLayer {
         state,
         _marker: PhantomData,
@@ -795,7 +820,7 @@ mod tests {
     use hyper::StatusCode;
 
     fn route_returning(body: &'static str) -> Route {
-        Route::from_handler(move || async move { body }, std::sync::Arc::new(()))
+        Route::from_handler(move || async move { body }, &std::sync::Arc::new(()))
     }
 
     #[tokio::test]
@@ -806,7 +831,7 @@ mod tests {
             resp
         }
 
-        let mut svc = from_fn(tag).layer(route_returning("hi"));
+        let mut svc = from_fn::<_, (Request<Body>,)>(tag).layer(route_returning("hi"));
         let req = Request::builder().body(Body::empty()).unwrap();
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.headers().get("x-tag").unwrap(), "hit");
@@ -814,14 +839,23 @@ mod tests {
 
     #[tokio::test]
     async fn from_fn_with_state_hands_state_to_the_closure() {
-        async fn tag(state: std::sync::Arc<str>, req: Request<Body>, next: Next) -> Response {
+        use crate::routing::extract::State;
+
+        async fn tag(
+            State(state): State<std::sync::Arc<str>>,
+            req: Request<Body>,
+            next: Next,
+        ) -> Response {
             let mut resp = next.run(req).await;
             resp.headers_mut().insert("x-state", state.parse().unwrap());
             resp
         }
 
-        let mut svc = from_fn_with_state(std::sync::Arc::<str>::from("bound"), tag)
-            .layer(route_returning("hi"));
+        let mut svc = from_fn_with_state::<_, _, (State<std::sync::Arc<str>>, Request<Body>)>(
+            std::sync::Arc::<str>::from("bound"),
+            tag,
+        )
+        .layer(route_returning("hi"));
         let req = Request::builder().body(Body::empty()).unwrap();
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.headers().get("x-state").unwrap(), "bound");
@@ -844,10 +878,10 @@ mod tests {
                     "ok"
                 }
             },
-            std::sync::Arc::new(()),
+            &std::sync::Arc::new(()),
         );
 
-        let mut svc = map_request(add_header).layer(route);
+        let mut svc = map_request::<_, (Request<Body>,)>(add_header).layer(route);
         let req = Request::builder().body(Body::empty()).unwrap();
         svc.call(req).await.unwrap();
         assert_eq!(seen_header.lock().unwrap().as_ref().unwrap(), "yes");
@@ -861,7 +895,7 @@ mod tests {
             resp
         }
 
-        let mut svc = map_response(tag).layer(route_returning("hi"));
+        let mut svc = map_response::<_, ()>(tag).layer(route_returning("hi"));
         let req = Request::builder().body(Body::empty()).unwrap();
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.headers().get("x-mapped").unwrap(), "yes");

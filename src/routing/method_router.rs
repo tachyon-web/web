@@ -130,11 +130,11 @@ where
     fn set<H, T>(mut self, idx: usize, handler: H) -> Self
     where
         H: Handler<T, S>,
-        T: Send + 'static,
+        T: 'static,
     {
         if let Some(slot) = self.handlers.get_mut(idx) {
             *slot = Some(Arc::new(move |state: Arc<S>| {
-                Route::from_handler(handler.clone(), state)
+                Route::from_handler(handler.clone(), &state)
             }));
         }
         self
@@ -237,13 +237,15 @@ where
         if headers.is_empty() {
             return self;
         }
-        self.layer(middleware::from_fn(move |req, next| {
-            let headers = headers.clone();
-            async move {
-                fire_early_hints(&req, headers);
-                next.run(req).await
-            }
-        }))
+        self.layer(middleware::from_fn(
+            move |req: crate::http::Request, next: middleware::Next| {
+                let headers = headers.clone();
+                async move {
+                    fire_early_hints(&req, headers);
+                    next.run(req).await
+                }
+            },
+        ))
     }
 
     /// Materializes every `BoxedIntoRoute<S>` slot into a concrete, state-free
@@ -347,7 +349,7 @@ macro_rules! method_routes {
                 pub fn $name<H, T>(self, handler: H) -> Self
                 where
                     H: Handler<T, S>,
-                    T: Send + 'static,
+                    T: 'static,
                 {
                     self.set($idx, handler)
                 }
@@ -389,10 +391,10 @@ macro_rules! method_routes {
 
         $(
             #[doc = concat!("Helper to construct a ", $verb, "-only route.")]
-            pub fn $name<H, T, S>(handler: H) -> MethodRouter<S>
+            pub fn $name<H, T, S>(handler: H) -> MethodRouter<S, std::convert::Infallible>
             where
                 H: Handler<T, S>,
-                T: Send + 'static,
+                T: 'static,
                 S: Clone + Send + Sync + 'static,
             {
                 MethodRouter::new().$name(handler)
@@ -420,10 +422,10 @@ macro_rules! method_routes {
         )+
 
         /// A route dispatching every HTTP method to `handler`, matching `axum::routing::any`.
-        pub fn any<H, T, S>(handler: H) -> MethodRouter<S>
+        pub fn any<H, T, S>(handler: H) -> MethodRouter<S, std::convert::Infallible>
         where
             H: Handler<T, S>,
-            T: Send + 'static,
+            T: 'static,
             S: Clone + Send + Sync + 'static,
         {
             let router = MethodRouter::new();
@@ -516,7 +518,7 @@ where
     pub fn on<H, T>(mut self, filter: MethodFilter, handler: H) -> Self
     where
         H: Handler<T, S>,
-        T: Send + 'static,
+        T: 'static,
     {
         let indices: Vec<usize> = (0..METHOD_COUNT)
             .filter(|&idx| filter.contains_idx(idx))
@@ -577,10 +579,10 @@ where
 
 /// Helper to construct a route for every HTTP method set in `filter`, matching
 /// `axum::routing::on`.
-pub fn on<H, T, S>(filter: MethodFilter, handler: H) -> MethodRouter<S>
+pub fn on<H, T, S>(filter: MethodFilter, handler: H) -> MethodRouter<S, std::convert::Infallible>
 where
     H: Handler<T, S>,
-    T: Send + 'static,
+    T: 'static,
     S: Clone + Send + Sync + 'static,
 {
     MethodRouter::new().on(filter, handler)
