@@ -737,6 +737,31 @@ where
     }
 }
 
+impl<S: Sync, T> super::OptionalFromRequestParts<S> for Path<T>
+where
+    T: DeserializeOwned + Send + Sync + 'static,
+{
+    type Rejection = rejection::PathRejection;
+
+    async fn from_request_parts(
+        parts: &mut hyper::http::request::Parts,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        match <Self as FromRequestParts<S>>::from_request_parts(parts, state).await {
+            Ok(path) => Ok(Some(path)),
+            Err(rejection::PathRejection::FailedToDeserializePathParams(e))
+                if matches!(
+                    e.kind(),
+                    rejection::ErrorKind::WrongNumberOfParameters { got: 0, .. }
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Extractor for the raw, un-deserialized path parameters as `(key, value)`
 /// string pairs, bypassing [`Path`]'s `serde` deserialization step entirely.
 /// Matches `axum::extract::RawPathParams`.

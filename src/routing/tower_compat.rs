@@ -90,7 +90,7 @@ impl<E> Route<E> {
         RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
         RespBody::Error: Into<Error>,
     {
-        Route::new(Normalize(layer.layer(self)))
+        Route::new(ResponseAxumBodyLayer::new().layer(layer.layer(self)))
     }
 }
 
@@ -189,19 +189,27 @@ impl Future for InfallibleRouteFuture {
     }
 }
 
-/// Wraps an arbitrary `tower::Service` (typically a freshly-layered one) so
-/// its response body and error type are normalized to what [`Route`] needs
-/// (`Response<Body>`, `Error = Infallible`) before being boxed back into one.
-/// The one normalization point every layer application funnels through.
-struct Normalize<S>(S);
+/// Wraps an arbitrary `tower::Service` (typically a freshly-layered one) so its response
+/// body and error type are normalized to what [`Route`] needs.
+///
+/// Normalizes to `Response<Body>`/`Error = Infallible` before being boxed back into a
+/// `Route` — the one normalization point every layer application funnels through. Matches
+/// `axum::middleware::ResponseAxumBody`. Built via [`ResponseAxumBodyLayer`].
+pub struct ResponseAxumBody<S>(S);
 
-impl<S: Clone> Clone for Normalize<S> {
+impl<S: Clone> Clone for ResponseAxumBody<S> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<S, RespBody> Service<Request<Body>> for Normalize<S>
+impl<S> std::fmt::Debug for ResponseAxumBody<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseAxumBody").finish_non_exhaustive()
+    }
+}
+
+impl<S, RespBody> Service<Request<Body>> for ResponseAxumBody<S>
 where
     S: Service<Request<Body>, Response = Response<RespBody>> + Clone + Send + Sync + 'static,
     S::Future: Send + 'static,
@@ -211,7 +219,7 @@ where
 {
     type Response = Response<Body>;
     type Error = Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>;
+    type Future = ResponseAxumBodyFuture;
 
     /// Readiness failures are deferred into `call` (via `ServiceExt::ready` there) rather
     /// than surfaced here, matching the rest of this module: a `Route` must never itself
@@ -224,7 +232,7 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let clone = self.0.clone();
         let mut inner = std::mem::replace(&mut self.0, clone);
-        Box::pin(async move {
+        ResponseAxumBodyFuture(Box::pin(async move {
             let result = match inner.ready().await {
                 Ok(ready) => ready.call(req).await,
                 Err(e) => Err(e),
@@ -236,7 +244,49 @@ where
                 }
                 Err(e) => Into::<Error>::into(e).into_response(),
             })
-        })
+        }))
+    }
+}
+
+/// Response future for [`ResponseAxumBody`]. Matches
+/// `axum::middleware::ResponseAxumBodyFuture`.
+pub struct ResponseAxumBodyFuture(
+    Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
+);
+
+impl std::fmt::Debug for ResponseAxumBodyFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseAxumBodyFuture")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Future for ResponseAxumBodyFuture {
+    type Output = Result<Response<Body>, Infallible>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+/// `tower::Layer` producing [`ResponseAxumBody`]. Matches
+/// `axum::middleware::ResponseAxumBodyLayer`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResponseAxumBodyLayer;
+
+impl ResponseAxumBodyLayer {
+    /// Builds the layer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl<S> Layer<S> for ResponseAxumBodyLayer {
+    type Service = ResponseAxumBody<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ResponseAxumBody(inner)
     }
 }
 
@@ -355,7 +405,7 @@ where
 {
     type Response = Response<Body>;
     type Error = Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>;
+    type Future = IntoServiceFuture;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -364,19 +414,39 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let handler = self.handler.clone();
         let state = Arc::clone(&self.state);
-        Box::pin(async move { Ok(handler.call(req, state).await) })
+        IntoServiceFuture(Box::pin(async move { Ok(handler.call(req, state).await) }))
+    }
+}
+
+/// Response future for [`HandlerService`]'s `Service` impl. Matches
+/// `axum::handler::future::IntoServiceFuture`.
+pub struct IntoServiceFuture(
+    Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
+);
+
+impl std::fmt::Debug for IntoServiceFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntoServiceFuture").finish_non_exhaustive()
+    }
+}
+
+impl Future for IntoServiceFuture {
+    type Output = Result<Response<Body>, Infallible>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
     }
 }
 
 /// A handler wrapped with a `tower::Layer`, matching `axum::handler::Handler::layer` —
 /// produced by [`HandlerExt::layer`].
-pub struct LayeredHandler<L, H, T, S> {
+pub struct Layered<L, H, T, S> {
     layer: L,
     handler: H,
     _marker: PhantomData<fn() -> (T, S)>,
 }
 
-impl<L: Clone, H: Clone, T, S> Clone for LayeredHandler<L, H, T, S> {
+impl<L: Clone, H: Clone, T, S> Clone for Layered<L, H, T, S> {
     fn clone(&self) -> Self {
         Self {
             layer: self.layer.clone(),
@@ -386,13 +456,13 @@ impl<L: Clone, H: Clone, T, S> Clone for LayeredHandler<L, H, T, S> {
     }
 }
 
-impl<L, H, T, S> std::fmt::Debug for LayeredHandler<L, H, T, S> {
+impl<L, H, T, S> std::fmt::Debug for Layered<L, H, T, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LayeredHandler").finish_non_exhaustive()
+        f.debug_struct("Layered").finish_non_exhaustive()
     }
 }
 
-impl<L, H, T, S, RespBody> Handler<T, S> for LayeredHandler<L, H, T, S>
+impl<L, H, T, S, RespBody> Handler<T, S> for Layered<L, H, T, S>
 where
     H: Handler<T, S> + Clone,
     S: Send + Sync + 'static,
@@ -411,7 +481,7 @@ where
             _marker: PhantomData,
         };
         let mut layered = self.layer.layer(inner);
-        ResponseFuture::Boxed(Box::pin(async move {
+        let fut = LayeredFuture(Box::pin(async move {
             match layered.ready().await {
                 Ok(ready) => match ready.call(req).await {
                     Ok(resp) => {
@@ -422,7 +492,26 @@ where
                 },
                 Err(e) => Into::<Error>::into(e).into_response(),
             }
-        }))
+        }));
+        ResponseFuture::Boxed(Box::pin(fut))
+    }
+}
+
+/// The future backing [`Layered`]'s `Handler::call`, produced while awaiting its
+/// wrapped `tower::Layer` pipeline. Matches `axum::handler::future::LayeredFuture`.
+pub struct LayeredFuture(Pin<Box<dyn Future<Output = Response<Body>> + Send>>);
+
+impl std::fmt::Debug for LayeredFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayeredFuture").finish_non_exhaustive()
+    }
+}
+
+impl Future for LayeredFuture {
+    type Output = Response<Body>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.as_mut().poll(cx)
     }
 }
 
@@ -430,12 +519,12 @@ where
 pub trait HandlerExt<T, S>: Handler<T, S> {
     /// Wraps this handler with a `tower::Layer`, matching
     /// `axum::handler::Handler::layer`.
-    fn layer<L>(self, layer: L) -> LayeredHandler<L, Self, T, S>
+    fn layer<L>(self, layer: L) -> Layered<L, Self, T, S>
     where
         Self: Sized,
         L: Layer<HandlerService<Self, T, S>> + Clone + Send + Sync + 'static,
     {
-        LayeredHandler {
+        Layered {
             layer,
             handler: self,
             _marker: PhantomData,
@@ -457,6 +546,33 @@ pub trait HandlerExt<T, S>: Handler<T, S> {
 }
 
 impl<H, T, S> HandlerExt<T, S> for H where H: Handler<T, S> {}
+
+/// Adds `Handler::into_service`/`Handler::into_make_service` sugar for stateless handlers.
+///
+/// Applies to handlers already at `Handler<T, ()>`, skipping the explicit
+/// `.with_state(())` call that [`HandlerExt::with_state`] otherwise requires. Matches
+/// `axum::handler::HandlerWithoutStateExt`.
+pub trait HandlerWithoutStateExt<T>: Handler<T, ()> {
+    /// Converts this handler directly into a `tower::Service`, matching
+    /// `axum::handler::HandlerWithoutStateExt::into_service`.
+    fn into_service(self) -> HandlerService<Self, T, ()>
+    where
+        Self: Sized,
+    {
+        self.with_state(())
+    }
+
+    /// Converts this handler directly into a `tower::make::MakeService`, matching
+    /// `axum::handler::HandlerWithoutStateExt::into_make_service`.
+    fn into_make_service(self) -> IntoMakeService<HandlerService<Self, T, ()>>
+    where
+        Self: Sized,
+    {
+        self.into_service().into_make_service()
+    }
+}
+
+impl<H, T> HandlerWithoutStateExt<T> for H where H: Handler<T, ()> {}
 
 /// Lets an uncompiled, stateless [`crate::routing::Router`] be driven
 /// directly as a `tower::Service` — e.g. `Router::new().route(...).oneshot(req)`
@@ -687,13 +803,27 @@ impl<S> Future for IntoMakeServiceFuture<S> {
 }
 
 /// Extension trait adding a couple of extra methods to any `tower::Service`.
-///
-/// Matches `axum::ServiceExt` (minus `into_make_service_with_connect_info`, which needs
-/// the `ConnectInfo`/`Listener` genericization this crate hasn't ported yet).
+/// Matches `axum::ServiceExt`.
 pub trait ServiceExt<R>: Service<R> + Sized {
     /// Converts this service into a `tower::make::MakeService`. Matches
     /// `axum::ServiceExt::into_make_service`.
     fn into_make_service(self) -> IntoMakeService<Self>;
+
+    /// Converts this service into a `tower::make::MakeService` that also derives a
+    /// [`ConnectInfo<C>`](crate::routing::extract::ConnectInfo) from each accepted
+    /// [`IncomingStream`] and inserts it into every request. Matches
+    /// `axum::ServiceExt::into_make_service_with_connect_info`.
+    ///
+    /// [`Server`](crate::server::Server) doesn't need this — it injects `ConnectInfo`
+    /// directly on every request as it accepts each connection. This exists for
+    /// embedding a bare `tower::Service` (e.g. a [`Router`](crate::routing::Router))
+    /// under a different accept loop that only hands you the raw socket addresses.
+    fn into_make_service_with_connect_info<C>(self) -> IntoMakeServiceWithConnectInfo<Self, C> {
+        IntoMakeServiceWithConnectInfo {
+            svc: self,
+            _marker: PhantomData,
+        }
+    }
 
     /// Converts this service into a [`crate::routing::error_handling::HandleError`], which
     /// handles its errors by converting them into responses. Matches
@@ -709,6 +839,169 @@ where
 {
     fn into_make_service(self) -> IntoMakeService<Self> {
         IntoMakeService::new(self)
+    }
+}
+
+/// A connection accepted by the caller's own accept loop.
+///
+/// Handed to a `MakeService` built via
+/// [`ServiceExt::into_make_service_with_connect_info`]. Matches
+/// `axum::serve::IncomingStream` — deliberately minimal, just the two addresses.
+#[derive(Debug, Clone, Copy)]
+pub struct IncomingStream {
+    remote_addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
+}
+
+impl IncomingStream {
+    /// Builds an `IncomingStream` from an accepted connection's addresses.
+    #[must_use]
+    pub const fn new(remote_addr: std::net::SocketAddr, local_addr: std::net::SocketAddr) -> Self {
+        Self {
+            remote_addr,
+            local_addr,
+        }
+    }
+
+    /// The peer's address.
+    #[must_use]
+    pub const fn remote_addr(&self) -> std::net::SocketAddr {
+        self.remote_addr
+    }
+
+    /// The local address the connection was accepted on.
+    #[must_use]
+    pub const fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+}
+
+/// Derives a [`ConnectInfo`](crate::routing::extract::ConnectInfo) payload from an
+/// accepted connection. Matches `axum::extract::connect_info::Connected`.
+pub trait Connected<T>: Clone + Send + Sync + 'static {
+    /// Builds the connect-info value for this connection.
+    fn connect_info(target: T) -> Self;
+}
+
+impl Connected<IncomingStream> for std::net::SocketAddr {
+    fn connect_info(target: IncomingStream) -> Self {
+        target.remote_addr
+    }
+}
+
+/// A `tower::Service` that inserts a fixed connect-info value into every request.
+///
+/// Wraps the request with [`ConnectInfo<C>`](crate::routing::extract::ConnectInfo)
+/// before forwarding it to the inner service. Built via
+/// [`IntoMakeServiceWithConnectInfo`]'s `Service<IncomingStream>` impl, or directly via
+/// [`MockConnectInfo`] for tests.
+pub struct ConnectInfoService<S, C> {
+    svc: S,
+    connect_info: C,
+}
+
+impl<S: Clone, C: Clone> Clone for ConnectInfoService<S, C> {
+    fn clone(&self) -> Self {
+        Self {
+            svc: self.svc.clone(),
+            connect_info: self.connect_info.clone(),
+        }
+    }
+}
+
+impl<S, C> std::fmt::Debug for ConnectInfoService<S, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectInfoService").finish_non_exhaustive()
+    }
+}
+
+impl<S, C> Service<Request<Body>> for ConnectInfoService<S, C>
+where
+    S: Service<Request<Body>>,
+    C: Clone + Send + Sync + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.svc.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        req.extensions_mut()
+            .insert(crate::routing::extract::ConnectInfo(
+                self.connect_info.clone(),
+            ));
+        self.svc.call(req)
+    }
+}
+
+/// A `tower::make::MakeService` that clones out a fresh copy of the wrapped service.
+///
+/// Tags each clone with `ConnectInfo<C>` derived from its accepted [`IncomingStream`].
+/// Matches `axum::extract::connect_info::IntoMakeServiceWithConnectInfo`. Built via
+/// [`ServiceExt::into_make_service_with_connect_info`].
+pub struct IntoMakeServiceWithConnectInfo<S, C> {
+    svc: S,
+    _marker: PhantomData<fn() -> C>,
+}
+
+impl<S: Clone, C> Clone for IntoMakeServiceWithConnectInfo<S, C> {
+    fn clone(&self) -> Self {
+        Self {
+            svc: self.svc.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S, C> std::fmt::Debug for IntoMakeServiceWithConnectInfo<S, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntoMakeServiceWithConnectInfo")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S, C> Service<IncomingStream> for IntoMakeServiceWithConnectInfo<S, C>
+where
+    S: Clone,
+    C: Connected<IncomingStream>,
+{
+    type Response = ConnectInfoService<S, C>;
+    type Error = Infallible;
+    type Future = std::future::Ready<Result<Self::Response, Infallible>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, target: IncomingStream) -> Self::Future {
+        let connect_info = C::connect_info(target);
+        std::future::ready(Ok(ConnectInfoService {
+            svc: self.svc.clone(),
+            connect_info,
+        }))
+    }
+}
+
+/// A `tower::Layer` that unconditionally inserts a fixed connect-info value.
+///
+/// Wraps every request with a fixed
+/// [`ConnectInfo<C>`](crate::routing::extract::ConnectInfo) — for testing handlers
+/// that use `ConnectInfo` without going through a real accept loop. Matches
+/// `axum::extract::connect_info::MockConnectInfo`.
+#[derive(Debug, Clone, Copy)]
+pub struct MockConnectInfo<C>(pub C);
+
+impl<C: Clone, S> Layer<S> for MockConnectInfo<C> {
+    type Service = ConnectInfoService<S, C>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConnectInfoService {
+            svc: inner,
+            connect_info: self.0.clone(),
+        }
     }
 }
 

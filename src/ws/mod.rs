@@ -62,6 +62,7 @@ use tungstenite::handshake::derive_accept_key;
 
 pub use deflate::DeflateConfig;
 pub use socket::{Message, WebSocket};
+pub use tungstenite::protocol::frame::Utf8Bytes;
 pub use tungstenite::protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode};
 
 /// Named WebSocket close-code constants (RFC 6455 §7.4).

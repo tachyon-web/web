@@ -132,6 +132,17 @@ impl IntoResponse for FailedToBufferBody {
     }
 }
 
+leaf_rejection! {
+    /// A body-extraction failure that doesn't fit any of the more specific rejection
+    /// variants above. Matches `axum_core::extract::rejection::UnknownBodyError`.
+    ///
+    /// Tachyon-web's own [`Body::collect_bytes`](crate::http::response::Body::collect_bytes)
+    /// already classifies every failure as either [`LengthLimitError`] or
+    /// [`FailedToBufferBody`], so this type is never constructed internally — it exists for
+    /// structural parity with axum, for callers building their own composite rejections.
+    pub struct UnknownBodyError => INTERNAL_SERVER_ERROR
+}
+
 composite_rejection! {
     /// Rejection for the raw [`bytes::Bytes`] extractor. Matches
     /// `axum_core::extract::rejection::BytesRejection`.

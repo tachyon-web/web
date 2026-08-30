@@ -448,16 +448,17 @@ fn make_path_parts(params: Vec<(&str, &str)>) -> hyper::http::request::Parts {
 #[tokio::test]
 async fn test_path_tuple_success_and_length_mismatch() {
     let mut ok_parts = make_path_parts(vec![("id", "42"), ("name", "hello")]);
-    let Path((id, name)) = Path::<(u32, String)>::from_request_parts(&mut ok_parts, &())
-        .await
-        .unwrap();
+    let Path((id, name)) =
+        <Path<(u32, String)> as FromRequestParts<()>>::from_request_parts(&mut ok_parts, &())
+            .await
+            .unwrap();
     assert_eq!(id, 42);
     assert_eq!(name, "hello");
 
     // Too many params for a 2-tuple.
     let mut too_many = make_path_parts(vec![("a", "1"), ("b", "2"), ("c", "3")]);
     assert!(
-        Path::<(u32, String)>::from_request_parts(&mut too_many, &())
+        <Path<(u32, String)> as FromRequestParts<()>>::from_request_parts(&mut too_many, &())
             .await
             .is_err()
     );
@@ -465,7 +466,7 @@ async fn test_path_tuple_success_and_length_mismatch() {
     // Too few params for a 2-tuple.
     let mut too_few = make_path_parts(vec![("a", "1")]);
     assert!(
-        Path::<(u32, String)>::from_request_parts(&mut too_few, &())
+        <Path<(u32, String)> as FromRequestParts<()>>::from_request_parts(&mut too_few, &())
             .await
             .is_err()
     );
@@ -476,9 +477,10 @@ async fn test_path_vec_seq_target() {
     // `Vec<T>` reaches `deserialize_seq` directly (not via tuple delegation),
     // and its `Deserialize` impl calls `SeqAccess::size_hint` to preallocate.
     let mut parts = make_path_parts(vec![("a", "x"), ("b", "y"), ("c", "z")]);
-    let Path(values) = Path::<Vec<String>>::from_request_parts(&mut parts, &())
-        .await
-        .unwrap();
+    let Path(values) =
+        <Path<Vec<String>> as FromRequestParts<()>>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
     assert_eq!(
         values,
         vec!["x".to_string(), "y".to_string(), "z".to_string()]
@@ -509,7 +511,7 @@ async fn test_path_scalar_wrong_param_count() {
     // Zero params for a bare scalar target.
     let mut zero = make_path_parts(vec![]);
     assert!(
-        Path::<u32>::from_request_parts(&mut zero, &())
+        <Path<u32> as FromRequestParts<()>>::from_request_parts(&mut zero, &())
             .await
             .is_err()
     );
@@ -517,14 +519,14 @@ async fn test_path_scalar_wrong_param_count() {
     // More than one param for a bare scalar target.
     let mut two = make_path_parts(vec![("a", "1"), ("b", "2")]);
     assert!(
-        Path::<u32>::from_request_parts(&mut two, &())
+        <Path<u32> as FromRequestParts<()>>::from_request_parts(&mut two, &())
             .await
             .is_err()
     );
 
     // Exactly one param succeeds.
     let mut one = make_path_parts(vec![("id", "7")]);
-    let Path(v) = Path::<u32>::from_request_parts(&mut one, &())
+    let Path(v) = <Path<u32> as FromRequestParts<()>>::from_request_parts(&mut one, &())
         .await
         .unwrap();
     assert_eq!(v, 7);
@@ -540,7 +542,7 @@ async fn test_path_error_kind_pinpoints_the_failing_field_or_index() {
     }
 
     let mut struct_target = make_path_parts(vec![("a", "1"), ("b", "not-a-number")]);
-    let err = Path::<Params>::from_request_parts(&mut struct_target, &())
+    let err = <Path<Params> as FromRequestParts<()>>::from_request_parts(&mut struct_target, &())
         .await
         .unwrap_err();
     let rejection::PathRejection::FailedToDeserializePathParams(err) = err else {
@@ -554,9 +556,10 @@ async fn test_path_error_kind_pinpoints_the_failing_field_or_index() {
     ));
 
     let mut tuple_target = make_path_parts(vec![("a", "true"), ("b", "nope")]);
-    let err = Path::<(bool, u32)>::from_request_parts(&mut tuple_target, &())
-        .await
-        .unwrap_err();
+    let err =
+        <Path<(bool, u32)> as FromRequestParts<()>>::from_request_parts(&mut tuple_target, &())
+            .await
+            .unwrap_err();
     let rejection::PathRejection::FailedToDeserializePathParams(err) = err else {
         panic!("expected FailedToDeserializePathParams");
     };
@@ -570,7 +573,7 @@ async fn test_path_error_kind_pinpoints_the_failing_field_or_index() {
     ));
 
     let mut scalar_target = make_path_parts(vec![("id", "nope")]);
-    let err = Path::<u32>::from_request_parts(&mut scalar_target, &())
+    let err = <Path<u32> as FromRequestParts<()>>::from_request_parts(&mut scalar_target, &())
         .await
         .unwrap_err();
     let rejection::PathRejection::FailedToDeserializePathParams(err) = err else {
@@ -593,7 +596,7 @@ async fn test_path_option_top_level_target() {
     // `MapDeserializer`/`CoercingCowDeserializer` without ever calling back into
     // `PathDeserializer::deserialize_option`).
     let mut parts = make_path_parts(vec![("id", "9")]);
-    let Path(v) = Path::<Option<u32>>::from_request_parts(&mut parts, &())
+    let Path(v) = <Path<Option<u32>> as FromRequestParts<()>>::from_request_parts(&mut parts, &())
         .await
         .unwrap();
     assert_eq!(v, Some(9));
@@ -602,7 +605,7 @@ async fn test_path_option_top_level_target() {
 #[tokio::test]
 async fn test_path_enum_target() {
     let mut parts = make_path_parts(vec![("color", "Red")]);
-    let Path(c) = Path::<Color>::from_request_parts(&mut parts, &())
+    let Path(c) = <Path<Color> as FromRequestParts<()>>::from_request_parts(&mut parts, &())
         .await
         .unwrap();
     assert_eq!(c, Color::Red);
@@ -615,16 +618,17 @@ async fn test_path_unit_and_unit_struct_targets() {
 
     // `()` as the whole target reaches `deserialize_unit` and ignores any params.
     let mut parts = make_path_parts(vec![("a", "1"), ("b", "2")]);
-    let Path(unit_val) = Path::<()>::from_request_parts(&mut parts, &())
+    let Path(unit_val) = <Path<()> as FromRequestParts<()>>::from_request_parts(&mut parts, &())
         .await
         .unwrap();
     assert_eq!(unit_val, ());
 
     // A derived unit struct reaches `deserialize_unit_struct`.
     let mut empty_parts = make_path_parts(vec![]);
-    let Path(u) = Path::<UnitStruct>::from_request_parts(&mut empty_parts, &())
-        .await
-        .unwrap();
+    let Path(u) =
+        <Path<UnitStruct> as FromRequestParts<()>>::from_request_parts(&mut empty_parts, &())
+            .await
+            .unwrap();
     assert_eq!(u, UnitStruct);
 }
 
@@ -634,9 +638,10 @@ async fn test_path_newtype_struct_target() {
     struct Wrapper(u32);
 
     let mut parts = make_path_parts(vec![("id", "77")]);
-    let Path(Wrapper(v)) = Path::<Wrapper>::from_request_parts(&mut parts, &())
-        .await
-        .unwrap();
+    let Path(Wrapper(v)) =
+        <Path<Wrapper> as FromRequestParts<()>>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
     assert_eq!(v, 77);
 }
 
@@ -645,7 +650,9 @@ async fn test_path_ignored_any_top_level_target() {
     // `IgnoredAny`'s `Deserialize` impl calls `deserialize_ignored_any` directly on the
     // top-level deserializer.
     let mut parts = make_path_parts(vec![("a", "1"), ("b", "2")]);
-    let result = Path::<serde::de::IgnoredAny>::from_request_parts(&mut parts, &()).await;
+    let result =
+        <Path<serde::de::IgnoredAny> as FromRequestParts<()>>::from_request_parts(&mut parts, &())
+            .await;
     assert!(result.is_ok());
 }
 

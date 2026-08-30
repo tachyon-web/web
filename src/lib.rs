@@ -247,6 +247,8 @@ pub mod tls;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+/// Re-export of [`bytes::Bytes`], matching `axum::body::Bytes`.
+pub use bytes::Bytes;
 pub use http::compression::{self, Compression, CompressionLevel, Encoding};
 #[cfg(feature = "early-hints")]
 pub use http::early_hints::{self, EarlyHints, EarlyHintsConfig, Link};
@@ -256,6 +258,8 @@ pub use http::response::{
     AppendHeaders, ErrorResponse, Html, IntoResponse, IntoResponseParts, NoContent, Redirect,
     ResponseParts, TryIntoHeaderError, to_bytes,
 };
+/// Re-export of the `http_body::Body` trait, matching `axum::body::HttpBody`.
+pub use hyper::body::Body as HttpBody;
 pub use routing::error_handling;
 pub use routing::extract;
 #[cfg(feature = "cookies")]

@@ -117,6 +117,20 @@ where
     }
 }
 
+impl<S: Sync, T> super::OptionalFromRequestParts<S> for Extension<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    type Rejection = std::convert::Infallible;
+
+    fn from_request_parts(
+        parts: &mut hyper::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Option<Self>, Self::Rejection>> + Send {
+        std::future::ready(Ok(parts.extensions.get::<T>().cloned().map(Extension)))
+    }
+}
+
 /// A `tower::Layer` inserting a fixed, cloneable value into every incoming
 /// request's extensions. Matches `Extension<T>`'s `tower::Layer` impl in axum
 /// — the layer form of the [`Extension`] extractor above, for a value bound
@@ -332,6 +346,18 @@ impl<S: Sync> FromRequestParts<S> for MatchedPath {
                 .into()
             })
         })
+    }
+}
+
+#[cfg(feature = "matched-path")]
+impl<S: Sync> super::OptionalFromRequestParts<S> for MatchedPath {
+    type Rejection = std::convert::Infallible;
+
+    fn from_request_parts(
+        parts: &mut hyper::http::request::Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Option<Self>, Self::Rejection>> + Send {
+        std::future::ready(Ok(parts.extensions.get::<Self>().cloned()))
     }
 }
 

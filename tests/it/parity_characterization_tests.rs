@@ -100,6 +100,7 @@ mod core_error_response_shape {
     }
 }
 
+#[cfg(feature = "http1")]
 mod path_extractor_rejection_text {
     use crate::common::TestServer;
     use tachyon_web::routing::extract::Path;

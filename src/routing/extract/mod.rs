@@ -148,39 +148,74 @@ impl_from_request_via_parts!(Query<T>, T: serde::de::DeserializeOwned + Send + S
 impl_from_request_via_parts!(Extension<T>, T: Clone + Send + Sync + 'static);
 impl_from_request_via_parts!(ConnectInfo<T>, T: Clone + Send + Sync + 'static);
 
-/// `Option<T>` succeeds with `None` wherever `T` would fail, for any
-/// extractor. Matches the effect of Axum's `OptionalFromRequestParts`/
-/// `OptionalFromRequest` blanket impls, simplified: Axum lets an individual
-/// extractor override *which* rejections become `None` versus a real error
-/// (e.g. `Query`'s override still hard-errors on malformed query strings,
-/// only treating "no query string at all" as `None`). This collapses every
-/// rejection to `None` uniformly instead, which is simpler but less precise —
-/// most consumers of `Option<Extractor>` just want "was it there or not"
-/// and don't rely on the distinction.
+/// Customizes the behavior of `Option<Self>` as a [`FromRequestParts`] extractor.
+///
+/// Lets an individual extractor decide which of its own rejections collapse to
+/// `None` versus stay a real error. Matches `axum_core::extract::OptionalFromRequestParts`.
+///
+/// Only implemented for the extractors Axum itself implements it for
+/// ([`Extension`], [`MatchedPath`], [`Path`]) — an extractor with no impl of this
+/// trait has no `Option<T>` support at all, matching Axum exactly.
+pub trait OptionalFromRequestParts<S: Sync>: Sized + Send {
+    /// The rejection type returned if extraction fails.
+    type Rejection: crate::http::response::IntoResponse;
+
+    /// Extract this type from the request parts and state, or `None` if genuinely absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a rejection for a failure that shouldn't collapse to `None` (e.g. a
+    /// malformed value, as opposed to the value simply being missing).
+    fn from_request_parts(
+        parts: &mut hyper::http::request::Parts,
+        state: &S,
+    ) -> impl Future<Output = Result<Option<Self>, Self::Rejection>> + Send;
+}
+
+/// Customizes the behavior of `Option<Self>` as a [`FromRequest`] extractor. Matches
+/// `axum_core::extract::OptionalFromRequest`.
+///
+/// Only implemented for the extractors Axum itself implements it for ([`Json`],
+/// [`Multipart`]) — an extractor with no impl of this trait has no `Option<T>`
+/// support at all, matching Axum exactly.
+pub trait OptionalFromRequest<S: Sync>: Sized + Send {
+    /// The rejection type returned if extraction fails.
+    type Rejection: crate::http::response::IntoResponse;
+
+    /// Extract this type from the request and state, or `None` if genuinely absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a rejection for a failure that shouldn't collapse to `None` (e.g. a
+    /// malformed value, as opposed to the value simply being missing).
+    fn from_request(
+        req: hyper::Request<Body>,
+        state: &S,
+    ) -> impl Future<Output = Result<Option<Self>, Self::Rejection>> + Send;
+}
+
 impl<S: Sync, T> FromRequestParts<S> for Option<T>
 where
-    T: FromRequestParts<S>,
+    T: OptionalFromRequestParts<S>,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = T::Rejection;
 
     async fn from_request_parts(
         parts: &mut hyper::http::request::Parts,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(T::from_request_parts(parts, state).await.ok())
+        T::from_request_parts(parts, state).await
     }
 }
 
-/// See [`FromRequestParts` for `Option<T>`](#impl-FromRequestParts%3CS%3E-for-Option%3CT%3E)
-/// — same simplification relative to Axum's real `OptionalFromRequest`.
 impl<S: Sync, T> FromRequest<S> for Option<T>
 where
-    T: FromRequest<S>,
+    T: OptionalFromRequest<S>,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = T::Rejection;
 
     async fn from_request(req: hyper::Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
-        Ok(T::from_request(req, state).await.ok())
+        T::from_request(req, state).await
     }
 }
 

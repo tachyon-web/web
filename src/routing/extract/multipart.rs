@@ -68,6 +68,34 @@ where
     }
 }
 
+impl<S> super::OptionalFromRequest<S> for Multipart
+where
+    S: Sync,
+{
+    type Rejection = rejection::MultipartRejection;
+
+    fn from_request(
+        req: hyper::Request<Body>,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Option<Self>, Self::Rejection>> + Send {
+        std::future::ready((|| {
+            let Some(content_type) = content_type_str(req.headers()) else {
+                return Ok(None);
+            };
+            match multer::parse_boundary(content_type) {
+                Ok(boundary) => {
+                    let limit = max_body_size(req.extensions());
+                    let limited = http_body_util::Limited::new(req.into_body(), limit);
+                    let multipart = multer::Multipart::new(limited.into_data_stream(), boundary);
+                    Ok(Some(Self { inner: multipart }))
+                }
+                Err(multer::Error::NoMultipart) => Ok(None),
+                Err(_) => Err(rejection::InvalidBoundary.into()),
+            }
+        })())
+    }
+}
+
 impl Multipart {
     /// Yields the next [`Field`] if available.
     ///

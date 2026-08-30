@@ -43,6 +43,7 @@ serde_json = { version = "1", optional = true }
 
 # Utilities & Performance
 bytes = "1"
+futures-core = { version = "0.3", default-features = false }
 tracing = "0.1"
 matchit = "0.9"
 socket2 = { version = "0.6", features = ["all"] }
@@ -55,9 +56,6 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # Optional WebSocket support (see the `ws` feature).
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
-
-# Optional Server-Sent Events support (see the `sse` feature).
-futures-core = { version = "0.3", default-features = false, optional = true }
 
 # Optional `multipart/form-data` support (see the `multipart` feature).
 multer = { version = "3", default-features = false, optional = true }
@@ -117,7 +115,7 @@ tower-log = ["tower/log"]
 ws = ["dep:tungstenite", "dep:futures-util", "dep:flate2"]
 form = []
 query = []
-multipart = ["dep:multer", "dep:futures-core"]
+multipart = ["dep:multer"]
 
 # Tachyon-only additions
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]
@@ -131,7 +129,7 @@ lets-encrypt = [
     "dep:instant-acme", "dep:webpki", "dep:serde_json", "dep:hyper-rustls", "tls", "cert-gen",
     "hyper-util/client-legacy",
 ]
-sse = ["dep:futures-core", "dep:serde_json"]
+sse = ["dep:serde_json"]
 sfv = []
 tor = [
     "dep:arti-client", "dep:tor-hsservice", "dep:tor-proto", "dep:tor-cell",
@@ -140,10 +138,10 @@ tor = [
 i2p = ["dep:tachyon-i2p", "tachyon-i2p/aws-lc"]
 
 # Response compression.
-compression-gzip = ["dep:flate2", "dep:async-compression", "dep:futures-core", "async-compression/gzip"]
-compression-deflate = ["dep:flate2", "dep:async-compression", "dep:futures-core", "async-compression/zlib"]
-compression-br = ["dep:brotli", "dep:async-compression", "dep:futures-core", "async-compression/brotli"]
-compression-zstd = ["dep:zstd", "dep:async-compression", "dep:futures-core", "async-compression/zstd"]
+compression-gzip = ["dep:flate2", "dep:async-compression", "async-compression/gzip"]
+compression-deflate = ["dep:flate2", "dep:async-compression", "async-compression/zlib"]
+compression-br = ["dep:brotli", "dep:async-compression", "async-compression/brotli"]
+compression-zstd = ["dep:zstd", "dep:async-compression", "async-compression/zstd"]
 compression-full = [
     "compression-gzip", "compression-deflate", "compression-br", "compression-zstd",
 ]

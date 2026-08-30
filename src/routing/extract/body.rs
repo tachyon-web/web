@@ -192,6 +192,27 @@ where
         })
     }
 }
+#[cfg(feature = "json")]
+impl<S, T> super::OptionalFromRequest<S> for Json<T>
+where
+    S: Sync,
+    T: DeserializeOwned + Send + Sync + 'static,
+{
+    type Rejection = rejection::JsonRejection;
+
+    async fn from_request(
+        req: hyper::Request<Body>,
+        state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        if req.headers().get(hyper::header::CONTENT_TYPE).is_none() {
+            return Ok(None);
+        }
+        <Self as FromRequest<S>>::from_request(req, state)
+            .await
+            .map(Some)
+    }
+}
+
 impl<S: Sync> FromRequest<S> for Bytes {
     type Rejection = rejection::BytesRejection;
 

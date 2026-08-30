@@ -64,21 +64,45 @@ fn strip_newlines(value: String) -> String {
     }
 }
 
-/// Writes a multi-line SSE field, one `<prefix> <line>` per line.
+/// A [`std::fmt::Write`] adapter that serializes a multi-line SSE field, one `<prefix>
+/// <line>` per line. Matches `axum::response::sse::EventDataWriter`.
 ///
 /// SSE treats `\n`, `\r\n` and a lone `\r` as the same line break, so all three are normalized
 /// first: a stray `\r` left mid-line is one the client re-reads as a terminator, turning the
 /// remainder into a field the caller never wrote.
-fn write_multiline(buf: &mut String, prefix: &str, value: &str) {
-    let normalized;
-    let value = if value.contains('\r') {
-        normalized = value.replace("\r\n", "\n").replace('\r', "\n");
-        normalized.as_str()
-    } else {
-        value
-    };
-    for line in value.split('\n') {
-        let _ = writeln!(buf, "{prefix} {line}");
+pub struct EventDataWriter<'a> {
+    buf: &'a mut String,
+    prefix: &'a str,
+}
+
+impl<'a> EventDataWriter<'a> {
+    /// Creates a writer that appends `<prefix> <line>` lines to `buf`.
+    pub const fn new(buf: &'a mut String, prefix: &'a str) -> Self {
+        Self { buf, prefix }
+    }
+}
+
+impl std::fmt::Debug for EventDataWriter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventDataWriter")
+            .field("prefix", &self.prefix)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Write for EventDataWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let normalized;
+        let value = if value.contains('\r') {
+            normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+            normalized.as_str()
+        } else {
+            value
+        };
+        for line in value.split('\n') {
+            writeln!(self.buf, "{} {line}", self.prefix)?;
+        }
+        Ok(())
     }
 }
 
@@ -142,13 +166,13 @@ impl Event {
     /// Serializes this event into SSE wire format, terminated by a blank line.
     fn write_to(&self, buf: &mut String) {
         if let Some(comment) = &self.comment {
-            write_multiline(buf, ":", comment);
+            let _ = EventDataWriter::new(buf, ":").write_str(comment);
         }
         if let Some(event) = &self.event {
             let _ = writeln!(buf, "event: {event}");
         }
         if let Some(data) = &self.data {
-            write_multiline(buf, "data:", data);
+            let _ = EventDataWriter::new(buf, "data:").write_str(data);
         }
         if let Some(id) = &self.id {
             let _ = writeln!(buf, "id: {id}");
@@ -216,12 +240,19 @@ impl KeepAlive {
 
 pin_project_lite::pin_project! {
     /// Wraps a stream, injecting `keep_alive.event` whenever the inner stream
-    /// hasn't produced an item for `keep_alive.interval`.
-    struct KeepAliveStream<S> {
+    /// hasn't produced an item for `keep_alive.interval`. Returned internally by
+    /// [`Sse::keep_alive`]. Matches `axum::response::sse::KeepAliveStream`.
+    pub struct KeepAliveStream<S> {
         #[pin]
         stream: S,
         interval: tokio::time::Interval,
         comment_event: Event,
+    }
+}
+
+impl<S> std::fmt::Debug for KeepAliveStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeepAliveStream").finish_non_exhaustive()
     }
 }
 

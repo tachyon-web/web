@@ -62,6 +62,13 @@ impl Body {
         Self::Stream(BoxBody::new(body.map_err(std::convert::Into::into)))
     }
 
+    /// Converts this body into a [`Stream`](futures_core::Stream) of its data frames,
+    /// discarding trailers. Matches `axum_core::body::Body::into_data_stream`.
+    #[must_use]
+    pub const fn into_data_stream(self) -> BodyDataStream {
+        BodyDataStream(self)
+    }
+
     /// Buffers the entire body into memory, rejecting bodies larger than `limit`
     /// bytes with a `413 Payload Too Large` rejection instead of allocating
     /// unbounded memory.
@@ -146,6 +153,37 @@ impl HyperBody for Body {
             Self::Full(full) => full.size_hint(),
             Self::Empty => SizeHint::with_exact(0),
             Self::Stream(stream) => stream.size_hint(),
+        }
+    }
+}
+
+/// A stream of a [`Body`]'s data frames, with trailers discarded. Returned by
+/// [`Body::into_data_stream`]. Matches `axum_core::body::BodyDataStream`.
+pub struct BodyDataStream(Body);
+
+impl std::fmt::Debug for BodyDataStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BodyDataStream").finish_non_exhaustive()
+    }
+}
+
+impl futures_core::Stream for BodyDataStream {
+    type Item = Result<Bytes, crate::http::error::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            let body = Pin::new(&mut self.as_mut().get_mut().0);
+            match body.poll_frame(cx) {
+                // A trailers frame is skipped; keep polling for the next data frame.
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Ok(data) = frame.into_data() {
+                        return Poll::Ready(Some(Ok(data)));
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
