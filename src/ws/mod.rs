@@ -448,6 +448,20 @@ where
     }
 }
 
+impl<S> crate::routing::extract::FromRequestParts<S> for WebSocketUpgrade<DefaultOnFailedUpgrade>
+where
+    S: Send + Sync,
+{
+    type Rejection = WebSocketUpgradeRejection;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Self::from_request_parts(parts, state))
+    }
+}
+
 impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
     /// Build a [`WebSocketUpgrade`] from request parts, validating the RFC 6455 handshake
     /// headers (or, for HTTP/2 with the `http2` feature enabled, the RFC 8441 extended-`CONNECT`

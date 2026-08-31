@@ -9,5 +9,116 @@
 # Example:
 #   SIGNATURE<TAB>(type) RequestExt  # axum seals this trait; we don't. Strictly
 #                                    # more permissive, so no downstream break.
-#
-# Empty on purpose: nothing is currently waived.
+
+# --- Strictly more permissive: an added default type param, or an added
+# --- supertrait bound on trait *implementors* (never a break for callers of
+# --- the trait generically). ---
+SIGNATURE	(type) RequestExt	# axum seals this trait; we don't. Strictly more permissive.
+SIGNATURE	(type) RequestPartsExt	# axum seals this trait; we don't. Strictly more permissive.
+SIGNATURE	(type) error_handling::HandleError	# extra `T = ()` default; axum has none. Load-bearing for existing inference (HandleErrorLayer::new(f) with no extractor tuple) -- kept deliberately.
+SIGNATURE	(type) error_handling::HandleErrorLayer	# same `T = ()` default as HandleError above.
+SIGNATURE	(type) extract::FromRequest	# extra `Send` supertrait bound, and `M = ()` instead of axum's `M = Self::ViaRequest` marker. This crate derives FromRequest from FromRequestParts via macro-generated impls per type instead of axum's blanket-impl-over-M trick; M is kept only for signature shape.
+SIGNATURE	(type) extract::FromRequestParts	# extra `Send` supertrait bound. Async server context: every real implementor is already Send.
+SIGNATURE	(type) extract::OptionalFromRequest	# extra `Send` supertrait bound, no `M` marker (see extract::FromRequest above).
+SIGNATURE	(type) extract::OptionalFromRequestParts	# extra `Send` supertrait bound.
+SIGNATURE	(type) handler::future::IntoServiceFuture	# extra `F = ()` default; axum has none. Strictly more permissive.
+SIGNATURE	(type) middleware::FromExtractorLayer	# extra `S = (), T = ()` defaults; axum has none. Strictly more permissive.
+SIGNATURE	(type) middleware::FromFnLayer	# extra `S = (), T = ()` defaults; axum has none. Strictly more permissive.
+SIGNATURE	(type) middleware::IntoMapRequestResult	# axum seals this trait; we don't, and we add a `B = Self::Body` default. Strictly more permissive.
+SIGNATURE	(type) middleware::MapRequestLayer	# extra `S = (), T = ()` defaults; axum has none. Strictly more permissive.
+SIGNATURE	(type) middleware::MapResponseLayer	# extra `S = (), T = ()` defaults; axum has none. Strictly more permissive.
+SIGNATURE	(type) middleware::ResponseAxumBodyFuture	# extra `Fut = ()` default; axum has none. Strictly more permissive.
+
+# --- Tool limitation, not a real gap: impl-level generic parameter names
+# --- (e.g. the `S` in `impl<S> Trait<S> for Ty`) aren't canonicalized by
+# --- api_diff.py the way function-level generics are, so axum naming its
+# --- own impl parameter `OuterState` where we name ours `S` reads as a
+# --- missing impl even though the structural shape is identical. Verified
+# --- by hand: `impl<S: Sync, T> FromRequestParts<S> for State<T>` exists in
+# --- src/routing/extract/parts.rs. ---
+IMPL	(type) extract::State	# axum: impl FromRequestParts<OuterState> for State -- we have the same impl, just named `S`. See scripts/api_diff.py's `impl_members` -- only function-level generics get canonicalized, not impl-level ones.
+
+# --- Architectural: Route/HandlerService/the middleware chain fix the
+# --- response body to this crate's own `Body` type rather than being
+# --- generic over an arbitrary response-body type `B`, via
+# --- ResponseAxumBody's normalization. axum's own `Router`/`MethodRouter`
+# --- accept any `Service::Response: IntoResponse`. Redesigning
+# --- ResponseAxumBody to be response-body-generic is a real architecture
+# --- change touching every layer-application call site; too risky to make
+# --- without broader test coverage of this hot path. ---
+MEMBER_SIGNATURE	(type) Router::fn fallback_service	# see ResponseAxumBody note above.
+MEMBER_SIGNATURE	(type) Router::fn layer	# see ResponseAxumBody note above.
+MEMBER_SIGNATURE	(type) Router::fn nest_service	# see ResponseAxumBody note above.
+MEMBER_SIGNATURE	(type) Router::fn route_layer	# see ResponseAxumBody note above.
+MEMBER_SIGNATURE	(type) Router::fn route_service	# see ResponseAxumBody note above.
+MEMBER_SIGNATURE	(type) routing::Router::fn fallback_service	# alias path of Router::fallback_service above.
+MEMBER_SIGNATURE	(type) routing::Router::fn layer	# alias path of Router::layer above.
+MEMBER_SIGNATURE	(type) routing::Router::fn nest_service	# alias path of Router::nest_service above.
+MEMBER_SIGNATURE	(type) routing::Router::fn route_layer	# alias path of Router::route_layer above.
+MEMBER_SIGNATURE	(type) routing::Router::fn route_service	# alias path of Router::route_service above.
+IMPL	(type) extract::connect_info::IntoMakeServiceWithConnectInfo	# not generic over an arbitrary Service<T> -- concretely tied to IncomingStream, same root cause as ResponseAxumBody above.
+IMPL	(type) handler::HandlerService	# Service<Request<B>>/Service<IncomingStream<L>> are concrete rather than generic over B/L, same root cause as ResponseAxumBody above.
+IMPL	(type) middleware::FromExtractor	# Service<Request<B>> concrete rather than generic over B, same root cause as ResponseAxumBody above.
+IMPL	(type) middleware::MapRequest	# Service<Request<B>> concrete rather than generic over B, same root cause as ResponseAxumBody above.
+IMPL	(type) middleware::MapResponse	# Service<Request<B>> concrete rather than generic over B, same root cause as ResponseAxumBody above.
+IMPL	(type) middleware::ResponseAxumBody	# Service<Request> concrete rather than generic, same root cause as ResponseAxumBody's own design above.
+IMPL	(type) routing::Route	# Service<Request<B>> concrete rather than generic over B, same root cause as ResponseAxumBody above.
+
+# --- Architectural: `MethodRouter::with_state`'s `S2: Clone + Send + Sync +
+# --- 'static` bound is declared at the method level; axum declares no bound
+# --- at all (presumably at a different impl-block level). Attempted
+# --- removing it -- fails to compile with three E0277 errors because
+# --- `MethodRouter::with_state`'s own body calls itself with the same
+# --- requirement internally. Reverted; accepted as a signature-shape-only
+# --- difference (not a functional one -- both accept the same calls). ---
+MEMBER_SIGNATURE	(type) Router::fn with_state	# see with_state bound-placement note above.
+MEMBER_SIGNATURE	(type) routing::Router::fn with_state	# alias path of Router::with_state above.
+MEMBER_SIGNATURE	(type) routing::MethodRouter::fn with_state	# see with_state bound-placement note above.
+MEMBER_SIGNATURE	(type) routing::method_routing::MethodRouter::fn with_state	# alias path of routing::MethodRouter::with_state above.
+
+# --- Architectural: `E` parametrizes `MethodRouter<S, E>` itself (it's part
+# --- of Self), so unlike Sse::new's stream-generic (which axum declares at
+# --- the function level), `handle_error`/`route_layer`'s `E`-related bounds
+# --- can't be moved to the function without changing what Self even means.
+# --- Necessarily declared at a different site than axum's function-level
+# --- rendering, so the structural comparison can't match textually even
+# --- though the behavior is the same. ---
+MEMBER_SIGNATURE	(type) routing::MethodRouter::fn handle_error	# see MethodRouter E-placement note above.
+MEMBER_SIGNATURE	(type) routing::MethodRouter::fn route_layer	# see MethodRouter E-placement note above.
+MEMBER_SIGNATURE	(type) routing::method_routing::MethodRouter::fn handle_error	# alias path of routing::MethodRouter::handle_error above.
+MEMBER_SIGNATURE	(type) routing::method_routing::MethodRouter::fn route_layer	# alias path of routing::MethodRouter::route_layer above.
+
+# --- Architectural: axum's Sse::new spells its stream bound as
+# --- `TryStream<Ok = Event>` at the function level; ours is
+# --- `Stream<Item = Result<Event, E>>` at the impl level. Behaviorally
+# --- identical (Stream<Item=Result<T,E>> blanket-implements
+# --- TryStream<Ok=T,Error=E>), but switching the bound's spelling and
+# --- declaration site would also require touching the internal
+# --- KeepAliveStream/EventStreamBody plumbing that depends on it -- not
+# --- worth the risk for a cosmetic difference. ---
+MEMBER_SIGNATURE	(type) response::Sse::fn new	# see Sse::new bound-spelling note above.
+MEMBER_SIGNATURE	(type) response::sse::Sse::fn new	# alias path of response::Sse::new above.
+
+# --- Architectural: `Body::new`/`Body::from_stream`'s error bound targets
+# --- this crate's own `Self::Error` rather than axum's `Self::BoxError`.
+# --- `crate::BoxError` exists and Error is likely convertible via a blanket
+# --- impl from it, but changing the bound would be a real semantic
+# --- widening (accepting a strictly larger set of error types), and the
+# --- reverse-direction conversion isn't established. Deferred pending a
+# --- closer look, not attempted this pass. ---
+MEMBER_SIGNATURE	(type) body::Body::fn from_stream	# see Body::new/from_stream BoxError note above.
+MEMBER_SIGNATURE	(type) body::Body::fn new	# see Body::new/from_stream BoxError note above.
+
+# --- Not yet ported: axum's MethodRouter implements Handler (so one router
+# --- can be nested as another's handler) and is its own trivial MakeService
+# --- via Service<IncomingStream> (like Router<()> is). Neither has a call
+# --- path anywhere in this crate yet; `MethodRouter::into_make_service()`
+# --- (added this session) covers the common case explicitly. ---
+IMPL	(type) routing::MethodRouter	# Handler<(),S> and Service<IncomingStream<L>> not ported, see note above.
+IMPL	(type) routing::method_routing::MethodRouter	# alias path of routing::MethodRouter above.
+IMPL	(type) serve::IncomingStream	# HandlerService<H,T,S>: Service<IncomingStream>, MethodRouter<()>: Service<IncomingStream>, and Connected<Self> for a fully generic L::Addr -- tachyon's Connected is concretely tied to IncomingStream<L> rather than generic; architectural simplification, not a bug.
+
+# --- Not yet ported: axum's `Next` implements `tower::Service` directly, in
+# --- addition to exposing `.run()`. Nothing in this crate calls Next as a
+# --- Service; `.run()` covers every current call site. ---
+IMPL	(type) middleware::Next	# Service<Request<Self::Body>> not ported, see note above.

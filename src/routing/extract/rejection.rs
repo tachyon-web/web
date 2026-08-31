@@ -79,8 +79,8 @@ macro_rules! unit_rejection {
         impl $name {
             /// Get the response body text used for this rejection.
             #[must_use]
-            pub const fn body_text(&self) -> &'static str {
-                $body
+            pub fn body_text(&self) -> String {
+                $body.to_string()
             }
 
             /// Get the status code used for this rejection.
@@ -117,7 +117,7 @@ macro_rules! composite_rejection {
             #[must_use]
             pub fn body_text(&self) -> String {
                 match self {
-                    $(Self::$variant(inner) => inner.body_text().to_string()),+
+                    $(Self::$variant(inner) => inner.body_text()),+
                 }
             }
 

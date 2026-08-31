@@ -75,6 +75,10 @@ pub struct MethodRouter<S = (), E = std::convert::Infallible> {
     /// The accumulated prefix to strip from the request `Uri` before dispatch, when this
     /// route was reached through one or more [`Router::nest`] calls.
     pub(crate) nest_prefix: Option<Arc<str>>,
+    /// Handler for methods that reach this route but have no registered handler slot,
+    /// matching `axum::routing::MethodRouter`'s own `fallback`. Consulted before the
+    /// router-level `Router::method_not_allowed_fallback` (or the default `405`).
+    pub(crate) fallback: Option<BoxedIntoRoute<S, E>>,
     _marker: std::marker::PhantomData<fn() -> E>,
 }
 
@@ -85,6 +89,7 @@ impl<S, E> Clone for MethodRouter<S, E> {
             param_names: self.param_names.clone(),
             matched_path: self.matched_path.clone(),
             nest_prefix: self.nest_prefix.clone(),
+            fallback: self.fallback.clone(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -99,6 +104,7 @@ impl<S, E> std::fmt::Debug for MethodRouter<S, E> {
         let _ = dbg.field("param_names", &self.param_names);
         let _ = dbg.field("matched_path", &self.matched_path);
         let _ = dbg.field("nest_prefix", &self.nest_prefix);
+        let _ = dbg.field("has_fallback", &self.fallback.is_some());
         dbg.finish()
     }
 }
@@ -124,6 +130,7 @@ where
             param_names: Arc::from([]),
             matched_path: Arc::from(""),
             nest_prefix: None,
+            fallback: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -143,13 +150,27 @@ where
         self
     }
 
+    /// Set a raw `tower::Service` to answer requests whose method isn't registered on this
+    /// route, matching `axum::routing::MethodRouter::fallback_service`. Consulted before the
+    /// router-level `Router::method_not_allowed_fallback` (or the default `405`).
+    #[must_use]
+    pub fn fallback_service<Svc>(mut self, service: Svc) -> Self
+    where
+        Svc: tower::Service<Request, Error = E> + Clone + Send + Sync + 'static,
+        Svc::Response: crate::http::response::IntoResponse + 'static,
+        Svc::Future: Send + 'static,
+    {
+        self.fallback = Some(Arc::new(move |_state: Arc<S>| Route::new(service.clone())));
+        self
+    }
+
     /// Merges `other`'s method handlers into `self`: registering the same path twice with
     /// non-overlapping methods combines into a single route, matching Axum.
     ///
     /// # Errors
     /// Returns [`RouterError::MethodOverlap`] if `other` defines a method already present in
     /// `self` — where Axum panics with "Overlapping method route".
-    pub(crate) fn merge(mut self, mut other: Self, path: &str) -> Result<Self, RouterError> {
+    pub(crate) fn merge_at(mut self, mut other: Self, path: &str) -> Result<Self, RouterError> {
         for (i, (mine, theirs)) in self
             .handlers
             .iter_mut()
@@ -169,14 +190,62 @@ where
         if self.nest_prefix.is_none() {
             self.nest_prefix = other.nest_prefix;
         }
+        if self.fallback.is_none() {
+            self.fallback = other.fallback;
+        }
         Ok(self)
     }
 
-    /// Apply a `tower::Layer` to every endpoint registered in this
-    /// `MethodRouter` **so far** — matching `axum::routing::MethodRouter::layer`.
-    /// Call this after the verb builders (`.get()`/`.post()`/...) it should cover.
+    /// Merges `other`'s method handlers into `self`, matching
+    /// `axum::routing::MethodRouter::merge`.
+    ///
+    /// # Panics
+    /// Panics if `other` defines a method already present in `self` ("Overlapping method
+    /// route"). Use [`Router::merge`](crate::routing::Router::merge) for a non-panicking
+    /// path-level merge, or match this method's own routes up front.
     #[must_use]
-    pub fn layer<L, NewError>(mut self, layer: L) -> MethodRouter<S, NewError>
+    #[allow(clippy::panic)]
+    pub fn merge(self, other: Self) -> Self {
+        match self.merge_at(other, "<merged MethodRouter>") {
+            Ok(merged) => merged,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Apply a `tower::Layer` to every endpoint registered in this `MethodRouter`
+    /// **so far**, including its [`fallback`](Self::fallback) — matching
+    /// `axum::routing::MethodRouter::layer`. Call this after the verb builders
+    /// (`.get()`/`.post()`/...) it should cover. Use [`Self::route_layer`] to leave the
+    /// fallback untouched.
+    #[must_use]
+    pub fn layer<L, NewError>(self, layer: L) -> MethodRouter<S, NewError>
+    where
+        L: tower::Layer<Route<E>> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<Request> + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<Request>>::Response:
+            crate::http::response::IntoResponse + 'static,
+        <L::Service as tower::Service<Request>>::Error: Into<NewError> + 'static,
+        <L::Service as tower::Service<Request>>::Future: Send + 'static,
+        E: 'static,
+        S: 'static,
+        NewError: 'static,
+    {
+        let fallback = self.fallback.clone();
+        let mut routed = self.route_layer(layer.clone());
+        routed.fallback = fallback.map(|old| {
+            let layer = layer.clone();
+            let f: BoxedIntoRoute<S, NewError> =
+                Arc::new(move |state: Arc<S>| old(state).layer(&layer));
+            f
+        });
+        routed
+    }
+
+    /// Apply a `tower::Layer` to every endpoint registered in this `MethodRouter` **so
+    /// far**, but *not* its [`fallback`](Self::fallback) — matching
+    /// `axum::routing::MethodRouter::route_layer`.
+    #[must_use]
+    pub fn route_layer<L, NewError>(mut self, layer: L) -> MethodRouter<S, NewError>
     where
         L: tower::Layer<Route<E>> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<Request> + Clone + Send + Sync + 'static,
@@ -201,8 +270,25 @@ where
             param_names: self.param_names,
             matched_path: self.matched_path,
             nest_prefix: self.nest_prefix,
+            fallback: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Wraps every registered handler (and [`fallback`](Self::fallback)) so a fallible
+    /// error, produced anywhere in a layer applied afterward, is converted into a response
+    /// via `f` instead of reaching [`Route`]'s default conversion — matching
+    /// `axum::routing::MethodRouter::handle_error`.
+    #[must_use]
+    pub fn handle_error<F, Fut, Res>(self, f: F) -> MethodRouter<S, std::convert::Infallible>
+    where
+        F: FnOnce(crate::http::error::Error) -> Fut + Clone + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Res> + Send,
+        Res: crate::http::response::IntoResponse,
+        E: Into<crate::http::error::Error> + Send + 'static,
+        S: 'static,
+    {
+        self.layer(crate::routing::error_handling::HandleErrorLayer::new(f))
     }
 
     /// Capture a state and transition this method router to another state type.
@@ -224,13 +310,38 @@ where
                 }));
             }
         }
+        let fallback = self.fallback.map(|into_route| {
+            let state = state.clone();
+            let f: BoxedIntoRoute<S2, E> =
+                Arc::new(move |_new_state: Arc<S2>| into_route(state.clone()));
+            f
+        });
         MethodRouter {
             handlers: new_handlers,
             param_names: self.param_names,
             matched_path: self.matched_path,
             nest_prefix: self.nest_prefix,
+            fallback,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Converts this method router into a [`MakeService`](tower::MakeService), matching
+    /// `axum::routing::MethodRouter::into_make_service`. Only meaningful once `S = ()`.
+    #[must_use]
+    pub const fn into_make_service(self) -> crate::routing::tower_compat::IntoMakeService<Self> {
+        crate::routing::tower_compat::IntoMakeService::new(self)
+    }
+
+    /// Converts this method router into a [`MakeService`](tower::MakeService) that also
+    /// records each connection's [`ConnectInfo`](crate::routing::extract::ConnectInfo),
+    /// matching `axum::routing::MethodRouter::into_make_service_with_connect_info`. Only
+    /// meaningful once `S = ()`.
+    #[must_use]
+    pub const fn into_make_service_with_connect_info<C>(
+        self,
+    ) -> crate::routing::tower_compat::IntoMakeServiceWithConnectInfo<Self, C> {
+        crate::routing::tower_compat::IntoMakeServiceWithConnectInfo::new(self)
     }
 }
 
@@ -251,6 +362,22 @@ where
                 Route::from_handler(handler.clone(), &state)
             }));
         }
+        self
+    }
+
+    /// Set a [`Handler`] to answer requests whose method isn't registered on this route,
+    /// matching `axum::routing::MethodRouter::fallback`. Consulted before the router-level
+    /// `Router::method_not_allowed_fallback` (or the default `405`).
+    #[must_use]
+    pub fn fallback<H, T>(mut self, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+        S: Send + Sync + 'static,
+    {
+        self.fallback = Some(Arc::new(move |state: Arc<S>| {
+            Route::from_handler(handler.clone(), &state)
+        }));
         self
     }
 
@@ -317,6 +444,7 @@ where
             #[cfg(feature = "matched-path")]
             matched_path: self.matched_path.clone(),
             nest_prefix: self.nest_prefix.clone(),
+            fallback: self.fallback.as_ref().map(|f| f(state.clone())),
         }
     }
 }
@@ -331,6 +459,7 @@ pub(crate) struct CompiledMethodRouter {
     #[cfg(feature = "matched-path")]
     pub(crate) matched_path: Arc<str>,
     pub(crate) nest_prefix: Option<Arc<str>>,
+    pub(crate) fallback: Option<Route>,
 }
 
 impl CompiledMethodRouter {

@@ -470,6 +470,23 @@ where
     }
 }
 
+#[cfg(feature = "form")]
+impl<T> IntoResponse for Form<T>
+where
+    T: Serialize,
+{
+    fn into_response(self) -> Response {
+        match serde_urlencoded::to_string(&self.0) {
+            Ok(body) => with_content_type(Bytes::from(body), "application/x-www-form-urlencoded"),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize form: {err}"),
+            )
+                .into_response(),
+        }
+    }
+}
+
 /// Serializes `value` into the calling thread's reusable JSON buffer.
 ///
 /// `try_borrow_mut` (rather than `borrow_mut`) so that a `Serialize` impl which re-enters

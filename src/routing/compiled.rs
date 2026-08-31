@@ -310,45 +310,9 @@ impl<S> CompiledRouter<S> {
             strip_uri_prefix(&mut req, prefix);
         }
 
-        let method = req.method();
-        let idx = method_index(method);
-
-        // HEAD uses an explicit HEAD handler when registered; otherwise it
-        // falls back to the GET handler, with the body discarded afterwards.
-        let is_head = *method == Method::HEAD;
-        let falls_back_to_get =
-            is_head && method_router.handlers[IDX_HEAD].is_none() && idx == Some(IDX_HEAD);
-        let effective_idx = if falls_back_to_get {
-            Some(IDX_GET)
-        } else {
-            idx
-        };
-
-        let route =
-            effective_idx.and_then(|i| method_router.handlers.get(i).and_then(Option::as_ref));
-
-        if let Some(route) = route {
-            let mut resp = call_route(route, req).await;
-            // Per HTTP semantics, a HEAD response must never carry a body,
-            // regardless of whether it came from an explicit HEAD handler or
-            // the implicit GET fallback.
-            if is_head {
-                discard_body_for_head(&mut resp);
-            }
-            resp
-        } else if let Some(fb) = &self.method_not_allowed_fallback {
-            // Route exists but this method has no handler, and a custom fallback
-            // was configured for that case via `Router::method_not_allowed_fallback`.
-            call_route(fb, req).await
-        } else {
-            // Route exists but this method has no handler → 405 with Allow header.
-            let allow = method_router.allow_header();
-            Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .header(hyper::header::ALLOW, &allow)
-                .body(Body::full(Bytes::from_static(b"Method Not Allowed")))
-                .unwrap_or_else(|_| Response::new(Body::empty()))
-        }
+        method_router
+            .dispatch(req, self.method_not_allowed_fallback.as_ref())
+            .await
     }
 
     /// Internal: attempt to match `path`, returning `RouteResolution`.
@@ -373,3 +337,60 @@ impl<S> CompiledRouter<S> {
 
 /// Type alias for matched route results to keep signatures clean.
 pub(crate) type RouteResolution<'a> = (&'a CompiledMethodRouter, extract::PathParamsVec);
+
+impl CompiledMethodRouter {
+    /// Dispatches an already-path-matched request to the handler for its method (falling
+    /// back to `GET` for an unregistered `HEAD`), this route's own
+    /// [`fallback`](CompiledMethodRouter::fallback) if the method has no handler, then
+    /// `router_fallback` (the enclosing `Router`'s `method_not_allowed_fallback`, when
+    /// dispatched through one), then a bare `405`.
+    pub(crate) async fn dispatch(
+        &self,
+        req: Request<Body>,
+        router_fallback: Option<&Route>,
+    ) -> Response<Body> {
+        let method = req.method();
+        let idx = method_index(method);
+
+        // HEAD uses an explicit HEAD handler when registered; otherwise it
+        // falls back to the GET handler, with the body discarded afterwards.
+        let is_head = *method == Method::HEAD;
+        let falls_back_to_get =
+            is_head && self.handlers[IDX_HEAD].is_none() && idx == Some(IDX_HEAD);
+        let effective_idx = if falls_back_to_get {
+            Some(IDX_GET)
+        } else {
+            idx
+        };
+
+        let route = effective_idx.and_then(|i| self.handlers.get(i).and_then(Option::as_ref));
+
+        if let Some(route) = route {
+            let mut resp = call_route(route, req).await;
+            // Per HTTP semantics, a HEAD response must never carry a body,
+            // regardless of whether it came from an explicit HEAD handler or
+            // the implicit GET fallback.
+            if is_head {
+                discard_body_for_head(&mut resp);
+            }
+            resp
+        } else if let Some(fb) = &self.fallback {
+            // Route exists but this method has no handler, and this specific route has
+            // its own `MethodRouter::fallback`/`fallback_service` — takes priority over
+            // the router-level fallback below.
+            call_route(fb, req).await
+        } else if let Some(fb) = router_fallback {
+            // Route exists but this method has no handler, and a custom fallback
+            // was configured for that case via `Router::method_not_allowed_fallback`.
+            call_route(fb, req).await
+        } else {
+            // Route exists but this method has no handler → 405 with Allow header.
+            let allow = self.allow_header();
+            Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header(hyper::header::ALLOW, &allow)
+                .body(Body::full(Bytes::from_static(b"Method Not Allowed")))
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
+    }
+}

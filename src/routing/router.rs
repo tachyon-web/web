@@ -240,7 +240,7 @@ where
         if let Some(pos) = self.routes.iter().position(|(p, _)| *p == path) {
             let (_, existing) = self.routes.remove(pos);
             let merged = existing
-                .merge(method_router, &path)
+                .merge_at(method_router, &path)
                 .unwrap_or_else(|e| panic!("{e}"));
             self.routes.insert(pos, (path, merged));
         } else {

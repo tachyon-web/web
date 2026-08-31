@@ -200,10 +200,13 @@ impl Message {
     ///
     /// # Errors
     /// Returns an error if the payload isn't valid UTF-8.
-    pub fn into_text(self) -> Result<Utf8Bytes, std::str::Utf8Error> {
+    pub fn into_text(self) -> Result<Utf8Bytes, crate::http::error::Error> {
         match self {
             Self::Text(text) => Ok(text),
-            other => other.into_data().try_into(),
+            other => other
+                .into_data()
+                .try_into()
+                .map_err(crate::http::error::Error::new),
         }
     }
 
@@ -211,10 +214,12 @@ impl Message {
     ///
     /// # Errors
     /// Returns an error if the payload isn't valid UTF-8.
-    pub fn to_text(&self) -> Result<&str, std::str::Utf8Error> {
+    pub fn to_text(&self) -> Result<&str, crate::http::error::Error> {
         match self {
             Self::Text(text) => Ok(text.as_str()),
-            Self::Binary(data) | Self::Ping(data) | Self::Pong(data) => std::str::from_utf8(data),
+            Self::Binary(data) | Self::Ping(data) | Self::Pong(data) => {
+                std::str::from_utf8(data).map_err(crate::http::error::Error::new)
+            }
             Self::Close(None) => Ok(""),
             Self::Close(Some(frame)) => Ok(frame.reason.as_str()),
         }

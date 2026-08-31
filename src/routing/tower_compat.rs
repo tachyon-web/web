@@ -696,6 +696,32 @@ where
     }
 }
 
+/// Lets a bare `MethodRouter` (state already bound to `()`) be driven directly as a
+/// `tower::Service`, matching axum's own `impl<B> Service<Request<B>> for
+/// MethodRouter<(), Infallible>`. Dispatches to whichever verb slot matches the request's
+/// method (falling back to `GET` for an unregistered `HEAD`, then this router's own
+/// [`MethodRouter::fallback`], then a bare `405`) — the same per-route logic
+/// [`crate::routing::CompiledRouter`] applies once a path has already matched.
+impl<B> Service<Request<B>> for crate::routing::method_router::MethodRouter<(), Infallible>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Error>,
+{
+    type Response = Response<Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        let compiled = self.materialize(&Arc::new(()));
+        let req = req.map(Body::stream);
+        Box::pin(async move { Ok(compiled.dispatch(req, None).await) })
+    }
+}
+
 /// Lets a bare `Router` be passed directly to [`crate::server::serve()`], matching axum's own
 /// `impl<L> Service<serve::IncomingStream<'_, L>> for Router<()>`: the router is its own trivial
 /// `MakeService`, cloning itself once per accepted connection rather than needing an explicit

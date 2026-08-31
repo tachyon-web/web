@@ -166,7 +166,10 @@ impl Event {
     ///
     /// # Panics
     /// Panics if `data`/`json_data` has already been called on this event.
-    pub fn json_data<T: serde::Serialize>(self, data: T) -> serde_json::Result<Self> {
+    pub fn json_data<T: serde::Serialize>(
+        self,
+        data: T,
+    ) -> Result<Self, crate::http::error::Error> {
         struct JsonWriter<'a>(&'a mut EventDataWriter);
         impl std::io::Write for JsonWriter<'_> {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -178,7 +181,8 @@ impl Event {
         }
 
         let mut writer = self.into_data_writer();
-        serde_json::to_writer(JsonWriter(&mut writer), &data)?;
+        serde_json::to_writer(JsonWriter(&mut writer), &data)
+            .map_err(crate::http::error::Error::new)?;
         Ok(writer.into_event())
     }
 
