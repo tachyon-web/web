@@ -14,6 +14,9 @@ use hyper::header::{CONTENT_TYPE, HeaderMap};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Re-exported at the path `axum::extract::multipart` uses for them.
+pub use rejection::{InvalidBoundary, MultipartRejection};
+
 /// Extractor that parses `multipart/form-data` requests (commonly used for file uploads).
 ///
 /// Matches `axum::extract::Multipart`. Since extracting multipart form data requires consuming the body, this
@@ -41,6 +44,8 @@ use std::task::{Context, Poll};
 /// For security reasons, this respects the same body-size limit as
 /// [`Bytes`](super::super::extract::DefaultBodyLimit) — 2 MiB by default,
 /// configurable via [`DefaultBodyLimit`](super::super::extract::DefaultBodyLimit).
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::Multipart`.*
 #[derive(Debug)]
 pub struct Multipart {
     inner: multer::Multipart<'static>,
@@ -118,6 +123,8 @@ impl Multipart {
 /// A single field in a multipart stream.
 ///
 /// Matches `axum::extract::multipart::Field`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::multipart::Field`.*
 #[derive(Debug)]
 pub struct Field<'a> {
     inner: multer::Field<'static>,
@@ -199,6 +206,8 @@ impl Field<'_> {
 /// Errors associated with parsing `multipart/form-data` requests.
 ///
 /// Matches `axum::extract::multipart::MultipartError`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::multipart::MultipartError`.*
 #[derive(Debug)]
 pub struct MultipartError {
     source: multer::Error,

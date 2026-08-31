@@ -101,7 +101,7 @@ zstd = { version = "0.13", default-features = false }
 [features]
 default = [
     "json", "matched-path", "original-uri",
-    "http1", "http2", "tower-log", "form", "query",
+    "http1", "http2", "tower-log", "form", "query", "tokio", "tracing",
 ]
 
 # Axum-parity features
@@ -116,6 +116,15 @@ ws = ["dep:tungstenite", "dep:futures-util", "dep:flate2"]
 form = []
 query = []
 multipart = ["dep:multer"]
+# No-op axum-parity features: axum gates these behind a Cargo feature, but
+# tachyon-web always depends on tokio and always compiles in tracing, so
+# `features = ["tokio"]` / `features = ["tracing"]` just need to keep
+# resolving after an axum -> tachyon-web swap, not do anything themselves.
+# `macros` is axum's `#[debug_handler]` derive; tachyon-web has no equivalent
+# proc-macro crate to gate, so this is a pure compatibility placeholder.
+tokio = []
+tracing = []
+macros = []
 
 # Tachyon-only additions
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]

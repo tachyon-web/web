@@ -69,30 +69,56 @@ pub use tungstenite::protocol::WebSocketConfig;
 /// Matches `axum::extract::ws::close_code`.
 pub mod close_code {
     /// Normal, successful closure — the purpose the connection was opened for has been fulfilled.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::NORMAL`.*
     pub const NORMAL: u16 = 1000;
     /// The endpoint is going away (server shutdown, browser navigating away).
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::AWAY`.*
     pub const AWAY: u16 = 1001;
     /// The endpoint is terminating the connection due to a protocol error.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::PROTOCOL`.*
     pub const PROTOCOL: u16 = 1002;
     /// The endpoint received data it can't accept (e.g. non-UTF-8 text).
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::UNSUPPORTED`.*
     pub const UNSUPPORTED: u16 = 1003;
     /// Reserved: no status code was present, even though one was expected.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::STATUS`.*
     pub const STATUS: u16 = 1005;
     /// Reserved: the connection was closed abnormally, without a close frame.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::ABNORMAL`.*
     pub const ABNORMAL: u16 = 1006;
     /// The endpoint received data inconsistent with the message type (e.g. non-UTF-8 in a text message).
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::INVALID`.*
     pub const INVALID: u16 = 1007;
     /// The endpoint received a message violating its policy.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::POLICY`.*
     pub const POLICY: u16 = 1008;
     /// The endpoint received a message too large to process.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::SIZE`.*
     pub const SIZE: u16 = 1009;
     /// The client expected the server to negotiate one or more extensions it didn't.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::EXTENSION`.*
     pub const EXTENSION: u16 = 1010;
     /// The server encountered an unexpected condition preventing it from fulfilling the request.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::ERROR`.*
     pub const ERROR: u16 = 1011;
     /// Reserved: the connection was closed due to a failure to perform a TLS handshake.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::RESTART`.*
     pub const RESTART: u16 = 1012;
     /// The service is restarting.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::close_code::AGAIN`.*
     pub const AGAIN: u16 = 1013;
 }
 
@@ -100,6 +126,8 @@ pub mod close_code {
 /// feature, HTTP/2 extended-`CONNECT`) request.
 ///
 /// See the [module docs](self) for an example.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::WebSocketUpgrade`.*
 #[must_use]
 pub struct WebSocketUpgrade<F = DefaultOnFailedUpgrade> {
     config: WebSocketConfig,
@@ -246,6 +274,12 @@ impl<F> WebSocketUpgrade<F> {
         self.protocol.as_ref()
     }
 
+    /// Overrides the selected WebSocket subprotocol, bypassing [`protocols`](Self::protocols)'s
+    /// own negotiation against the client's requested list.
+    pub fn set_selected_protocol(&mut self, protocol: HeaderValue) {
+        self.protocol = Some(protocol);
+    }
+
     /// The `Origin` header sent by the client, if any.
     ///
     /// Present for browser clients (and absent for most non-browser WebSocket clients).
@@ -283,7 +317,7 @@ impl<F> WebSocketUpgrade<F> {
     /// The returned [`Response`] must be returned from the handler unmodified for the
     /// upgrade to complete.
     #[must_use = "the response from `on_upgrade` must be returned from the handler"]
-    pub fn on_upgrade<C, Fut>(self, callback: C) -> Response<Body>
+    pub fn on_upgrade<C, Fut>(self, callback: C) -> crate::http::response::Response
     where
         C: FnOnce(WebSocket) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -351,6 +385,8 @@ impl<F> WebSocketUpgrade<F> {
 /// What to do when completing a WebSocket connection upgrade fails.
 ///
 /// See [`WebSocketUpgrade::on_failed_upgrade`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ws::OnFailedUpgrade`.*
 pub trait OnFailedUpgrade: Send + 'static {
     /// Handle the failure.
     fn call(self, error: Error);
@@ -366,6 +402,8 @@ where
 }
 
 /// The default [`OnFailedUpgrade`]: silently ignores the error.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ws::DefaultOnFailedUpgrade`.*
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct DefaultOnFailedUpgrade;

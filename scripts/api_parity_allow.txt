@@ -1,0 +1,13 @@
+# Deliberate, reviewed deviations from axum's public API.
+#
+# One finding per line: the CODE, a TAB, then the path exactly as
+# `scripts/api_diff.py parity` prints it after the code. Everything after `#`
+# is a comment -- always record *why* the deviation is acceptable, since an
+# entry here is the only thing standing between a real compat break and a
+# green CI run.
+#
+# Example:
+#   SIGNATURE<TAB>(type) RequestExt  # axum seals this trait; we don't. Strictly
+#                                    # more permissive, so no downstream break.
+#
+# Empty on purpose: nothing is currently waived.

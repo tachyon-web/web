@@ -14,6 +14,8 @@ use crate::routing::tower_compat::Route;
 use crate::routing::{middleware, static_dir, tower_compat};
 
 /// Axum-like routing table using `matchit` under the hood.
+///
+/// *Axum compatibility: drop-in replacement for `axum::Router`.*
 #[derive(Clone)]
 pub struct Router<S = ()> {
     pub(crate) routes: Vec<(String, MethodRouter<S>)>,
@@ -270,6 +272,21 @@ where
         tower_compat::IntoMakeService::new(self)
     }
 
+    /// Converts this router into a `tower::make::MakeService` that also derives a
+    /// [`ConnectInfo<C>`](crate::routing::extract::ConnectInfo) from each accepted connection,
+    /// matching `axum::routing::Router::into_make_service_with_connect_info`. Only meaningful
+    /// once `S = ()` — see [`Router::into_make_service`]'s docs.
+    ///
+    /// [`Server`](crate::server::Server) doesn't need this — it injects `ConnectInfo` directly
+    /// on every request as it accepts each connection. This exists for embedding a bare
+    /// `Router` under a different accept loop that only hands you the raw socket addresses.
+    #[must_use]
+    pub const fn into_make_service_with_connect_info<C>(
+        self,
+    ) -> tower_compat::IntoMakeServiceWithConnectInfo<Self, C> {
+        tower_compat::IntoMakeServiceWithConnectInfo::new(self)
+    }
+
     /// Converts this router into a borrowed `tower::Service` with a fixed body type `B`,
     /// matching `axum::routing::Router::as_service`. Useful for calling a router directly
     /// (e.g. via `tower::ServiceExt::oneshot`) without going through a real server — see
@@ -456,7 +473,8 @@ where
     /// both routers already have a `fallback`/`method_not_allowed_fallback` configured —
     /// matching Axum's `Router::merge`.
     #[must_use]
-    pub fn merge(mut self, mut other: Self) -> Self {
+    pub fn merge<R: Into<Self>>(mut self, other: R) -> Self {
+        let mut other = other.into();
         self.compiled = None;
         for (path, method_router) in other.routes.drain(..) {
             self.push_or_merge_route(path, method_router);
@@ -632,7 +650,7 @@ where
     pub fn fallback<H, T>(mut self, handler: H) -> Self
     where
         H: Handler<T, S>,
-        T: Send + 'static,
+        T: 'static,
     {
         self.fallback = Some(Arc::new(move |state| {
             Route::from_handler(handler.clone(), &state)
@@ -648,12 +666,37 @@ where
     pub fn method_not_allowed_fallback<H, T>(mut self, handler: H) -> Self
     where
         H: Handler<T, S>,
-        T: Send + 'static,
+        T: 'static,
     {
         self.method_not_allowed_fallback = Some(Arc::new(move |state| {
             Route::from_handler(handler.clone(), &state)
         }));
         self.compiled = None;
+        self
+    }
+
+    /// Clears any fallback set via [`Router::fallback`]/[`Router::fallback_service`], reverting
+    /// to the default `404 Not Found`.
+    #[must_use]
+    pub fn reset_fallback(mut self) -> Self {
+        self.fallback = None;
+        self.compiled = None;
+        self
+    }
+
+    /// Whether this router has any routes registered.
+    #[must_use]
+    pub const fn has_routes(&self) -> bool {
+        !self.routes.is_empty()
+    }
+
+    /// A no-op builder method, matching `axum::routing::Router::without_v07_checks`.
+    ///
+    /// Axum 0.8 added a stricter path-conflict check on top of 0.7's, and this opts back
+    /// out of it; this crate's `matchit`-backed router only ever had the one (equivalent
+    /// to 0.8's) conflict check, so there is no looser mode to opt into.
+    #[must_use]
+    pub const fn without_v07_checks(self) -> Self {
         self
     }
 
@@ -799,6 +842,8 @@ where
 }
 
 /// Errors that can occur during router construction or compilation.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub enum RouterError {
     /// Duplicate route registered.

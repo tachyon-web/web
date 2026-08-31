@@ -96,9 +96,13 @@ use sfv::{BareItemFromInput, Date, Decimal, Parser};
 /// fields are tens of bytes; this sits far above any legitimate use and far
 /// below the point where per-request parsing work becomes interesting to an
 /// attacker.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub const MAX_INPUT: usize = 16 * 1024;
 
 /// Why a structured-field header was rejected.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SfvError {
@@ -188,6 +192,8 @@ impl crate::http::response::IntoResponse for SfvError {
 }
 
 /// Result alias for this module.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub type SfvResult<T> = std::result::Result<T, SfvError>;
 
 /// Checks the size bound before handing bytes to the parser.
@@ -206,6 +212,8 @@ const fn checked(input: &[u8]) -> SfvResult<&[u8]> {
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed
 /// `sf-dictionary`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 pub fn parse_dictionary(input: &[u8]) -> SfvResult<Dictionary> {
     Ok(Parser::new(checked(input)?).parse_dictionary()?)
@@ -218,6 +226,8 @@ pub fn parse_dictionary(input: &[u8]) -> SfvResult<Dictionary> {
 /// # Errors
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed `sf-list`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 pub fn parse_list(input: &[u8]) -> SfvResult<List> {
     Ok(Parser::new(checked(input)?).parse_list()?)
@@ -230,6 +240,8 @@ pub fn parse_list(input: &[u8]) -> SfvResult<List> {
 /// # Errors
 ///
 /// Returns [`SfvError`] if the field is oversized or not a well-formed `sf-item`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 pub fn parse_item(input: &[u8]) -> SfvResult<Item> {
     Ok(Parser::new(checked(input)?).parse_item()?)
@@ -238,6 +250,8 @@ pub fn parse_item(input: &[u8]) -> SfvResult<Item> {
 /// The integer at `key`, if the key is present and holds an integer item.
 ///
 /// Requires the `sfv` feature.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 #[must_use]
 pub fn dict_integer(dict: &Dictionary, key: &str) -> Option<i64> {
@@ -252,6 +266,8 @@ pub fn dict_integer(dict: &Dictionary, key: &str) -> Option<i64> {
 /// Note that a bare key (`i` rather than `i=?1`) is a boolean `true`.
 ///
 /// Requires the `sfv` feature.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 #[must_use]
 pub fn dict_boolean(dict: &Dictionary, key: &str) -> Option<bool> {
@@ -265,6 +281,8 @@ pub fn dict_boolean(dict: &Dictionary, key: &str) -> Option<bool> {
 /// display-string item.
 ///
 /// Requires the `sfv` feature.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 #[must_use]
 pub fn dict_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
@@ -287,6 +305,8 @@ pub fn dict_str<'a>(dict: &'a Dictionary, key: &str) -> Option<&'a str> {
 ///
 /// Implemented for `i64`, `bool`, `f64`, [`Decimal`], `String`, `Vec<u8>`,
 /// `Date` and `Option<T>`. [`sfv_dictionary!`](crate::sfv_dictionary) dispatches through this.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub trait FromSfvValue: Sized {
     /// What this type expects, for the rejection message ("an integer", ...).
     const EXPECTED: &'static str;
@@ -389,6 +409,8 @@ impl<T: FromSfvValue> SlotSink for Option<T> {
 /// value alone. Stashing it here, in a cell the caller keeps a reference to
 /// independently of the (consumed) visitor, is what lets [`parse_with_visitor`]
 /// recover it: see [`capture`].
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub type ErrorSlot = Cell<Option<SfvError>>;
 
 /// Runs `result`, and if it is `Err`, stashes the error in `errors` and
@@ -497,6 +519,8 @@ macro_rules! __sfv_missing {
 /// ```
 ///
 /// Requires the `sfv` feature.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 #[macro_export]
 macro_rules! sfv_dictionary {
@@ -627,6 +651,8 @@ macro_rules! __sfv_dictionary_impl {
 ///
 /// Returns [`SfvError`] if the field is oversized, malformed, or the visitor
 /// rejects it.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub fn parse_with_visitor<'de, V>(input: &'de [u8], visitor: V) -> SfvResult<V::Out>
 where
     V: sfv::visitor::DictionaryVisitor<'de, Error = SfvError>,
@@ -638,6 +664,8 @@ where
 ///
 /// Implemented by [`sfv_dictionary!`](crate::sfv_dictionary), or by hand (via [`parse_with_visitor`]
 /// or the parse helpers) for headers the macro does not cover.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub trait FromStructuredHeader: Sized {
     /// The lowercase name of the header this type is parsed from.
     const HEADER_NAME: &'static str;
@@ -669,6 +697,8 @@ pub trait FromStructuredHeader: Sized {
 /// }
 /// # }
 /// ```
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "sfv")]
 #[derive(Debug, Clone, Copy)]
 pub struct StructuredHeader<T>(pub T);
@@ -758,6 +788,8 @@ where
 /// invalid without; this is for the advisory kind, like [`Priority`], where a
 /// client sending a garbled value should fall back to normal handling rather
 /// than have its request rejected over a hint.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[must_use]
 pub fn header_or_default<T>(headers: &hyper::HeaderMap) -> T
 where
@@ -777,6 +809,8 @@ __sfv_dictionary_impl! {
     /// Out-of-range urgencies are deliberately *not* rejected — RFC 9218 says
     /// to ignore them and use the default — so read [`Priority::urgency`]
     /// rather than the raw field when scheduling on it.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub struct Priority for "priority" {
         /// The raw `u` value, exactly as sent.

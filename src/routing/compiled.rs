@@ -18,6 +18,8 @@ use crate::routing::tower_compat::Route;
 /// phantom type parameter for API-shape continuity (`CompiledRouter<S>`);
 /// dispatch itself needs no further state, since it was bound once, here, at
 /// [`crate::routing::router::Router::compile`] time.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub struct CompiledRouter<S> {
     pub(crate) matcher: matchit::Router<CompiledMethodRouter>,
     pub(crate) fallback: Option<Route>,

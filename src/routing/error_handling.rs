@@ -29,6 +29,8 @@ use tower::{Layer, Service};
 /// yet load-bearing here: axum uses it to let `f` additionally take `FromRequestParts`
 /// extractors ahead of the error (`|State(s), err| ...`) via a family of tuple impls this
 /// crate hasn't ported — `f` must be a plain `FnOnce(Error) -> Fut` for now.
+///
+/// *Axum compatibility: drop-in replacement for `axum::error_handling::HandleErrorLayer`.*
 pub struct HandleErrorLayer<F, T = ()> {
     f: F,
     _extractor: PhantomData<fn() -> T>,
@@ -74,6 +76,8 @@ where
 /// The `tower::Service` produced by [`HandleErrorLayer`]. Matches
 /// `axum::error_handling::HandleError`. See [`HandleErrorLayer`]'s docs for the current
 /// scope of the phantom `T` parameter.
+///
+/// *Axum compatibility: drop-in replacement for `axum::error_handling::HandleError`.*
 pub struct HandleError<S, F, T = ()> {
     inner: S,
     f: F,
@@ -110,8 +114,15 @@ impl<S, F, T> std::fmt::Debug for HandleError<S, F, T> {
 
 /// The future returned by [`HandleError`]'s `Service::call`. Matches
 /// `axum::error_handling::future::HandleErrorFuture`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::error_handling::future::HandleErrorFuture`.*
 pub struct HandleErrorFuture {
     future: Pin<Box<dyn Future<Output = Result<Response, std::convert::Infallible>> + Send>>,
+}
+
+/// Re-export of [`HandleErrorFuture`] at the path `axum::error_handling::future` uses.
+pub mod future {
+    pub use super::HandleErrorFuture;
 }
 
 impl std::fmt::Debug for HandleErrorFuture {
@@ -119,6 +130,8 @@ impl std::fmt::Debug for HandleErrorFuture {
         f.debug_struct("HandleErrorFuture").finish_non_exhaustive()
     }
 }
+
+impl Unpin for HandleErrorFuture {}
 
 impl Future for HandleErrorFuture {
     type Output = Result<Response, std::convert::Infallible>;

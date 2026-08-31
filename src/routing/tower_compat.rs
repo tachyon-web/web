@@ -26,8 +26,10 @@ use tower::{Layer, Service, ServiceExt as _};
 /// `tower::Service` handed to `get_service`/`on_service`/etc. keeps its own error all
 /// the way up to [`crate::routing::Router::route`], which (like axum) only accepts it
 /// once `E = Infallible`. `Handler`-based routes never carry a live `E` at all, since
-/// [`Handler::call`](crate::routing::handler::Handler::call) has no `Error` type — it
+/// [`Handler::call`] has no `Error` type — it
 /// always resolves to a `Response` via [`IntoResponse`] before it ever reaches a `Route`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::Route`.*
 pub struct Route<E = Infallible>(
     tower::util::BoxCloneSyncService<Request<Body>, Response<Body>, E>,
 );
@@ -105,6 +107,8 @@ impl<E: 'static> Service<Request<Body>> for Route<E> {
 }
 
 /// Response future for [`Route`]. Matches `axum::routing::future::RouteFuture`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::future::RouteFuture`.*
 pub struct RouteFuture<E> {
     inner: Pin<Box<dyn Future<Output = Result<Response<Body>, E>> + Send>>,
 }
@@ -123,6 +127,8 @@ impl<E> RouteFuture<E> {
     }
 }
 
+impl<E> Unpin for RouteFuture<E> {}
+
 impl<E> Future for RouteFuture<E> {
     type Output = Result<Response<Body>, E>;
 
@@ -138,6 +144,8 @@ impl<E> Future for RouteFuture<E> {
 /// implementing its own `Handler` trait, letting one router be nested as a handler in
 /// another — not yet ported) — kept as a real, usable type for axum-ported code that
 /// names it directly.
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::future::InfallibleRouteFuture`.*
 pub struct InfallibleRouteFuture {
     future: RouteFuture<Infallible>,
 }
@@ -155,6 +163,8 @@ impl InfallibleRouteFuture {
         Self { future }
     }
 }
+
+impl Unpin for InfallibleRouteFuture {}
 
 impl Future for InfallibleRouteFuture {
     type Output = Response<Body>;
@@ -175,6 +185,8 @@ impl Future for InfallibleRouteFuture {
 /// Normalizes to `Response<Body>`/`Error = Infallible` before being boxed back into a
 /// `Route` — the one normalization point every layer application funnels through. Matches
 /// `axum::middleware::ResponseAxumBody`. Built via [`ResponseAxumBodyLayer`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::ResponseAxumBody`.*
 pub struct ResponseAxumBody<S>(S);
 
 impl<S: Clone> Clone for ResponseAxumBody<S> {
@@ -233,6 +245,8 @@ where
 
 /// Response future for [`ResponseAxumBody`]. Matches
 /// `axum::middleware::ResponseAxumBodyFuture`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::ResponseAxumBodyFuture`.*
 pub struct ResponseAxumBodyFuture<Fut = ()> {
     inner: Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
     _marker: PhantomData<fn() -> Fut>,
@@ -255,6 +269,8 @@ impl<Fut> Future for ResponseAxumBodyFuture<Fut> {
 
 /// `tower::Layer` producing [`ResponseAxumBody`]. Matches
 /// `axum::middleware::ResponseAxumBodyLayer`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::ResponseAxumBodyLayer`.*
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResponseAxumBodyLayer;
 
@@ -275,6 +291,8 @@ impl<S> Layer<S> for ResponseAxumBodyLayer {
 }
 
 /// Marker type parameter for [`Handler`] impls backed by a raw `tower::Service`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct TowerServiceMarker;
 
@@ -283,6 +301,8 @@ pub struct TowerServiceMarker;
 /// Used by [`Router::route_service`](crate::routing::Router::route_service),
 /// [`Router::nest_service`](crate::routing::Router::nest_service), and
 /// [`Router::fallback_service`](crate::routing::Router::fallback_service).
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone)]
 pub struct ServiceHandler<Svc> {
     pub(crate) service: Svc,
@@ -362,6 +382,8 @@ where
 ///
 /// Lets a bare handler be served directly (no `Router`) or passed to any Tower/Hyper API
 /// expecting a `Service<Request<Body>>`. Built via [`Handler::with_state`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::handler::HandlerService`.*
 pub struct HandlerService<H, T, S> {
     handler: H,
     state: S,
@@ -375,6 +397,32 @@ impl<H, T, S> HandlerService<H, T, S> {
             state,
             _marker: PhantomData,
         }
+    }
+
+    /// The state this handler was bound to via [`Handler::with_state`].
+    pub const fn state(&self) -> &S {
+        &self.state
+    }
+}
+
+impl<H, T, S> HandlerService<H, T, S>
+where
+    H: Handler<T, S> + Clone,
+    S: Clone + Send + Sync + 'static,
+{
+    /// Converts this into a `tower::make::MakeService`. Inherent shortcut for
+    /// [`ServiceExt::into_make_service`] that needs no trait import, matching Axum's own
+    /// inherent `HandlerService::into_make_service`.
+    pub fn into_make_service(self) -> IntoMakeService<Self> {
+        ServiceExt::into_make_service(self)
+    }
+
+    /// Converts this into a `tower::make::MakeService` that also derives a
+    /// [`ConnectInfo<C>`](crate::routing::extract::ConnectInfo) from each accepted connection.
+    /// Inherent shortcut for [`ServiceExt::into_make_service_with_connect_info`], matching
+    /// Axum's own inherent `HandlerService::into_make_service_with_connect_info`.
+    pub fn into_make_service_with_connect_info<C>(self) -> IntoMakeServiceWithConnectInfo<Self, C> {
+        ServiceExt::into_make_service_with_connect_info(self)
     }
 }
 
@@ -419,6 +467,8 @@ where
 
 /// Response future for [`HandlerService`]'s `Service` impl. Matches
 /// `axum::handler::future::IntoServiceFuture`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::handler::future::IntoServiceFuture`.*
 pub struct IntoServiceFuture<F = ()> {
     inner: Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
     _marker: PhantomData<fn() -> F>,
@@ -440,6 +490,8 @@ impl<F> Future for IntoServiceFuture<F> {
 
 /// A handler wrapped with a `tower::Layer`, matching `axum::handler::Handler::layer` —
 /// produced by [`Handler::layer`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::handler::Layered`.*
 pub struct Layered<L, H, T, S> {
     layer: L,
     handler: H,
@@ -510,6 +562,8 @@ where
 
 /// The future backing [`Layered`]'s `Handler::call`, produced while awaiting its
 /// wrapped `tower::Layer` pipeline. Matches `axum::handler::future::LayeredFuture`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::handler::future::LayeredFuture`.*
 pub struct LayeredFuture<S>
 where
     S: Service<crate::http::Request>,
@@ -527,6 +581,8 @@ where
     }
 }
 
+impl<S> Unpin for LayeredFuture<S> where S: Service<crate::http::Request> {}
+
 impl<S> Future for LayeredFuture<S>
 where
     S: Service<crate::http::Request>,
@@ -543,6 +599,8 @@ where
 /// Applies to handlers already at `Handler<T, ()>`, skipping the explicit
 /// `.with_state(())` call that [`Handler::with_state`] otherwise requires. Matches
 /// `axum::handler::HandlerWithoutStateExt`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::handler::HandlerWithoutStateExt`.*
 pub trait HandlerWithoutStateExt<T>: Handler<T, ()> {
     /// Converts this handler directly into a `tower::Service`, matching
     /// `axum::handler::HandlerWithoutStateExt::into_service`.
@@ -638,7 +696,7 @@ where
     }
 }
 
-/// Lets a bare `Router` be passed directly to [`crate::server::serve`], matching axum's own
+/// Lets a bare `Router` be passed directly to [`crate::server::serve()`], matching axum's own
 /// `impl<L> Service<serve::IncomingStream<'_, L>> for Router<()>`: the router is its own trivial
 /// `MakeService`, cloning itself once per accepted connection rather than needing an explicit
 /// `.into_make_service()` call.
@@ -663,6 +721,8 @@ where
 ///
 /// Has a fixed body type. Matches `axum::routing::RouterAsService`. Built via
 /// [`Router::as_service`](crate::routing::Router::as_service).
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::RouterAsService`.*
 pub struct RouterAsService<'a, B, S = ()> {
     router: &'a mut crate::routing::Router<S>,
     _marker: PhantomData<fn(B)>,
@@ -707,6 +767,8 @@ where
 ///
 /// Has a fixed body type. Matches `axum::routing::RouterIntoService`. Built via
 /// [`Router::into_service`](crate::routing::Router::into_service).
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::RouterIntoService`.*
 pub struct RouterIntoService<B, S = ()> {
     router: crate::routing::Router<S>,
     _marker: PhantomData<fn(B)>,
@@ -761,6 +823,8 @@ where
 /// One clone per connection. Matches `axum::routing::IntoMakeService`. Built via
 /// [`Router::into_make_service`](crate::routing::Router::into_make_service) (or
 /// [`ServiceExt::into_make_service`] for any other `tower::Service`).
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::IntoMakeService`.*
 #[derive(Debug, Clone)]
 pub struct IntoMakeService<S> {
     svc: S,
@@ -791,9 +855,13 @@ where
 
 /// Response future for [`IntoMakeService`]. Matches
 /// `axum::routing::future::IntoMakeServiceFuture`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::future::IntoMakeServiceFuture`.*
 pub struct IntoMakeServiceFuture<S> {
     future: std::future::Ready<Result<S, Infallible>>,
 }
+
+impl<S> Unpin for IntoMakeServiceFuture<S> {}
 
 impl<S> IntoMakeServiceFuture<S> {
     fn new(svc: S) -> Self {
@@ -820,6 +888,8 @@ impl<S> Future for IntoMakeServiceFuture<S> {
 
 /// Extension trait adding a couple of extra methods to any `tower::Service`.
 /// Matches `axum::ServiceExt`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::ServiceExt`.*
 pub trait ServiceExt<R>: Service<R> + Sized {
     /// Converts this service into a `tower::make::MakeService`. Matches
     /// `axum::ServiceExt::into_make_service`.
@@ -858,12 +928,14 @@ where
     }
 }
 
-/// A connection accepted by [`crate::serve`]'s (or a caller's own) accept loop, before its
+/// A connection accepted by [`crate::serve()`]'s (or a caller's own) accept loop, before its
 /// per-connection `tower::Service` is produced from it.
 ///
 /// Matches `axum::serve::IncomingStream`: generic over the listener type `L`, giving a
 /// `MakeService` access to the raw accepted IO (e.g. for TLS SNI inspection, peer certs,
 /// Unix-socket credentials) as well as the address.
+///
+/// *Axum compatibility: drop-in replacement for `axum::serve::IncomingStream`.*
 pub struct IncomingStream<'a, L>
 where
     L: crate::server::Listener,
@@ -899,6 +971,8 @@ impl<L: crate::server::Listener> std::fmt::Debug for IncomingStream<'_, L> {
 
 /// Derives a [`ConnectInfo`](crate::routing::extract::ConnectInfo) payload from an
 /// accepted connection. Matches `axum::extract::connect_info::Connected`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::connect_info::Connected`.*
 pub trait Connected<T>: Clone + Send + Sync + 'static {
     /// Builds the connect-info value for this connection.
     fn connect_info(stream: T) -> Self;
@@ -916,6 +990,8 @@ impl Connected<IncomingStream<'_, tokio::net::TcpListener>> for std::net::Socket
 /// before forwarding it to the inner service. Built via
 /// [`IntoMakeServiceWithConnectInfo`]'s `Service<IncomingStream>` impl, or directly via
 /// [`MockConnectInfo`] for tests.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub struct ConnectInfoService<S, C> {
     svc: S,
     connect_info: C,
@@ -963,9 +1039,20 @@ where
 /// Tags each clone with `ConnectInfo<C>` derived from its accepted [`IncomingStream`].
 /// Matches `axum::extract::connect_info::IntoMakeServiceWithConnectInfo`. Built via
 /// [`ServiceExt::into_make_service_with_connect_info`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::connect_info::IntoMakeServiceWithConnectInfo`.*
 pub struct IntoMakeServiceWithConnectInfo<S, C> {
     svc: S,
     _marker: PhantomData<fn() -> C>,
+}
+
+impl<S, C> IntoMakeServiceWithConnectInfo<S, C> {
+    pub(crate) const fn new(svc: S) -> Self {
+        Self {
+            svc,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<S: Clone, C> Clone for IntoMakeServiceWithConnectInfo<S, C> {
@@ -1011,9 +1098,13 @@ where
 
 /// Response future for [`IntoMakeServiceWithConnectInfo`]. Matches
 /// `axum::extract::connect_info::ResponseFuture`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::connect_info::ResponseFuture`.*
 pub struct ResponseFuture<S, C> {
     inner: std::future::Ready<Result<ConnectInfoService<S, C>, Infallible>>,
 }
+
+impl<S, C> Unpin for ResponseFuture<S, C> {}
 
 impl<S, C> std::fmt::Debug for ResponseFuture<S, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1035,6 +1126,8 @@ impl<S, C> Future for ResponseFuture<S, C> {
 /// [`ConnectInfo<C>`](crate::routing::extract::ConnectInfo) — for testing handlers
 /// that use `ConnectInfo` without going through a real accept loop. Matches
 /// `axum::extract::connect_info::MockConnectInfo`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::connect_info::MockConnectInfo`.*
 #[derive(Debug, Clone, Copy)]
 pub struct MockConnectInfo<T>(pub T);
 

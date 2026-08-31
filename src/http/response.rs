@@ -19,6 +19,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// The unified body type for Tachyon-Web responses. Matches `axum_core::body::Body`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::body::Body`.*
 #[derive(Debug)]
 pub struct Body(BoxBody<Bytes, crate::http::error::Error>);
 
@@ -56,6 +58,30 @@ impl Body {
         B::Error: Into<crate::http::error::Error>,
     {
         Self(boxed(body))
+    }
+
+    /// Create a new `Body` from an [`HyperBody`](hyper::body::Body) implementation. An alias
+    /// for [`Body::stream`] at the name Axum's equivalent uses.
+    ///
+    /// Matches `axum::body::Body::new`.
+    pub fn new<B>(body: B) -> Self
+    where
+        B: HyperBody<Data = Bytes> + Send + 'static,
+        B::Error: Into<crate::http::error::Error>,
+    {
+        Self::stream(body)
+    }
+
+    /// Create a new `Body` from a fallible [`Stream`](futures_core::Stream) of byte chunks.
+    ///
+    /// Matches `axum::body::Body::from_stream`.
+    pub fn from_stream<S>(stream: S) -> Self
+    where
+        S: futures_core::stream::TryStream + Send + 'static,
+        S::Ok: Into<Bytes>,
+        S::Error: Into<crate::http::error::Error>,
+    {
+        Self::stream(http_body_util::StreamBody::new(FrameStream { stream }))
     }
 
     /// Converts this body into a [`Stream`](futures_core::Stream) of its data frames,
@@ -97,14 +123,118 @@ impl Body {
     }
 }
 
+impl From<Bytes> for Body {
+    fn from(bytes: Bytes) -> Self {
+        Self::full(bytes)
+    }
+}
+
+impl From<&'static [u8]> for Body {
+    fn from(bytes: &'static [u8]) -> Self {
+        Self::full(Bytes::from_static(bytes))
+    }
+}
+
+impl From<&'static str> for Body {
+    fn from(s: &'static str) -> Self {
+        Self::full(Bytes::from_static(s.as_bytes()))
+    }
+}
+
+impl From<()> for Body {
+    fn from((): ()) -> Self {
+        Self::empty()
+    }
+}
+
+impl From<std::borrow::Cow<'static, [u8]>> for Body {
+    fn from(cow: std::borrow::Cow<'static, [u8]>) -> Self {
+        match cow {
+            std::borrow::Cow::Borrowed(b) => b.into(),
+            std::borrow::Cow::Owned(v) => v.into(),
+        }
+    }
+}
+
+impl From<std::borrow::Cow<'static, str>> for Body {
+    fn from(cow: std::borrow::Cow<'static, str>) -> Self {
+        match cow {
+            std::borrow::Cow::Borrowed(s) => s.into(),
+            std::borrow::Cow::Owned(s) => s.into(),
+        }
+    }
+}
+
+impl From<String> for Body {
+    fn from(s: String) -> Self {
+        Self::full(Bytes::from(s))
+    }
+}
+
+impl From<Vec<u8>> for Body {
+    fn from(v: Vec<u8>) -> Self {
+        Self::full(Bytes::from(v))
+    }
+}
+
+impl IntoResponse for Body {
+    fn into_response(self) -> Response {
+        HttpResponse::new(self)
+    }
+}
+
+impl<S: Sync> crate::routing::extract::FromRequest<S> for Body {
+    type Rejection = std::convert::Infallible;
+
+    fn from_request(
+        req: hyper::Request<Self>,
+        _state: &S,
+    ) -> impl std::future::Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Ok(req.into_body()))
+    }
+}
+
 /// Buffers `body` into a single [`Bytes`], rejecting bodies over `limit`.
 /// Free-function form of [`Body::collect_bytes`], matching `axum::body::to_bytes`.
 ///
 /// # Errors
 ///
 /// Returns an error if `body` exceeds `limit` or otherwise fails to read.
-pub async fn to_bytes(body: Body, limit: usize) -> Result<Bytes, crate::http::error::Error> {
+///
+/// *Axum compatibility: drop-in replacement for `axum::body::to_bytes`.*
+pub async fn to_bytes(
+    body: Body,
+    limit: usize,
+) -> std::result::Result<Bytes, crate::http::error::Error> {
     body.collect_bytes(limit).await
+}
+
+pin_project_lite::pin_project! {
+    /// Adapts a fallible byte-chunk [`Stream`](futures_core::Stream) into the
+    /// `Result<Frame<Bytes>, Error>` stream [`http_body_util::StreamBody`] needs, for
+    /// [`Body::from_stream`].
+    struct FrameStream<S> {
+        #[pin]
+        stream: S,
+    }
+}
+
+impl<S> futures_core::Stream for FrameStream<S>
+where
+    S: futures_core::stream::TryStream,
+    S::Ok: Into<Bytes>,
+    S::Error: Into<crate::http::error::Error>,
+{
+    type Item = Result<Frame<Bytes>, crate::http::error::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.project().stream.try_poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(Frame::data(chunk.into())))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl HyperBody for Body {
@@ -129,6 +259,8 @@ impl HyperBody for Body {
 
 /// A stream of a [`Body`]'s data frames, with trailers discarded. Returned by
 /// [`Body::into_data_stream`]. Matches `axum_core::body::BodyDataStream`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::body::BodyDataStream`.*
 pub struct BodyDataStream {
     inner: Body,
 }
@@ -160,11 +292,35 @@ impl futures_core::Stream for BodyDataStream {
     }
 }
 
+impl HyperBody for BodyDataStream {
+    type Data = Bytes;
+    type Error = crate::http::error::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        futures_core::Stream::poll_next(self, cx).map(|opt| opt.map(|res| res.map(Frame::data)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// A Tachyon HTTP response, generic over its body type (defaulting to [`Body`]).
 /// Matches `axum_core::response::Response`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::Response`.*
 pub type Response<T = Body> = HttpResponse<T>;
 
 /// Trait for generating an HTTP response.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::IntoResponse`.*
 pub trait IntoResponse {
     /// Convert the type into a [`Response`].
     fn into_response(self) -> Response;
@@ -234,8 +390,16 @@ impl IntoResponse for &'static [u8] {
 }
 
 /// An HTML response.
-#[derive(Debug, Clone)]
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::Html`.*
+#[derive(Debug, Clone, Copy)]
 pub struct Html<T>(pub T);
+
+impl<T> From<T> for Html<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
 
 impl<T> IntoResponse for Html<T>
 where
@@ -272,6 +436,22 @@ impl std::io::Write for BytesMutWriter<'_> {
 /// A JSON response. Requires the `json` feature.
 #[cfg(feature = "json")]
 pub use crate::routing::extract::Json;
+
+/// Re-export of the [`Extension`](crate::routing::extract::parts::Extension) extractor
+/// at the path `axum::response::Extension` uses (it doubles as a response type
+/// there too).
+pub use crate::routing::extract::Extension;
+
+/// Re-export of the [`Form`](crate::routing::extract::body::Form) extractor at the
+/// path `axum::response::Form` uses. Requires the `form` feature.
+#[cfg(feature = "form")]
+pub use crate::routing::extract::Form;
+
+/// A handler return type that carries any [`IntoResponse`] error, matching
+/// `axum::response::Result`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::Result`.*
+pub type Result<T, E = ErrorResponse> = std::result::Result<T, E>;
 
 #[cfg(feature = "json")]
 impl<T> IntoResponse for Json<T>
@@ -351,15 +531,29 @@ where
 
 /// The response under construction, passed to [`IntoResponseParts::into_response_parts`]
 /// so implementors can attach headers/extensions without unpacking the whole response.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::ResponseParts`.*
 #[derive(Debug)]
 pub struct ResponseParts {
     res: Response,
 }
 
 impl ResponseParts {
+    /// Read-only access to the headers of the response being built.
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        self.res.headers()
+    }
+
     /// Mutable access to the headers of the response being built.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         self.res.headers_mut()
+    }
+
+    /// Read-only access to the extensions of the response being built.
+    #[must_use]
+    pub fn extensions(&self) -> &hyper::http::Extensions {
+        self.res.extensions()
     }
 
     /// Mutable access to the extensions of the response being built.
@@ -373,6 +567,8 @@ impl ResponseParts {
 ///
 /// Implement this for your own typed-header wrappers to use them anywhere in a
 /// response tuple, e.g. `(MyCacheControl, StatusCode, Json<T>)`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::IntoResponseParts`.*
 pub trait IntoResponseParts {
     /// The rejection response returned if attaching the parts fails.
     type Error: IntoResponse;
@@ -381,7 +577,10 @@ pub trait IntoResponseParts {
     ///
     /// # Errors
     /// Returns `Self::Error` if the parts cannot be attached (e.g. an invalid header value).
-    fn into_response_parts(self, res: ResponseParts) -> Result<ResponseParts, Self::Error>;
+    fn into_response_parts(
+        self,
+        res: ResponseParts,
+    ) -> std::result::Result<ResponseParts, Self::Error>;
 }
 
 impl IntoResponseParts for HeaderMap {
@@ -433,6 +632,8 @@ where
 
 /// The error produced when a `(K, V)` pair fails to convert into a header name/value,
 /// matching `axum_core::response::TryIntoHeaderError`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub struct TryIntoHeaderError<K, V> {
     kind: TryIntoHeaderErrorKind,
     _marker: PhantomData<fn() -> (K, V)>,
@@ -502,6 +703,8 @@ where
 /// above) — this exists for the common case of a small, fixed list of
 /// `(name, value)` pairs (e.g. `[("x-custom", "1"), ("x-other", "2")]`)
 /// without constructing a full `HeaderMap` first.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::AppendHeaders`.*
 #[derive(Debug, Clone, Copy)]
 pub struct AppendHeaders<I>(pub I);
 
@@ -530,6 +733,17 @@ where
             res.headers_mut().append(key, value);
         }
         Ok(res)
+    }
+}
+
+impl<I, K, V> IntoResponse for AppendHeaders<I>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: TryInto<HeaderName>,
+    V: TryInto<HeaderValue>,
+{
+    fn into_response(self) -> Response {
+        (self, ()).into_response()
     }
 }
 
@@ -623,6 +837,8 @@ impl IntoResponse for std::convert::Infallible {
 }
 
 /// A `204 No Content` response with no body. Matches `axum::response::NoContent`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::NoContent`.*
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoContent;
 
@@ -649,6 +865,8 @@ impl IntoResponse for NoContent {
 ///     Ok("ok")
 /// }
 /// ```
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::ErrorResponse`.*
 #[derive(Debug)]
 pub struct ErrorResponse(Response);
 
@@ -680,6 +898,8 @@ where
 }
 
 /// A response that redirects the client to another location.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::Redirect`.*
 #[derive(Debug, Clone)]
 pub struct Redirect {
     status_code: StatusCode,
@@ -723,6 +943,21 @@ impl Redirect {
             status_code: StatusCode::PERMANENT_REDIRECT,
             location: HeaderValue::try_from(uri).unwrap_or_else(|_| HeaderValue::from_static("/")),
         }
+    }
+
+    /// The `Location` header value this redirect will send.
+    ///
+    /// Falls back to `"/"` if the original `uri` wasn't valid header-value bytes — see
+    /// [`Redirect::to`]'s docs — rather than panicking the way Axum's equivalent does.
+    #[must_use]
+    pub fn location(&self) -> &str {
+        self.location.to_str().unwrap_or("/")
+    }
+
+    /// The status code this redirect will send.
+    #[must_use]
+    pub const fn status_code(&self) -> StatusCode {
+        self.status_code
     }
 }
 

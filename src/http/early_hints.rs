@@ -127,6 +127,8 @@ use std::sync::Arc;
 /// drains before it polls the handler, starve its own response in the process.
 ///
 /// [RFC 8297 §2]: https://www.rfc-editor.org/rfc/rfc8297#section-2
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub const MAX_HINTS_PER_REQUEST: usize = 4;
 
 /// How many `Link` values one hint may carry.
@@ -134,6 +136,8 @@ pub const MAX_HINTS_PER_REQUEST: usize = 4;
 /// A header block big enough to exceed the peer's `SETTINGS_MAX_HEADER_LIST_SIZE` is
 /// refused wholesale, taking the hint's useful links down with the surplus, so the block is
 /// truncated here instead.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub const MAX_LINKS_PER_HINT: usize = 32;
 
 /// A fetch destination, the `as=` parameter of a `rel=preload` link.
@@ -144,6 +148,8 @@ pub const MAX_LINKS_PER_HINT: usize = 32;
 /// come from the [HTML fetch destination] list.
 ///
 /// [HTML fetch destination]: https://fetch.spec.whatwg.org/#concept-request-destination
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum As {
     /// A stylesheet — `<link rel=stylesheet>`.
@@ -201,6 +207,8 @@ impl std::fmt::Display for As {
 }
 
 /// The CORS mode a preload is fetched in — the `crossorigin=` parameter.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrossOrigin {
     /// CORS request without credentials. What fonts and most cross-origin assets need.
@@ -221,6 +229,8 @@ impl CrossOrigin {
 }
 
 /// The `fetchpriority=` hint, relative to other resources of the same destination.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FetchPriority {
     /// Raise this above the browser's default for its destination.
@@ -297,6 +307,8 @@ impl Rel {
 /// ```
 ///
 /// [RFC 8288]: https://www.rfc-editor.org/rfc/rfc8288
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
     target: String,
@@ -551,6 +563,8 @@ fn is_safe_quoted(value: &str) -> bool {
 /// block — one bad target should not cost the others their head start. At most
 /// [`MAX_LINKS_PER_HINT`] survive; the rest are dropped so an oversized block cannot cost
 /// the hint every link it carried.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[must_use]
 pub fn links_to_headers(links: impl IntoIterator<Item = Link>) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -572,6 +586,8 @@ pub fn links_to_headers(links: impl IntoIterator<Item = Link>) -> HeaderMap {
 }
 
 /// Configuration for [`Server::early_hints`](crate::Server::early_hints).
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Debug)]
 pub struct EarlyHintsConfig {
     require_navigation: bool,
@@ -648,6 +664,8 @@ pub(crate) type HintSender = tokio::sync::mpsc::Sender<HeaderMap>;
 /// fallback path, and adding hints to a handler cannot make it start failing.
 ///
 /// Cheap to clone; clones share one budget of [`MAX_HINTS_PER_REQUEST`] sends.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone)]
 pub struct EarlyHints {
     /// `None` on a transport that cannot emit informational responses, or when the request

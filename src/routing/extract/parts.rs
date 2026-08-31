@@ -13,6 +13,8 @@ use std::future::Future;
 use crate::routing::extract::{FromRequestParts, rejection};
 
 /// Derives sub-state from the app state, matching `axum::extract::FromRef`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::FromRef`.*
 pub trait FromRef<T> {
     /// Extract a reference/clone from the parent state.
     fn from_ref(input: &T) -> Self;
@@ -25,8 +27,24 @@ impl<T: Clone> FromRef<T> for T {
 }
 
 /// Extractor for application state.
-#[derive(Debug, Clone, Copy)]
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::State`.*
+#[derive(Debug, Clone, Copy, Default)]
 pub struct State<S>(pub S);
+
+impl<S> std::ops::Deref for State<S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<S> std::ops::DerefMut for State<S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 impl<S: Sync, T> FromRequestParts<S> for State<T>
 where
@@ -76,8 +94,24 @@ impl<S: Sync> FromRequestParts<S> for Uri {
 }
 
 /// Extractor for request-local extensions.
-#[derive(Debug, Clone, Copy)]
+///
+/// *Axum compatibility: drop-in replacement for `axum::Extension`.*
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Extension<T>(pub T);
+
+impl<T> std::ops::Deref for Extension<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Extension<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 impl<S: Sync, T> FromRequestParts<S> for Extension<T>
 where
@@ -151,6 +185,8 @@ where
 
 /// The `tower::Service` produced by [`Extension`]'s `tower::Layer` impl.
 /// Matches `axum::extension::AddExtension`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::AddExtension`.*
 #[derive(Clone, Copy, Debug)]
 pub struct AddExtension<S, T> {
     pub(crate) inner: S,
@@ -180,6 +216,8 @@ where
 }
 
 /// Extractor for reading and managing Cookies.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "cookies")]
 #[derive(Debug, Clone)]
 pub struct Cookies {
@@ -257,6 +295,8 @@ impl<S: Sync> FromRequestParts<S> for Cookies {
 }
 
 /// Extractor for host header or authority.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone)]
 pub struct Host(pub String);
 
@@ -287,9 +327,27 @@ impl<S: Sync> FromRequestParts<S> for Host {
 }
 
 /// Extractor for the original URI. Requires the `original-uri` feature.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::OriginalUri`.*
 #[cfg(feature = "original-uri")]
 #[derive(Debug, Clone)]
 pub struct OriginalUri(pub Uri);
+
+#[cfg(feature = "original-uri")]
+impl std::ops::Deref for OriginalUri {
+    type Target = Uri;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "original-uri")]
+impl std::ops::DerefMut for OriginalUri {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[cfg(feature = "original-uri")]
 impl<S: Sync> FromRequestParts<S> for OriginalUri {
@@ -317,6 +375,8 @@ impl<S: Sync> FromRequestParts<S> for OriginalUri {
 /// one time series per distinct resource ID). Only available for requests that
 /// matched a registered route; unmatched requests (404s) have no `MatchedPath`.
 /// Requires the `matched-path` feature.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::MatchedPath`.*
 #[cfg(feature = "matched-path")]
 #[derive(Debug, Clone)]
 pub struct MatchedPath(pub(crate) std::sync::Arc<str>);
@@ -366,6 +426,8 @@ impl<S: Sync> super::OptionalFromRequestParts<S> for MatchedPath {
 ///
 /// Only available for requests that matched a route reached through at least
 /// one level of nesting — a non-nested route has no [`NestedPath`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::NestedPath`.*
 #[derive(Debug, Clone)]
 pub struct NestedPath(pub(crate) std::sync::Arc<str>);
 
@@ -395,8 +457,24 @@ impl<S: Sync> FromRequestParts<S> for NestedPath {
 }
 
 /// Extractor for network connection info.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ConnectInfo`.*
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectInfo<T>(pub T);
+
+impl<T> std::ops::Deref for ConnectInfo<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for ConnectInfo<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 impl<S: Sync, T> FromRequestParts<S> for ConnectInfo<T>
 where

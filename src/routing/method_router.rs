@@ -61,7 +61,9 @@ pub(crate) type BoxedIntoRoute<S, E = std::convert::Infallible> =
 /// once `E = Infallible`. `Handler`-based slots (`.get()`/`.post()`/…) never carry a live
 /// `E` at all, since [`Handler`] has no `Error` type — every handler call already resolves
 /// to a `Response` before it reaches a [`Route`].
-pub struct MethodRouter<S, E = std::convert::Infallible> {
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::MethodRouter`.*
+pub struct MethodRouter<S = (), E = std::convert::Infallible> {
     pub(crate) handlers: [Option<BoxedIntoRoute<S, E>>; METHOD_COUNT],
     /// Path-parameter names in declaration order, populated by `Router::compile()`. Cloning
     /// an `Arc<str>` into `PathParams` is a refcount bump rather than a per-request
@@ -408,6 +410,11 @@ macro_rules! method_routes {
 
         $(
             #[doc = concat!("Helper to construct a ", $verb, "-only route.")]
+            #[doc = ""]
+            #[doc = concat!(
+                "*Axum compatibility: drop-in replacement for `axum::routing::",
+                stringify!($name), "`.*"
+            )]
             pub fn $name<H, T, S>(handler: H) -> MethodRouter<S, std::convert::Infallible>
             where
                 H: Handler<T, S>,
@@ -421,6 +428,11 @@ macro_rules! method_routes {
                 "Helper to construct a ", $verb,
                 "-only route from a raw `tower::Service`."
             )]
+            #[doc = ""]
+            #[doc = concat!(
+                "*Axum compatibility: drop-in replacement for `axum::routing::",
+                stringify!($svc_name), "`.*"
+            )]
             pub fn $svc_name<T, S>(svc: T) -> MethodRouter<S, T::Error>
             where
                 T: tower::Service<Request> + Clone + Send + Sync + 'static,
@@ -433,6 +445,8 @@ macro_rules! method_routes {
         )+
 
         /// A route dispatching every HTTP method to `handler`, matching `axum::routing::any`.
+        ///
+        /// *Axum compatibility: drop-in replacement for `axum::routing::any`.*
         pub fn any<H, T, S>(handler: H) -> MethodRouter<S, std::convert::Infallible>
         where
             H: Handler<T, S>,
@@ -446,6 +460,8 @@ macro_rules! method_routes {
 
         /// A route dispatching every HTTP method to a raw `tower::Service`, matching
         /// `axum::routing::any_service`.
+        ///
+        /// *Axum compatibility: drop-in replacement for `axum::routing::any_service`.*
         pub fn any_service<T, S>(svc: T) -> MethodRouter<S, T::Error>
         where
             T: tower::Service<Request> + Clone + Send + Sync + 'static,
@@ -476,6 +492,8 @@ method_routes! {
 ///
 /// Used by [`on`] and [`on_service`]/`MethodRouter::on`/`MethodRouter::on_service` to register
 /// a handler against more than one method at once.
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::MethodFilter`.*
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MethodFilter(u16);
 
@@ -503,6 +521,12 @@ impl MethodFilter {
     const fn contains_idx(self, idx: usize) -> bool {
         self.0 & (1u16 << idx) != 0
     }
+
+    /// Combines two filters, matching every method either one matches.
+    #[must_use]
+    pub const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 impl std::ops::BitOr for MethodFilter {
@@ -510,6 +534,33 @@ impl std::ops::BitOr for MethodFilter {
 
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
+    }
+}
+
+/// Error returned by `MethodFilter`'s `TryFrom<Method>` impl: `method` isn't one of the nine
+/// HTTP methods `MethodFilter` can represent.
+///
+/// *Tachyon extension: no `axum` equivalent.*
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoMatchingMethodFilter {
+    method: Method,
+}
+
+impl std::fmt::Display for NoMatchingMethodFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no `MethodFilter` matches `{}`", self.method)
+    }
+}
+
+impl std::error::Error for NoMatchingMethodFilter {}
+
+impl TryFrom<Method> for MethodFilter {
+    type Error = NoMatchingMethodFilter;
+
+    fn try_from(method: Method) -> Result<Self, Self::Error> {
+        method_index(&method)
+            .map(|idx| Self(1u16 << idx))
+            .ok_or(NoMatchingMethodFilter { method })
     }
 }
 
@@ -567,6 +618,8 @@ where
 
 /// Helper to construct a route for every HTTP method set in `filter`, matching
 /// `axum::routing::on`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::on`.*
 pub fn on<H, T, S>(filter: MethodFilter, handler: H) -> MethodRouter<S, std::convert::Infallible>
 where
     H: Handler<T, S>,
@@ -578,6 +631,8 @@ where
 
 /// Helper to construct a route for every HTTP method set in `filter` from a raw
 /// `tower::Service`, matching `axum::routing::on_service`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::routing::on_service`.*
 pub fn on_service<T, S>(filter: MethodFilter, svc: T) -> MethodRouter<S, T::Error>
 where
     T: tower::Service<Request> + Clone + Send + Sync + 'static,

@@ -6,6 +6,9 @@ use std::future::Future;
 
 use crate::routing::extract::{FromRequestParts, rejection};
 
+/// Re-exported at the path `axum::extract::path` uses for them.
+pub use rejection::{ErrorKind, FailedToDeserializePathParams, InvalidUtf8InPathParam};
+
 /// Extractor for URI path parameters.
 ///
 /// Supports three shapes, matching Axum:
@@ -16,16 +19,36 @@ use crate::routing::extract::{FromRequestParts, rejection};
 /// Routes with no path parameters (e.g. `/health`) never populate a params
 /// list, so `Path<()>` or any other zero-field extractor deserializes
 /// successfully against an empty parameter set on those routes.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::Path`.*
 #[derive(Debug, Clone)]
 pub struct Path<T>(pub T);
+
+impl<T> std::ops::Deref for Path<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Path<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// The captured path parameters for one request, in route-declaration order.
 ///
 /// Inline up to four, which covers essentially every real route, so a parameterised match
 /// costs no separate allocation beyond the extension itself.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub type PathParamsVec = smallvec::SmallVec<[(std::sync::Arc<str>, String); 4]>;
 
 /// Internal path parameters container stored in request extensions.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone)]
 pub struct PathParams(pub PathParamsVec);
 
@@ -768,6 +791,8 @@ where
 ///
 /// Prefer [`Path`] where it fits; this exists for the (rarer) case of wanting
 /// the params without paying for the deserialize step.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::RawPathParams`.*
 #[derive(Debug, Clone)]
 pub struct RawPathParams(PathParamsVec);
 
@@ -808,6 +833,8 @@ impl<'a> IntoIterator for &'a RawPathParams {
 }
 
 /// An iterator over raw path parameters. Created with [`RawPathParams::iter`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::path::RawPathParamsIter`.*
 #[derive(Debug, Clone)]
 pub struct RawPathParamsIter<'a>(std::slice::Iter<'a, (std::sync::Arc<str>, String)>);
 

@@ -59,6 +59,8 @@ where
 ///
 /// Optionally with a bound state argument first. Matches `axum::middleware::from_fn`.
 /// Built via [`from_fn`]/[`from_fn_with_state`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::FromFnLayer`.*
 pub struct FromFnLayer<F, S = (), T = ()> {
     f: F,
     state: S,
@@ -82,11 +84,15 @@ impl<F: Clone, S: Clone, T> Clone for FromFnLayer<F, S, T> {
 }
 
 /// Wraps `f` for use with `.layer()`/`.route_layer()`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::from_fn`.*
 pub const fn from_fn<F, T>(f: F) -> FromFnLayer<F, (), T> {
     from_fn_with_state((), f)
 }
 
 /// Wraps `f`, binding `state` as its first argument.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::from_fn_with_state`.*
 pub const fn from_fn_with_state<F, S, T>(state: S, f: F) -> FromFnLayer<F, S, T> {
     FromFnLayer {
         f,
@@ -109,6 +115,8 @@ impl<F: Clone, S: Clone, T, I> Layer<I> for FromFnLayer<F, S, T> {
 }
 
 /// The `tower::Service` produced by [`FromFnLayer`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::FromFn`.*
 pub struct FromFn<F, S, I, T> {
     f: F,
     state: S,
@@ -219,6 +227,8 @@ mod from_fn_future {
 
     /// Response future for [`super::FromFn`]. Matches `axum::middleware::future::ResponseFuture`
     /// (re-exported here as [`super::FromFnResponseFuture`]).
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::middleware::future::FromFnResponseFuture`.*
     pub struct ResponseFuture {
         pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
     }
@@ -248,6 +258,8 @@ pub use from_fn_future::ResponseFuture as FromFnResponseFuture;
 /// return either a bare `Request<Body>` or a `Result<Request<Body>, R>` to
 /// short-circuit the pipeline with `R`'s response on `Err` — see
 /// [`IntoMapRequestResult`]. Built via [`map_request`]/[`map_request_with_state`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::MapRequestLayer`.*
 pub struct MapRequestLayer<F, S = (), T = ()> {
     f: F,
     state: S,
@@ -271,11 +283,15 @@ impl<F: Clone, S: Clone, T> Clone for MapRequestLayer<F, S, T> {
 }
 
 /// Wraps `f` for use with `.layer()`/`.route_layer()`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::map_request`.*
 pub const fn map_request<F, T>(f: F) -> MapRequestLayer<F, (), T> {
     map_request_with_state((), f)
 }
 
 /// Wraps `f`, binding `state` as its first argument.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::map_request_with_state`.*
 pub const fn map_request_with_state<F, S, T>(state: S, f: F) -> MapRequestLayer<F, S, T> {
     MapRequestLayer {
         f,
@@ -298,6 +314,8 @@ impl<F: Clone, S: Clone, T, I> Layer<I> for MapRequestLayer<F, S, T> {
 }
 
 /// The `tower::Service` produced by [`MapRequestLayer`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::MapRequest`.*
 pub struct MapRequest<F, S, I, T> {
     f: F,
     state: S,
@@ -406,6 +424,8 @@ mod map_request_future {
     /// Response future for [`super::MapRequest`]. Matches
     /// `axum::middleware::future::ResponseFuture` (re-exported here as
     /// [`super::MapRequestResponseFuture`]).
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::middleware::future::MapRequestResponseFuture`.*
     pub struct ResponseFuture {
         pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
     }
@@ -432,6 +452,8 @@ pub use map_request_future::ResponseFuture as MapRequestResponseFuture;
 /// A bare `Request<Body>` always continues the pipeline; `Result::Err(R)`
 /// short-circuits it with `R`'s response instead. Matches
 /// `axum::middleware::IntoMapRequestResult`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::IntoMapRequestResult`.*
 pub trait IntoMapRequestResult<B = Body> {
     /// Normalizes into a `Result` so both return shapes can be handled uniformly.
     ///
@@ -467,6 +489,8 @@ where
 /// Optionally with a bound state argument first. Matches
 /// `axum::middleware::map_response`/`map_response_with_state`. Built via
 /// [`map_response`]/[`map_response_with_state`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::MapResponseLayer`.*
 pub struct MapResponseLayer<F, S = (), T = ()> {
     f: F,
     state: S,
@@ -490,11 +514,15 @@ impl<F: Clone, S: Clone, T> Clone for MapResponseLayer<F, S, T> {
 }
 
 /// Wraps `f` for use with `.layer()`/`.route_layer()`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::map_response`.*
 pub const fn map_response<F, T>(f: F) -> MapResponseLayer<F, (), T> {
     map_response_with_state((), f)
 }
 
 /// Wraps `f`, binding `state` as its first argument.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::map_response_with_state`.*
 pub const fn map_response_with_state<F, S, T>(state: S, f: F) -> MapResponseLayer<F, S, T> {
     MapResponseLayer {
         f,
@@ -517,6 +545,8 @@ impl<F: Clone, S: Clone, T, I> Layer<I> for MapResponseLayer<F, S, T> {
 }
 
 /// The `tower::Service` produced by [`MapResponseLayer`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::MapResponse`.*
 pub struct MapResponse<F, S, I, T> {
     f: F,
     state: S,
@@ -623,6 +653,8 @@ mod map_response_future {
     /// Response future for [`super::MapResponse`]. Matches
     /// `axum::middleware::future::ResponseFuture` (re-exported here as
     /// [`super::MapResponseResponseFuture`]).
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::middleware::future::MapResponseResponseFuture`.*
     pub struct ResponseFuture {
         pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
     }
@@ -652,6 +684,8 @@ pub use map_response_future::ResponseFuture as MapResponseResponseFuture;
 /// `axum::middleware::from_extractor`. Since `Next` no longer carries state,
 /// this runs `E` against unit state (`()`) — use [`from_extractor_with_state`]
 /// for an extractor that needs real state.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::FromExtractorLayer`.*
 pub struct FromExtractorLayer<E, S = ()> {
     state: S,
     _marker: PhantomData<fn() -> E>,
@@ -664,6 +698,8 @@ impl<E, S> std::fmt::Debug for FromExtractorLayer<E, S> {
 }
 
 /// Builds the layer for extractor `E`, matching `axum::middleware::from_extractor::<E>()`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::from_extractor`.*
 #[must_use]
 pub const fn from_extractor<E>() -> FromExtractorLayer<E, ()> {
     FromExtractorLayer {
@@ -697,6 +733,8 @@ where
 }
 
 /// The `tower::Service` produced by [`FromExtractorLayer`].
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::FromExtractor`.*
 pub struct FromExtractor<T, E, S> {
     inner: T,
     state: S,
@@ -769,6 +807,8 @@ mod from_extractor_future {
     /// Response future for [`super::FromExtractor`]. Matches
     /// `axum::middleware::future::ResponseFuture` (re-exported here as
     /// [`super::FromExtractorResponseFuture`]).
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::middleware::future::FromExtractorResponseFuture`.*
     pub struct ResponseFuture<B, T, E, S>
     where
         E: FromRequestParts<S>,
@@ -776,6 +816,13 @@ mod from_extractor_future {
     {
         pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
         pub(super) _marker: PhantomData<ExtractorMarker<B, T, E, S>>,
+    }
+
+    impl<B, T, E, S> Unpin for ResponseFuture<B, T, E, S>
+    where
+        E: FromRequestParts<S>,
+        T: Service<Request<B>>,
+    {
     }
 
     impl<B, T, E, S> std::fmt::Debug for ResponseFuture<B, T, E, S>
@@ -803,6 +850,8 @@ mod from_extractor_future {
 pub use from_extractor_future::ResponseFuture as FromExtractorResponseFuture;
 
 /// Builds the layer for extractor `E`, bound to `state`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::middleware::from_extractor_with_state`.*
 pub const fn from_extractor_with_state<E, S>(state: S) -> FromExtractorLayer<E, S> {
     FromExtractorLayer {
         state,

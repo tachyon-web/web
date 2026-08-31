@@ -36,6 +36,8 @@ use tungstenite::protocol::frame::{
 /// A local newtype over `tungstenite`'s own `Utf8Bytes` rather than a direct re-export —
 /// mirrors axum's own choice (it wraps the same underlying type the same way), and keeps this
 /// crate's public API surface independent of `tungstenite`'s exact type shape.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ws::Utf8Bytes`.*
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Utf8Bytes(TungsteniteUtf8Bytes);
 
@@ -121,10 +123,14 @@ where
 }
 
 /// A WebSocket close code, per RFC 6455 §7.4. Matches `axum::extract::ws::CloseCode`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ws::CloseCode`.*
 pub type CloseCode = u16;
 
 /// A WebSocket close frame: the code and optional human-readable reason sent/received in a
 /// `Message::Close`. Matches `axum::extract::ws::CloseFrame`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ws::CloseFrame`.*
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloseFrame {
     /// The close code.
@@ -143,6 +149,8 @@ impl From<CloseFrame> for TungsteniteCloseFrame {
 }
 
 /// A WebSocket message. Matches `axum::extract::ws::Message`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ws::Message`.*
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// A text message.
@@ -155,6 +163,98 @@ pub enum Message {
     Pong(Bytes),
     /// A close message, with an optional close frame.
     Close(Option<CloseFrame>),
+}
+
+impl Message {
+    /// Constructs a new binary message.
+    pub fn binary<B: Into<Bytes>>(bin: B) -> Self {
+        Self::Binary(bin.into())
+    }
+
+    /// Constructs a new text message.
+    pub fn text<S: Into<Utf8Bytes>>(string: S) -> Self {
+        Self::Text(string.into())
+    }
+
+    /// Consumes this message, returning its raw payload bytes.
+    ///
+    /// A [`Close`](Message::Close) frame's payload is the 2-byte big-endian close code
+    /// followed by the UTF-8 reason, matching the wire format; a close with no
+    /// [`CloseFrame`] has an empty payload.
+    #[must_use]
+    pub fn into_data(self) -> Bytes {
+        match self {
+            Self::Text(text) => text.into(),
+            Self::Binary(data) | Self::Ping(data) | Self::Pong(data) => data,
+            Self::Close(None) => Bytes::new(),
+            Self::Close(Some(frame)) => {
+                let mut buf = BytesMut::with_capacity(frame.reason.len().saturating_add(2));
+                buf.extend_from_slice(&frame.code.to_be_bytes());
+                buf.extend_from_slice(frame.reason.as_bytes());
+                buf.freeze()
+            }
+        }
+    }
+
+    /// Consumes this message, decoding its payload as UTF-8 text.
+    ///
+    /// # Errors
+    /// Returns an error if the payload isn't valid UTF-8.
+    pub fn into_text(self) -> Result<Utf8Bytes, std::str::Utf8Error> {
+        match self {
+            Self::Text(text) => Ok(text),
+            other => other.into_data().try_into(),
+        }
+    }
+
+    /// Borrows this message's payload as UTF-8 text.
+    ///
+    /// # Errors
+    /// Returns an error if the payload isn't valid UTF-8.
+    pub fn to_text(&self) -> Result<&str, std::str::Utf8Error> {
+        match self {
+            Self::Text(text) => Ok(text.as_str()),
+            Self::Binary(data) | Self::Ping(data) | Self::Pong(data) => std::str::from_utf8(data),
+            Self::Close(None) => Ok(""),
+            Self::Close(Some(frame)) => Ok(frame.reason.as_str()),
+        }
+    }
+}
+
+impl<'b> From<&'b [u8]> for Message {
+    fn from(bytes: &'b [u8]) -> Self {
+        Self::binary(Bytes::copy_from_slice(bytes))
+    }
+}
+
+impl<'s> From<&'s str> for Message {
+    fn from(s: &'s str) -> Self {
+        Self::text(s)
+    }
+}
+
+impl From<String> for Message {
+    fn from(s: String) -> Self {
+        Self::text(s)
+    }
+}
+
+impl From<Vec<u8>> for Message {
+    fn from(v: Vec<u8>) -> Self {
+        Self::binary(v)
+    }
+}
+
+impl From<Bytes> for Message {
+    fn from(bytes: Bytes) -> Self {
+        Self::binary(bytes)
+    }
+}
+
+impl From<Message> for Vec<u8> {
+    fn from(msg: Message) -> Self {
+        msg.into_data().to_vec()
+    }
 }
 
 type Io = AllowStd<TokioIo<hyper::upgrade::Upgraded>>;
@@ -175,6 +275,8 @@ const RECV_YIELD_BUDGET: u32 = 128;
 /// An established WebSocket connection.
 ///
 /// See the [module docs](super) for an example.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::ws::WebSocket`.*
 pub struct WebSocket {
     frames: FrameSocket<Io>,
     protocol: Option<HeaderValue>,
@@ -706,6 +808,53 @@ impl WebSocket {
             PollSender::new(out_tx).sink_map_err(map_poll_sender_err),
             SplitStream { rx: in_rx },
         )
+    }
+}
+
+// `poll_recv`/`poll_drain_outgoing`/`queue_message` above all take `&mut self`, never
+// `Pin<&mut Self>` -- nothing about driving a `WebSocket` needs it to stay pinned, so
+// it's `Unpin` like every other field on it.
+impl Unpin for WebSocket {}
+
+impl Stream for WebSocket {
+    type Item = Result<Message, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.as_mut().get_mut().poll_recv(cx)
+    }
+}
+
+impl futures_core::stream::FusedStream for WebSocket {
+    fn is_terminated(&self) -> bool {
+        self.closed
+    }
+}
+
+impl Sink<Message> for WebSocket {
+    type Error = Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.as_mut()
+            .get_mut()
+            .poll_drain_outgoing(cx)
+            .map_err(|e| protocol_error(&e))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        self.as_mut().get_mut().queue_message(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Sink::<Message>::poll_ready(self, cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.as_mut().get_mut();
+        if !this.sent_close {
+            this.outgoing.push_back(Frame::close(None));
+            this.sent_close = true;
+        }
+        this.poll_drain_outgoing(cx).map_err(|e| protocol_error(&e))
     }
 }
 

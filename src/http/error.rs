@@ -6,9 +6,13 @@ use hyper::{Response, StatusCode};
 use crate::http::response::IntoResponse;
 
 /// A specialized Result type for Tachyon-Web operations.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A type-erased, boxed `std::error::Error`. Matches `axum_core::BoxError`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::BoxError`.*
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// An opaque, boxed error, matching `axum_core::Error` exactly (a plain struct wrapping
@@ -26,6 +30,8 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// downcasting it back out where needed (see `Error::status`/`Error::as_status`); it's
 /// never exposed as a public variant, so from the outside `Error` is exactly as opaque as
 /// axum's.
+///
+/// *Axum compatibility: drop-in replacement for `axum::Error`.*
 #[derive(Debug)]
 pub struct Error {
     inner: BoxError,

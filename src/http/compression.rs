@@ -85,6 +85,8 @@ pub use predicate::Predicate;
 /// negotiation and pre-compressed static assets ([`ServeDir`](crate::ServeDir) sidecars)
 /// work without the matching encoder linked in. [`Encoding::encoder_available`] reports
 /// whether this binary can actually *perform* the coding.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Encoding {
     /// No transformation. Always acceptable unless explicitly refused with `identity;q=0`.
@@ -192,6 +194,8 @@ impl std::fmt::Display for Encoding {
 /// `zstd` first: its throughput advantage over Brotli dominates Brotli's slightly better
 /// ratio for a body compressed once per request. Pre-compressed static assets invert that
 /// tradeoff, which is why [`ServeDir`](crate::ServeDir) prefers `br` instead.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub const DEFAULT_PREFERENCE: [Encoding; 4] = [
     Encoding::Zstd,
     Encoding::Brotli,
@@ -342,6 +346,8 @@ impl AcceptedEncodings {
 ///     Encoding::Gzip,
 /// );
 /// ```
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[must_use]
 pub fn negotiate(accept_encoding: &str, supported: &[Encoding]) -> Encoding {
     if supported.is_empty() {
@@ -389,6 +395,8 @@ pub fn negotiate(accept_encoding: &str, supported: &[Encoding]) -> Encoding {
 ///
 /// assert!(compression.supports(Encoding::Identity));
 /// ```
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone)]
 pub struct Compression {
     /// Enabled codings in server-preference order.

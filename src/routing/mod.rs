@@ -37,6 +37,21 @@ pub use method_router::{
 pub use router::{Router, RouterError};
 pub use tower_compat::Route;
 
+/// Re-export of [`method_router`] at the path `axum::routing::method_routing` uses.
+pub use method_router as method_routing;
+
+/// [`tower_compat`]'s `Service`-facing wrapper types, at the paths `axum::routing`
+/// uses for them (`IntoMakeService`, `RouterAsService`, `RouterIntoService`).
+pub use tower_compat::{IntoMakeService, RouterAsService, RouterIntoService};
+
+/// `Future` types returned by the `Service`-facing wrappers above, matching
+/// `axum::routing::future`.
+pub mod future {
+    pub use crate::routing::tower_compat::{
+        InfallibleRouteFuture, IntoMakeServiceFuture, RouteFuture,
+    };
+}
+
 /// Emits a pre-rendered `103 Early Hints` block for `req`, if the transport wired one up.
 ///
 /// Shared by the [`MethodRouter`] and [`Router`] forms of `early_hints`, which differ only

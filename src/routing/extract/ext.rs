@@ -10,6 +10,8 @@ use crate::routing::extract::{FromRequest, FromRequestParts};
 /// Sugar for running an extractor against request *parts* (headers, method,
 /// URI, extensions — no body) outside of a handler's argument list. Matches
 /// `axum_core::RequestPartsExt`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::RequestPartsExt`.*
 pub trait RequestPartsExt: Sized {
     /// Runs `E::from_request_parts` against unit state (`S = ()`).
     fn extract<E>(&mut self) -> impl Future<Output = Result<E, E::Rejection>> + Send
@@ -48,6 +50,8 @@ impl RequestPartsExt for hyper::http::request::Parts {
 
 /// Sugar for running an extractor against an owned [`hyper::Request`]
 /// outside of a handler's argument list. Matches `axum_core::RequestExt`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::RequestExt`.*
 pub trait RequestExt: Sized {
     /// Runs `E::from_request` against unit state (`S = ()`), consuming `self`.
     fn extract<E, M>(self) -> impl Future<Output = Result<E, E::Rejection>> + Send

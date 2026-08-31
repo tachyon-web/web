@@ -64,6 +64,8 @@ fn challenges() -> &'static RwLock<HashMap<String, String>> {
 /// Registers a temporary ACME HTTP-01 challenge response in the global store.
 ///
 /// The challenge will be served by the HTTP listener until [`unregister_challenge`] is called.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub fn register_challenge(token: String, key_authorization: String) {
     if let Ok(mut map) = challenges().write() {
         let _ = map.insert(token, key_authorization);
@@ -73,6 +75,8 @@ pub fn register_challenge(token: String, key_authorization: String) {
 }
 
 /// Removes a challenge token from the global store once the ACME server has validated it.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub fn unregister_challenge(token: &str) {
     if let Ok(mut map) = challenges().write() {
         let _ = map.remove(token);
@@ -83,6 +87,8 @@ pub fn unregister_challenge(token: &str) {
 ///
 /// Returns `Some(key_authorization)` if the token is active, or `None` otherwise.
 /// Callers on the hot HTTP path acquire only a read lock.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[inline]
 #[must_use]
 pub fn get_challenge(token: &str) -> Option<String> {
@@ -102,6 +108,8 @@ pub fn get_challenge(token: &str) -> Option<String> {
 /// # Thread safety
 /// All accesses are protected by an inner [`RwLock`]; reads (handshakes) never block
 /// each other, and writes (certificate renewals) happen at most once every 24 hours.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct AcmeResolver {
     current_key: RwLock<Option<Arc<CertifiedKey>>>,
@@ -154,6 +162,8 @@ impl ResolvesServerCert for AcmeResolver {
 }
 
 /// Errors that can occur during ACME certificate management.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub enum AcmeError {
     /// An I/O error reading or writing the certificate/key cache.
@@ -251,6 +261,8 @@ impl From<serde_json::Error> for AcmeError {
 /// On provisioning failure the background loop retries with exponential backoff
 /// (starting at 5 minutes, capped at 6 hours) to stay well within the
 /// [Let's Encrypt rate limits](https://letsencrypt.org/docs/rate-limits/).
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct AcmeManager {
     domains: Vec<String>,

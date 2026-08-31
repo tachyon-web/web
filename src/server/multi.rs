@@ -33,6 +33,8 @@ enum Transport {
 /// Constructed via [`Server::with_http`]/[`Server::with_https`]/[`Server::with_onion`]/
 /// [`Server::with_i2p`]/[`Server::with_h3`], chained with more of the same to add further
 /// transports, and finished with [`serve`](Self::serve).
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[must_use = "MultiServer does nothing until `.serve()` is called and awaited"]
 pub struct MultiServer<S> {
     server: Server<S>,

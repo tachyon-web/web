@@ -19,6 +19,8 @@ use std::io::Write;
 ///
 /// Named to match `tower-http`'s type of the same name, though the numeric mappings differ
 /// where `tower-http`'s defaults are a poor fit for per-request compression.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressionLevel {
     /// The cheapest setting each codec offers: gzip/deflate 1, Brotli 1, zstd 1. Right for

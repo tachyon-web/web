@@ -12,8 +12,10 @@
 //! that matters more to you than the axum-drop-in signature.
 
 use crate::http::response::Body;
-use crate::routing::tower_compat::IncomingStream;
-use crate::server::Listener;
+/// Re-exported at this path so `tachyon_web::serve::{IncomingStream, Listener, ListenerExt,
+/// TapIo}` matches `axum::serve::{IncomingStream, Listener, ListenerExt, TapIo}`.
+pub use crate::routing::tower_compat::IncomingStream;
+pub use crate::server::{Listener, ListenerExt, TapIo};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::future::{Future, IntoFuture};
@@ -35,6 +37,8 @@ type Response = crate::http::response::Response;
 /// forever (or until an accept error), and `.with_graceful_shutdown(signal)` can be chained on
 /// first — see the [module docs](self) for how this differs from
 /// [`Server`](crate::server::Server)'s own accept loop.
+///
+/// *Axum compatibility: drop-in replacement for `axum::serve`.*
 pub fn serve<L, M, S>(listener: L, make_service: M) -> Serve<L, M, S>
 where
     L: Listener,
@@ -52,6 +56,8 @@ where
 /// The future returned by [`fn@serve`] before any `.with_graceful_shutdown()` call.
 ///
 /// Implements [`IntoFuture`], matching `axum::serve::Serve`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::serve::Serve`.*
 #[must_use = "futures do nothing unless polled or `.await`ed"]
 pub struct Serve<L, M, S> {
     listener: L,
@@ -111,6 +117,8 @@ where
 }
 
 /// Returned by [`Serve::with_graceful_shutdown`]. Matches `axum::serve::WithGracefulShutdown`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::serve::WithGracefulShutdown`.*
 #[must_use = "futures do nothing unless polled or `.await`ed"]
 pub struct WithGracefulShutdown<L, M, S, F> {
     listener: L,
@@ -123,6 +131,19 @@ impl<L, M, S, F> std::fmt::Debug for WithGracefulShutdown<L, M, S, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WithGracefulShutdown")
             .finish_non_exhaustive()
+    }
+}
+
+impl<L, M, S, F> WithGracefulShutdown<L, M, S, F>
+where
+    L: Listener,
+{
+    /// The address this listener is bound to.
+    ///
+    /// # Errors
+    /// Returns an error if querying the OS for the bound address fails.
+    pub fn local_addr(&self) -> std::io::Result<L::Addr> {
+        self.listener.local_addr()
     }
 }
 

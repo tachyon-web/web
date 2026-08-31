@@ -1,7 +1,7 @@
-//! The `Listener`/`ListenerExt` traits accepted by [`crate::serve`], matching
+//! The `Listener`/`ListenerExt` traits accepted by [`crate::serve()`], matching
 //! `axum::serve::{Listener, ListenerExt, TapIo}`.
 //!
-//! [`crate::serve`] drives a real accept loop directly against whatever `Listener` it's given —
+//! [`crate::serve()`] drives a real accept loop directly against whatever `Listener` it's given —
 //! [`Listener::accept`] runs on every iteration, exactly as it would with axum. This is a
 //! separate accept path from [`crate::server::Server`]'s own `SO_REUSEPORT` worker pool, which
 //! binds its own sockets from a `SocketAddr` rather than accepting through a pre-built listener
@@ -16,6 +16,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::error;
 
 /// Types that can listen for connections. Matches `axum::serve::Listener`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::serve::Listener`.*
 pub trait Listener: Send + 'static {
     /// The listener's IO type.
     type Io: AsyncRead + AsyncWrite + Unpin + Send + 'static;
@@ -56,6 +58,8 @@ impl Listener for TcpListener {
 }
 
 /// Extensions to [`Listener`]. Matches `axum::serve::ListenerExt`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::serve::ListenerExt`.*
 pub trait ListenerExt: Listener + Sized {
     /// Run a mutable closure on every accepted `Io`.
     fn tap_io<F>(self, tap_fn: F) -> TapIo<Self, F>
@@ -73,6 +77,8 @@ impl<L: Listener> ListenerExt for L {}
 
 /// Return type of [`ListenerExt::tap_io`]. See that method for details.
 /// Matches `axum::serve::TapIo`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::serve::TapIo`.*
 pub struct TapIo<L, F> {
     listener: L,
     tap_fn: F,

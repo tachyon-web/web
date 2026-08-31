@@ -14,4 +14,6 @@ pub use response::Response;
 
 /// A Tachyon HTTP request, generic over its body type (defaulting to
 /// [`response::Body`]). Matches `axum_core::extract::Request`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub type Request<T = response::Body> = hyper::Request<T>;

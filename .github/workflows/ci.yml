@@ -44,7 +44,9 @@ jobs:
         run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,sfv,tower-log,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints
       - uses: dtolnay/rust-toolchain@nightly
       - name: axum API parity
-        run: python3 scripts/api_diff.py
+        run: python3 scripts/api_diff.py parity
+      - name: public API doc footers
+        run: python3 scripts/api_diff.py docs --check
 
   build:
     name: "${{ matrix.name }}"

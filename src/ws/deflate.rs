@@ -19,6 +19,8 @@ const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
 ///
 /// Constructed via [`Default`] and passed to
 /// [`WebSocketUpgrade::deflate_config`](super::WebSocketUpgrade::deflate_config).
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct DeflateConfig {

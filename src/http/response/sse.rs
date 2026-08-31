@@ -86,6 +86,8 @@ impl EventFlags {
 /// Multi-line `data` values are automatically split across multiple wire-format lines, per the
 /// SSE spec. Construction *is* serialization — each setter writes straight into the event's
 /// wire-format buffer, matching `axum::response::sse::Event`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::sse::Event`.*
 #[derive(Debug, Clone)]
 #[must_use]
 pub struct Event {
@@ -109,6 +111,8 @@ impl Default for Event {
 ///
 /// Panics if any `data` has already been written on the underlying [`Event`] prior to the
 /// first write through this instance.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::sse::EventDataWriter`.*
 #[derive(Debug)]
 #[must_use]
 pub struct EventDataWriter {
@@ -148,7 +152,7 @@ impl Event {
     ///
     /// # Panics
     /// Panics if `data`/`json_data` has already been called on this event.
-    pub fn data(self, data: impl AsRef<str>) -> Self {
+    pub fn data<T: AsRef<str>>(self, data: T) -> Self {
         let mut writer = self.into_data_writer();
         let _ = writer.write_str(data.as_ref());
         writer.into_event()
@@ -162,7 +166,7 @@ impl Event {
     ///
     /// # Panics
     /// Panics if `data`/`json_data` has already been called on this event.
-    pub fn json_data(self, data: impl serde::Serialize) -> serde_json::Result<Self> {
+    pub fn json_data<T: serde::Serialize>(self, data: T) -> serde_json::Result<Self> {
         struct JsonWriter<'a>(&'a mut EventDataWriter);
         impl std::io::Write for JsonWriter<'_> {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -182,7 +186,7 @@ impl Event {
     ///
     /// # Panics
     /// Panics if `event` contains `\r`/`\n`, or if this has already been called on this event.
-    pub fn event(mut self, event: impl AsRef<str>) -> Self {
+    pub fn event<T: AsRef<str>>(mut self, event: T) -> Self {
         assert!(
             !self.flags.contains(EventFlags::HAS_EVENT),
             "Called `Event::event` multiple times"
@@ -196,7 +200,7 @@ impl Event {
     ///
     /// # Panics
     /// Panics if `id` contains `\r`/`\n`, or if this has already been called on this event.
-    pub fn id(mut self, id: impl AsRef<str>) -> Self {
+    pub fn id<T: AsRef<str>>(mut self, id: T) -> Self {
         assert!(
             !self.flags.contains(EventFlags::HAS_ID),
             "Called `Event::id` multiple times"
@@ -233,7 +237,7 @@ impl Event {
     ///
     /// # Panics
     /// Panics if `comment` contains `\r`/`\n`.
-    pub fn comment(mut self, comment: impl AsRef<str>) -> Self {
+    pub fn comment<T: AsRef<str>>(mut self, comment: T) -> Self {
         self.field("", comment.as_ref());
         self
     }
@@ -328,6 +332,8 @@ impl std::fmt::Write for EventDataWriter {
 /// for too long; interleaving a harmless `: <text>` comment line (ignored by
 /// SSE clients) at a regular interval keeps the connection alive without the
 /// caller's own stream needing to know about it.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::sse::KeepAlive`.*
 #[derive(Debug, Clone)]
 pub struct KeepAlive {
     event: Event,
@@ -361,7 +367,7 @@ impl KeepAlive {
 
     /// Sets the keep-alive ping's comment text (sent as `: <text>`).
     #[must_use]
-    pub fn text(self, text: impl AsRef<str>) -> Self {
+    pub fn text<T: AsRef<str>>(self, text: T) -> Self {
         self.event(Event::default().comment(text))
     }
 
@@ -378,6 +384,8 @@ pin_project_lite::pin_project! {
     /// Wraps a stream, injecting `keep_alive.event` whenever the inner stream
     /// hasn't produced an item for `keep_alive.interval`. Returned internally by
     /// [`Sse::keep_alive`]. Matches `axum::response::sse::KeepAliveStream`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::response::sse::KeepAliveStream`.*
     pub struct KeepAliveStream<S> {
         #[pin]
         stream: S,
@@ -449,6 +457,8 @@ where
 /// Sets `Content-Type: text/event-stream` and `Cache-Control: no-cache`, then
 /// streams each item of the wrapped stream in SSE wire format as it becomes
 /// available — nothing is buffered.
+///
+/// *Axum compatibility: drop-in replacement for `axum::response::Sse`.*
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct Sse<S> {

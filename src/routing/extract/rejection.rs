@@ -37,9 +37,23 @@ macro_rules! leaf_rejection {
 
         impl std::error::Error for $name {}
 
+        impl $name {
+            /// Get the response body text used for this rejection.
+            #[must_use]
+            pub fn body_text(&self) -> String {
+                self.0.clone()
+            }
+
+            /// Get the status code used for this rejection.
+            #[must_use]
+            pub const fn status(&self) -> StatusCode {
+                StatusCode::$status
+            }
+        }
+
         impl IntoResponse for $name {
             fn into_response(self) -> Response {
-                (StatusCode::$status, self.0).into_response()
+                (self.status(), self.0).into_response()
             }
         }
     };
@@ -51,7 +65,7 @@ macro_rules! leaf_rejection {
 macro_rules! unit_rejection {
     ($(#[$m:meta])* pub struct $name:ident => $status:ident, $body:literal) => {
         $(#[$m])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
         pub struct $name;
 
         impl std::fmt::Display for $name {
@@ -62,9 +76,23 @@ macro_rules! unit_rejection {
 
         impl std::error::Error for $name {}
 
+        impl $name {
+            /// Get the response body text used for this rejection.
+            #[must_use]
+            pub const fn body_text(&self) -> &'static str {
+                $body
+            }
+
+            /// Get the status code used for this rejection.
+            #[must_use]
+            pub const fn status(&self) -> StatusCode {
+                StatusCode::$status
+            }
+        }
+
         impl IntoResponse for $name {
             fn into_response(self) -> Response {
-                (StatusCode::$status, $body).into_response()
+                (self.status(), self.body_text()).into_response()
             }
         }
     };
@@ -82,6 +110,24 @@ macro_rules! composite_rejection {
                 #[allow(missing_docs)]
                 $variant($inner)
             ),+
+        }
+
+        impl $name {
+            /// Get the response body text used for this rejection.
+            #[must_use]
+            pub fn body_text(&self) -> String {
+                match self {
+                    $(Self::$variant(inner) => inner.body_text().to_string()),+
+                }
+            }
+
+            /// Get the status code used for this rejection.
+            #[must_use]
+            pub const fn status(&self) -> StatusCode {
+                match self {
+                    $(Self::$variant(inner) => inner.status()),+
+                }
+            }
         }
 
         impl IntoResponse for $name {
@@ -117,6 +163,8 @@ macro_rules! composite_rejection {
 leaf_rejection! {
     /// The request body was larger than the configured limit. Matches
     /// `axum_core::extract::rejection::LengthLimitError`.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     pub struct LengthLimitError => PAYLOAD_TOO_LARGE
 }
 
@@ -125,12 +173,16 @@ leaf_rejection! {
     ///
     /// Covers any reason other than exceeding a length limit (I/O error, malformed
     /// chunked transfer, ...). Matches `axum_core::extract::rejection::UnknownBodyError`.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     pub struct UnknownBodyError => BAD_REQUEST
 }
 
 composite_rejection! {
     /// The request body could not be buffered. Matches
     /// `axum_core::extract::rejection::FailedToBufferBody`.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     pub enum FailedToBufferBody {
         LengthLimitError(LengthLimitError),
         UnknownBodyError(UnknownBodyError),
@@ -152,6 +204,8 @@ impl From<CoreError> for FailedToBufferBody {
 composite_rejection! {
     /// Rejection for the raw [`bytes::Bytes`] extractor. Matches
     /// `axum_core::extract::rejection::BytesRejection`.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     pub enum BytesRejection {
         FailedToBufferBody(FailedToBufferBody),
     }
@@ -166,12 +220,16 @@ impl From<CoreError> for BytesRejection {
 leaf_rejection! {
     /// The request body was read successfully but wasn't valid UTF-8. Matches
     /// `axum_core::extract::rejection::InvalidUtf8`.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     pub struct InvalidUtf8 => BAD_REQUEST
 }
 
 composite_rejection! {
     /// Rejection for the [`String`] extractor. Matches
     /// `axum_core::extract::rejection::StringRejection`.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     pub enum StringRejection {
         FailedToBufferBody(FailedToBufferBody),
         InvalidUtf8(InvalidUtf8),
@@ -184,6 +242,8 @@ composite_rejection! {
 ///
 /// Obtained through [`FailedToDeserializePathParams::kind`]/`::into_kind`, useful
 /// for building more precise error messages. Matches `axum::extract::path::ErrorKind`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::path::ErrorKind`.*
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorKind {
@@ -359,6 +419,8 @@ impl std::error::Error for PathDeserializationError {}
 
 /// The path parameters didn't deserialize into the extractor's target type.
 /// Matches `axum::extract::path::FailedToDeserializePathParams`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::path::FailedToDeserializePathParams`.*
 #[derive(Debug)]
 pub struct FailedToDeserializePathParams(pub(crate) PathDeserializationError);
 
@@ -427,12 +489,16 @@ unit_rejection! {
     /// The route matched but no path-parameter extension was present at all
     /// — an internal routing bug rather than a client error. Matches
     /// `axum::extract::rejection::MissingPathParams`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::MissingPathParams`.*
     pub struct MissingPathParams => INTERNAL_SERVER_ERROR, "No paths parameters found for matched route"
 }
 
 composite_rejection! {
     /// Rejection for the [`super::Path`] extractor. Matches
     /// `axum::extract::rejection::PathRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::PathRejection`.*
     pub enum PathRejection {
         FailedToDeserializePathParams(FailedToDeserializePathParams),
         MissingPathParams(MissingPathParams),
@@ -446,6 +512,8 @@ composite_rejection! {
 /// falls back to the raw, still-encoded value on a decode failure rather than
 /// rejecting the request (see [`ErrorKind::InvalidUtf8InPathParam`]'s docs).
 /// Kept for structural parity with axum, in case that fallback policy changes.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::path::InvalidUtf8InPathParam`.*
 #[derive(Debug, Clone)]
 pub struct InvalidUtf8InPathParam {
     key: std::sync::Arc<str>,
@@ -483,6 +551,8 @@ impl IntoResponse for InvalidUtf8InPathParam {
 composite_rejection! {
     /// Rejection for the [`super::RawPathParams`] extractor. Matches
     /// `axum::extract::rejection::RawPathParamsRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::RawPathParamsRejection`.*
     pub enum RawPathParamsRejection {
         InvalidUtf8InPathParam(InvalidUtf8InPathParam),
         MissingPathParams(MissingPathParams),
@@ -495,6 +565,8 @@ composite_rejection! {
 leaf_rejection! {
     /// The query string didn't deserialize into the extractor's target type.
     /// Matches `axum::extract::rejection::FailedToDeserializeQueryString`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::FailedToDeserializeQueryString`.*
     pub struct FailedToDeserializeQueryString => BAD_REQUEST
 }
 
@@ -502,6 +574,8 @@ leaf_rejection! {
 composite_rejection! {
     /// Rejection for the [`super::Query`] extractor. Matches
     /// `axum::extract::rejection::QueryRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::QueryRejection`.*
     pub enum QueryRejection {
         FailedToDeserializeQueryString(FailedToDeserializeQueryString),
     }
@@ -513,6 +587,8 @@ composite_rejection! {
 unit_rejection! {
     /// The request's `Content-Type` wasn't a JSON media type. Matches
     /// `axum::extract::rejection::MissingJsonContentType`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::MissingJsonContentType`.*
     pub struct MissingJsonContentType => UNSUPPORTED_MEDIA_TYPE, "Expected request with `Content-Type: application/json`"
 }
 
@@ -520,6 +596,8 @@ unit_rejection! {
 leaf_rejection! {
     /// The body was syntactically invalid JSON. Matches
     /// `axum::extract::rejection::JsonSyntaxError`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::JsonSyntaxError`.*
     pub struct JsonSyntaxError => BAD_REQUEST
 }
 
@@ -527,6 +605,8 @@ leaf_rejection! {
 leaf_rejection! {
     /// The body was well-formed JSON but didn't match the target type's
     /// shape. Matches `axum::extract::rejection::JsonDataError`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::JsonDataError`.*
     pub struct JsonDataError => UNPROCESSABLE_ENTITY
 }
 
@@ -534,6 +614,8 @@ leaf_rejection! {
 composite_rejection! {
     /// Rejection for the [`super::Json`] extractor. Matches
     /// `axum::extract::rejection::JsonRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::JsonRejection`.*
     pub enum JsonRejection {
         MissingJsonContentType(MissingJsonContentType),
         JsonSyntaxError(JsonSyntaxError),
@@ -548,6 +630,8 @@ composite_rejection! {
 unit_rejection! {
     /// The request's `Content-Type` wasn't `application/x-www-form-urlencoded`.
     /// Matches `axum::extract::rejection::InvalidFormContentType`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::InvalidFormContentType`.*
     pub struct InvalidFormContentType => UNSUPPORTED_MEDIA_TYPE, "Form requests must have `Content-Type: application/x-www-form-urlencoded`"
 }
 
@@ -556,6 +640,8 @@ leaf_rejection! {
     /// A `GET`/`HEAD` request's query string didn't deserialize into the
     /// extractor's target type. Matches
     /// `axum::extract::rejection::FailedToDeserializeForm`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::FailedToDeserializeForm`.*
     pub struct FailedToDeserializeForm => UNPROCESSABLE_ENTITY
 }
 
@@ -564,6 +650,8 @@ leaf_rejection! {
     /// A non-`GET`/`HEAD` request's body didn't deserialize into the
     /// extractor's target type. Matches
     /// `axum::extract::rejection::FailedToDeserializeFormBody`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::FailedToDeserializeFormBody`.*
     pub struct FailedToDeserializeFormBody => UNPROCESSABLE_ENTITY
 }
 
@@ -571,6 +659,8 @@ leaf_rejection! {
 composite_rejection! {
     /// Rejection for the [`super::Form`] extractor. Matches
     /// `axum::extract::rejection::FormRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::FormRejection`.*
     pub enum FormRejection {
         InvalidFormContentType(InvalidFormContentType),
         FailedToDeserializeForm(FailedToDeserializeForm),
@@ -583,6 +673,8 @@ composite_rejection! {
 composite_rejection! {
     /// Rejection for the [`super::RawForm`] extractor. Matches
     /// `axum::extract::rejection::RawFormRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::RawFormRejection`.*
     pub enum RawFormRejection {
         InvalidFormContentType(InvalidFormContentType),
         BytesRejection(BytesRejection),
@@ -594,12 +686,16 @@ composite_rejection! {
 leaf_rejection! {
     /// The requested extension type wasn't present in the request's
     /// extensions. Matches `axum::extract::rejection::MissingExtension`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::MissingExtension`.*
     pub struct MissingExtension => INTERNAL_SERVER_ERROR
 }
 
 composite_rejection! {
     /// Rejection for the [`super::Extension`] extractor. Matches
     /// `axum::extract::rejection::ExtensionRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::ExtensionRejection`.*
     pub enum ExtensionRejection {
         MissingExtension(MissingExtension),
     }
@@ -612,6 +708,8 @@ unit_rejection! {
     /// No matched route pattern was found in the request's extensions
     /// (the request never matched a route). Matches
     /// `axum::extract::rejection::MatchedPathMissing`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::MatchedPathMissing`.*
     pub struct MatchedPathMissing => INTERNAL_SERVER_ERROR, "No matched path found"
 }
 
@@ -619,6 +717,8 @@ unit_rejection! {
 composite_rejection! {
     /// Rejection for the [`super::MatchedPath`] extractor. Matches
     /// `axum::extract::rejection::MatchedPathRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::rejection::MatchedPathRejection`.*
     pub enum MatchedPathRejection {
         MatchedPathMissing(MatchedPathMissing),
     }
@@ -628,6 +728,8 @@ composite_rejection! {
 
 /// The matched route wasn't nested under a prefix. Matches
 /// `axum::extract::rejection::NestedPathRejection`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::rejection::NestedPathRejection`.*
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct NestedPathRejection;
@@ -640,9 +742,23 @@ impl std::fmt::Display for NestedPathRejection {
 
 impl std::error::Error for NestedPathRejection {}
 
+impl NestedPathRejection {
+    /// Get the response body text used for this rejection.
+    #[must_use]
+    pub fn body_text(&self) -> String {
+        self.to_string()
+    }
+
+    /// Get the status code used for this rejection.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 impl IntoResponse for NestedPathRejection {
     fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()).into_response()
+        (self.status(), self.body_text()).into_response()
     }
 }
 
@@ -651,6 +767,8 @@ impl IntoResponse for NestedPathRejection {
 /// The `boundary` in a `multipart/form-data` request was missing or invalid.
 ///
 /// Matches `axum::extract::rejection::InvalidBoundary`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::multipart::InvalidBoundary`.*
 #[cfg(feature = "multipart")]
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
@@ -667,9 +785,24 @@ impl std::fmt::Display for InvalidBoundary {
 impl std::error::Error for InvalidBoundary {}
 
 #[cfg(feature = "multipart")]
+impl InvalidBoundary {
+    /// Get the response body text used for this rejection.
+    #[must_use]
+    pub fn body_text(&self) -> String {
+        self.to_string()
+    }
+
+    /// Get the status code used for this rejection.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+#[cfg(feature = "multipart")]
 impl IntoResponse for InvalidBoundary {
     fn into_response(self) -> Response {
-        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+        (self.status(), self.body_text()).into_response()
     }
 }
 
@@ -678,6 +811,8 @@ composite_rejection! {
     /// Rejection for the [`super::multipart::Multipart`] extractor.
     ///
     /// Matches `axum::extract::rejection::MultipartRejection`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::multipart::MultipartRejection`.*
     pub enum MultipartRejection {
         InvalidBoundary(InvalidBoundary),
     }

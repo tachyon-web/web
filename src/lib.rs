@@ -280,6 +280,7 @@ pub use routing::handler::{BoxedFuture, BoxedHandler, Handler};
 pub use routing::middleware;
 pub use routing::middleware::Next;
 pub use routing::static_dir::ServeDir;
+pub use routing::tower_compat::ServiceExt;
 pub use routing::{
     MethodFilter, MethodRouter, Router, RouterError, any, any_service, connect, connect_service,
     delete, delete_service, get, get_service, head, head_service, on, on_service, options,
@@ -289,3 +290,21 @@ pub use routing::{
 #[cfg(feature = "tls")]
 pub use server::{HttpsServer, RustlsConfig, bind_rustls};
 pub use server::{MultiServer, Server, serve};
+
+/// The body type and body-consuming helpers, at the path `axum::body` uses for them.
+pub mod body {
+    pub use crate::HttpBody;
+    pub use crate::http::response::{Body, BodyDataStream, to_bytes};
+    pub use bytes::Bytes;
+}
+
+/// [`Handler`] and its `Service`-facing wrappers, at the path `axum::handler` uses.
+pub mod handler {
+    pub use crate::routing::handler::Handler;
+    pub use crate::routing::tower_compat::{HandlerService, HandlerWithoutStateExt, Layered};
+
+    /// `Future` types returned by the wrapper types above, matching `axum::handler::future`.
+    pub mod future {
+        pub use crate::routing::tower_compat::{IntoServiceFuture, LayeredFuture};
+    }
+}

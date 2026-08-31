@@ -45,6 +45,8 @@ use std::sync::Arc;
 /// also installed process-wide: plenty of relays on the live network don't yet support hybrid
 /// PQ key-exchange groups on their TLS link layer. Prefer PQ, don't require it exclusively, if
 /// this same policy will also be installed as the process default.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone)]
 pub struct TlsPolicy {
     provider: Arc<CryptoProvider>,

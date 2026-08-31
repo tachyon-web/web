@@ -14,6 +14,8 @@ use crate::http::response::{Body, IntoResponse};
 use crate::routing::extract::{FromRequest, FromRequestParts};
 
 /// A future that might be immediately ready, avoiding heap allocation.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub enum HandlerResponseFuture {
     /// The response was resolved immediately without any async waiting.
     Ready(Option<Response<Body>>),
@@ -53,17 +55,25 @@ fn noop_waker() -> Waker {
 }
 
 /// A pinned, boxed, `Send` future returning an HTTP response, or an immediately resolved response.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub type BoxedFuture = HandlerResponseFuture;
 
 /// A type-erased handler: `Arc<dyn Fn(Request<Body>, Arc<S>) -> BoxedFuture>`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub type BoxedHandler<S> =
     Arc<dyn Fn(Request<Body>, Arc<S>) -> BoxedFuture + Send + Sync + 'static>;
 
 /// Marker for asynchronous handlers.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct AsyncHandler<T>(std::marker::PhantomData<T>);
 
 /// Marker for synchronous handlers.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct SyncHandler<T>(std::marker::PhantomData<T>);
 
@@ -81,7 +91,9 @@ pub struct SyncHandler<T>(std::marker::PhantomData<T>);
 ///
 /// A sync handler runs on the Tokio worker that picked up the request. Blocking inside one
 /// stalls that worker — keep them to instant CPU work, and use `spawn_blocking` for I/O.
-pub trait Handler<T, S>: Clone + Send + Sync + 'static {
+///
+/// *Axum compatibility: drop-in replacement for `axum::handler::Handler`.*
+pub trait Handler<T, S>: Clone + Send + Sync + Sized + 'static {
     /// The future returned by [`Handler::call`].
     type Future: Future<Output = Response<Body>> + Send + 'static;
 

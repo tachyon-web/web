@@ -23,6 +23,8 @@ type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 /// Configuration for in-memory file caching.
 ///
 /// Defaults: enabled, 64 MiB total cap, 2 MiB per-file cap.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Debug)]
 pub struct CacheConfig {
     /// Whether RAM caching is *permitted*. This only takes effect once
@@ -292,6 +294,8 @@ impl StaticAsset {
 ///   or
 /// - Sanitize/strip `<script>` (and other active content) from SVGs before
 ///   they land in the served directory.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone, Debug)]
 pub struct ServeDir {
     base_path: PathBuf,

@@ -59,6 +59,8 @@ pub(crate) fn max_body_size(extensions: &hyper::http::Extensions) -> usize {
 /// itself — it only sets an extension the `Bytes`/`String`/`Json`/`Form`
 /// extractors read lazily, when (and if) they actually buffer the body
 /// themselves — so layering order relative to *this* layer doesn't matter.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::DefaultBodyLimit`.*
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultBodyLimit {
     /// `None` means disabled (`usize::MAX`).
@@ -79,12 +81,20 @@ impl DefaultBodyLimit {
     pub const fn disable() -> Self {
         Self { limit: None }
     }
+
+    /// Sets this limit directly on `req`'s extensions, for callers driving extractors
+    /// without going through the `tower::Layer` chain this type also implements.
+    /// Matches `axum::extract::DefaultBodyLimit::apply`.
+    pub fn apply<B>(self, req: &mut hyper::Request<B>) {
+        req.extensions_mut()
+            .insert(MaxBodySize(self.limit.unwrap_or(usize::MAX)));
+    }
 }
 
-impl tower::Layer<crate::routing::Route> for DefaultBodyLimit {
-    type Service = DefaultBodyLimitService;
+impl<S> tower::Layer<S> for DefaultBodyLimit {
+    type Service = DefaultBodyLimitService<S>;
 
-    fn layer(&self, inner: crate::routing::Route) -> Self::Service {
+    fn layer(&self, inner: S) -> Self::Service {
         DefaultBodyLimitService {
             limit: self.limit.unwrap_or(usize::MAX),
             inner,
@@ -93,13 +103,22 @@ impl tower::Layer<crate::routing::Route> for DefaultBodyLimit {
 }
 
 /// The `tower::Service` produced by [`DefaultBodyLimit`]'s `tower::Layer` impl.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone)]
-pub struct DefaultBodyLimitService {
+pub struct DefaultBodyLimitService<S> {
     limit: usize,
-    inner: crate::routing::Route,
+    inner: S,
 }
 
-impl tower::Service<hyper::Request<Body>> for DefaultBodyLimitService {
+impl<S> tower::Service<hyper::Request<Body>> for DefaultBodyLimitService<S>
+where
+    S: tower::Service<hyper::Request<Body>, Response = hyper::Response<Body>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
     type Response = hyper::Response<Body>;
     type Error = Infallible;
     type Future =
@@ -142,9 +161,60 @@ pub(crate) fn is_json_content_type(content_type: &str) -> bool {
 }
 
 /// Extractor for JSON payloads. Requires the `json` feature.
+///
+/// *Axum compatibility: drop-in replacement for `axum::Json`.*
 #[cfg(feature = "json")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Json<T>(pub T);
+
+#[cfg(feature = "json")]
+impl<T> std::ops::Deref for Json<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "json")]
+impl<T> std::ops::DerefMut for Json<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "json")]
+impl<T> From<T> for Json<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
+
+#[cfg(feature = "json")]
+impl<T> Json<T>
+where
+    T: DeserializeOwned,
+{
+    /// Deserializes `bytes` directly as JSON, bypassing the `Content-Type` check and
+    /// request-body machinery `FromRequest` uses. Matches `axum::Json::from_bytes`.
+    ///
+    /// # Errors
+    /// Returns a rejection if `bytes` isn't valid JSON, or doesn't match `T`'s shape.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, rejection::JsonRejection> {
+        serde_json::from_slice::<T>(bytes).map(Self).map_err(|e| {
+            // See the `FromRequest` impl below for why this splits on `e.classify()`.
+            let message = format!("Failed to deserialize JSON payload: {e}");
+            match e.classify() {
+                serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+                    rejection::JsonSyntaxError(message).into()
+                }
+                serde_json::error::Category::Data | serde_json::error::Category::Io => {
+                    rejection::JsonDataError(message).into()
+                }
+            }
+        })
+    }
+}
 
 #[cfg(feature = "json")]
 impl<S, T> FromRequest<S> for Json<T>
@@ -171,22 +241,7 @@ where
             .collect_bytes(limit)
             .await
             .map_err(rejection::BytesRejection::from)?;
-        serde_json::from_slice::<T>(&body).map(Json).map_err(|e| {
-            // Matches Axum's `JsonRejection`: malformed JSON (unbalanced braces,
-            // trailing commas, invalid escapes, truncated input, ...) is a client
-            // syntax error (`400`), while well-formed JSON that doesn't match the
-            // target type's shape (wrong field types, missing required fields) is
-            // `422` — the payload was understood but semantically rejected.
-            let message = format!("Failed to deserialize JSON payload: {e}");
-            match e.classify() {
-                serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-                    rejection::JsonSyntaxError(message).into()
-                }
-                serde_json::error::Category::Data | serde_json::error::Category::Io => {
-                    rejection::JsonDataError(message).into()
-                }
-            }
-        })
+        Self::from_bytes(&body)
     }
 }
 #[cfg(feature = "json")]
@@ -238,9 +293,27 @@ impl<S: Sync> FromRequest<S> for String {
     }
 }
 /// Extractor for form-urlencoded payloads. Requires the `form` feature.
+///
+/// *Axum compatibility: drop-in replacement for `axum::Form`.*
 #[cfg(feature = "form")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Form<T>(pub T);
+
+#[cfg(feature = "form")]
+impl<T> std::ops::Deref for Form<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "form")]
+impl<T> std::ops::DerefMut for Form<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[cfg(feature = "form")]
 impl<S: Sync, T> FromRequestParts<S> for Form<T>
@@ -327,6 +400,8 @@ where
 /// For `GET`/`HEAD` requests this is the raw query string; for other methods
 /// it's the raw `application/x-www-form-urlencoded` request body. Requires
 /// the `form` feature.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::RawForm`.*
 #[cfg(feature = "form")]
 #[derive(Debug, Clone)]
 pub struct RawForm(pub Bytes);
@@ -381,6 +456,8 @@ impl<S: Sync> FromRequest<S> for hyper::Request<Bytes> {
 /// Unlike `Bytes`, `String`, `Json`, and `Form`, this never allocates a single
 /// contiguous buffer for the body and is not subject to [`crate::server::Server::max_body_size`]
 /// — callers reading from the stream are responsible for enforcing their own limits.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct BodyStream(pub Body);
 

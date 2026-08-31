@@ -82,6 +82,8 @@ pub(super) fn tls_config_builder(
 }
 
 /// Configuration for custom rustls server.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
 #[derive(Clone)]
 pub struct RustlsConfig {
@@ -139,6 +141,8 @@ impl RustlsConfig {
     }
 }
 /// Create an HTTPS server bound to the given `SocketAddr` using the provided `RustlsConfig`.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
 #[must_use]
 pub const fn bind_rustls(addr: std::net::SocketAddr, config: RustlsConfig) -> HttpsServer {
@@ -149,6 +153,8 @@ pub const fn bind_rustls(addr: std::net::SocketAddr, config: RustlsConfig) -> Ht
     }
 }
 /// An HTTPS server ready to be run.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
 pub struct HttpsServer {
     pub(crate) addr: std::net::SocketAddr,

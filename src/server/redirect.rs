@@ -19,6 +19,8 @@ use hyper::{Request, Response};
 ///
 /// Far below [`crate::server::Server::max_connections`] on purpose: every connection here gets a bodyless
 /// `308` or a challenge token and closes, so the queue drains fast.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
 pub const REDIRECT_MAX_CONNECTIONS: usize = 2048;
 /// Parameters for the plaintext port-80 redirect/ACME-challenge listener spawned alongside a
@@ -115,6 +117,8 @@ pub(super) fn resolve_redirect_host<'a>(
 /// challenges — it never reaches the router — so it uses its own fixed ceiling rather than
 /// [`crate::server::Server::max_connections`], which sizes the listener that actually runs application
 /// handlers.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
 pub async fn serve_http_redirect_and_challenges(
     listener: TcpListener,

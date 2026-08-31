@@ -108,8 +108,12 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Default for [`Server::max_websocket_connections`] — see that field for how to size it.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 25_600;
 /// Default for [`Server::max_h3_concurrent_streams`] — see that field for how to size it.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "http3")]
 pub const DEFAULT_MAX_H3_CONCURRENT_STREAMS: usize = 256;
 /// How long [`Server::serve_all_acme`] waits for the first certificate to be
@@ -138,6 +142,8 @@ const FIRST_CERT_TIMEOUT: Duration = Duration::from_mins(1);
 ///     Ok(())
 /// }
 /// ```
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct Server<S> {
     pub(crate) router: CompiledRouter<S>,

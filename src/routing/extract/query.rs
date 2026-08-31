@@ -182,9 +182,52 @@ impl<'de> Iterator for QueryIter<'de> {
     }
 }
 /// Extractor for query parameters. Requires the `query` feature.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::Query`.*
 #[cfg(feature = "query")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
+
+#[cfg(feature = "query")]
+impl<T> std::ops::Deref for Query<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "query")]
+impl<T> std::ops::DerefMut for Query<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "query")]
+impl<T> Query<T>
+where
+    T: DeserializeOwned,
+{
+    /// Deserializes `uri`'s query string directly, bypassing the request-parts machinery
+    /// `FromRequestParts` uses. Matches `axum::extract::Query::try_from_uri`.
+    ///
+    /// # Errors
+    /// Returns a rejection if the query string doesn't match `T`'s shape.
+    pub fn try_from_uri(uri: &hyper::Uri) -> Result<Self, rejection::QueryRejection> {
+        let query_str = uri.query().unwrap_or("");
+        let iter = QueryIter { input: query_str };
+        let map_de = serde::de::value::MapDeserializer::new(iter);
+        T::deserialize(map_de)
+            .map(Self)
+            .map_err(|e: serde::de::value::Error| {
+                rejection::FailedToDeserializeQueryString(format!(
+                    "Failed to deserialize query parameters: {e}"
+                ))
+                .into()
+            })
+    }
+}
 
 #[cfg(feature = "query")]
 impl<S: Sync, T> FromRequestParts<S> for Query<T>
@@ -197,25 +240,16 @@ where
         parts: &mut hyper::http::request::Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
-        std::future::ready({
-            let query_str = parts.uri.query().unwrap_or("");
-            let iter = QueryIter { input: query_str };
-            let map_de = serde::de::value::MapDeserializer::new(iter);
-            T::deserialize(map_de)
-                .map(Query)
-                .map_err(|e: serde::de::value::Error| {
-                    rejection::FailedToDeserializeQueryString(format!(
-                        "Failed to deserialize query parameters: {e}"
-                    ))
-                    .into()
-                })
-        })
+        std::future::ready(Self::try_from_uri(&parts.uri))
     }
 }
 
-/// Extracts the raw, un-deserialized query string (`None` if the request has
-/// none), matching `axum::extract::RawQuery`. Infallible — unlike [`Query`],
-/// this never rejects, since it does no parsing at all.
+/// Extracts the raw, un-deserialized query string.
+///
+/// `None` if the request has none. Infallible — unlike [`Query`], this never
+/// rejects, since it does no parsing at all.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::RawQuery`.*
 #[derive(Debug, Clone)]
 pub struct RawQuery(pub Option<String>);
 

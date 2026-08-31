@@ -6,6 +6,8 @@ mod cert_gen {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     /// A self-signed TLS certificate with both PEM and DER representations.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     #[derive(Debug)]
     pub struct SelfSignedCert {
         /// Certificate in PEM format.
@@ -24,6 +26,8 @@ mod cert_gen {
     /// # Errors
     ///
     /// Returns an error if generating the key pair or signing the certificate fails.
+    ///
+    /// *Tachyon extension: no `axum` equivalent.*
     pub fn generate_self_signed_cert(domains: Vec<String>) -> Result<SelfSignedCert, rcgen::Error> {
         let params = CertificateParams::new(domains)?;
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384)?;

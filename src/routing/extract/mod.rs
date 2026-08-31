@@ -48,6 +48,21 @@ pub use parts::*;
 pub use path::*;
 pub use query::*;
 
+/// The request type extractors receive, matching `axum::extract::Request`.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::Request`.*
+pub type Request<T = crate::http::response::Body> = hyper::Request<T>;
+
+/// Extractors and helpers for the client's socket address, matching
+/// `axum::extract::connect_info`.
+pub mod connect_info {
+    pub use crate::routing::extract::parts::ConnectInfo;
+    pub use crate::routing::tower_compat::MockConnectInfo;
+    pub use crate::routing::tower_compat::{
+        Connected, IntoMakeServiceWithConnectInfo, ResponseFuture,
+    };
+}
+
 use crate::http::response::Body;
 use std::future::Future;
 
@@ -56,6 +71,8 @@ use std::future::Future;
 /// `async fn`, matching `axum::extract::FromRequestParts` exactly — most built-in
 /// impls here don't need to await anything and resolve immediately, but a user
 /// extractor that needs to (e.g. a database round trip keyed off a header) can.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::FromRequestParts`.*
 pub trait FromRequestParts<S>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
@@ -83,6 +100,8 @@ pub trait FromRequestParts<S>: Sized + Send {
 /// implement both [`FromRequestParts`] and `FromRequest` without a coherence conflict — this
 /// crate achieves the same result via per-type macro-generated impls instead, so `M` exists here
 /// purely for signature parity.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::FromRequest`.*
 pub trait FromRequest<S, M = ()>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
@@ -161,6 +180,8 @@ impl_from_request_via_parts!(ConnectInfo<T>, T: Clone + Send + Sync + 'static);
 /// Only implemented for the extractors Axum itself implements it for
 /// ([`Extension`], [`MatchedPath`], [`Path`]) — an extractor with no impl of this
 /// trait has no `Option<T>` support at all, matching Axum exactly.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::OptionalFromRequestParts`.*
 pub trait OptionalFromRequestParts<S>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
@@ -183,6 +204,8 @@ pub trait OptionalFromRequestParts<S>: Sized + Send {
 /// Only implemented for the extractors Axum itself implements it for ([`Json`],
 /// [`Multipart`]) — an extractor with no impl of this trait has no `Option<T>`
 /// support at all, matching Axum exactly.
+///
+/// *Axum compatibility: drop-in replacement for `axum::extract::OptionalFromRequest`.*
 pub trait OptionalFromRequest<S>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;

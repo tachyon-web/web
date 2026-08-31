@@ -12,6 +12,8 @@ use hyper::{HeaderMap, Response, StatusCode, Version};
 use std::sync::Arc;
 
 /// Predicate used to determine if a response should be compressed or not.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 pub trait Predicate: Send + Sync + 'static {
     /// Should this response be compressed?
     fn should_compress(&self, response: &Response<Body>) -> bool;
@@ -46,6 +48,8 @@ where
 /// Two predicates combined into one — compresses only when both would.
 ///
 /// Created with [`Predicate::and`].
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone, Copy)]
 pub struct And<Lhs, Rhs> {
     lhs: Lhs,
@@ -63,6 +67,8 @@ where
 }
 
 /// [`Predicate`] that only allows compression of responses at or above a certain size.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone, Copy)]
 pub struct SizeAbove(u16);
 
@@ -101,6 +107,8 @@ impl Predicate for SizeAbove {
 }
 
 /// [`Predicate`] that won't allow responses with a specific `Content-Type` to be compressed.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone)]
 pub struct NotForContentType {
     content_type: Str,
@@ -177,6 +185,8 @@ impl Str {
 ///
 /// Compresses everything at least [`SizeAbove::DEFAULT_MIN_SIZE`] bytes, except gRPC, images
 /// (`image/svg+xml` excepted), and Server-Sent Events.
+///
+/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug, Clone)]
 pub struct DefaultPredicate(
     And<And<And<SizeAbove, NotForContentType>, NotForContentType>, NotForContentType>,

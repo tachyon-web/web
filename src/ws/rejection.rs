@@ -120,42 +120,56 @@ macro_rules! ws_composite_rejection {
 ws_rejection! {
     /// The request method wasn't `GET` on an HTTP/1.1 handshake. Matches
     /// `axum::extract::ws::rejection::MethodNotGet`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::MethodNotGet`.*
     pub struct MethodNotGet => METHOD_NOT_ALLOWED, "Request method must be `GET`"
 }
 
 ws_rejection! {
     /// The request method wasn't `CONNECT` on an RFC 8441 (HTTP/2) handshake. Matches
     /// `axum::extract::ws::rejection::MethodNotConnect`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::MethodNotConnect`.*
     pub struct MethodNotConnect => METHOD_NOT_ALLOWED, "Request method must be `CONNECT`"
 }
 
 ws_rejection! {
     /// The `Connection` header didn't include `upgrade`. Matches
     /// `axum::extract::ws::rejection::InvalidConnectionHeader`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::InvalidConnectionHeader`.*
     pub struct InvalidConnectionHeader => BAD_REQUEST, "Connection header did not include 'upgrade'"
 }
 
 ws_rejection! {
     /// The `Upgrade` header didn't include `websocket`. Matches
     /// `axum::extract::ws::rejection::InvalidUpgradeHeader`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::InvalidUpgradeHeader`.*
     pub struct InvalidUpgradeHeader => BAD_REQUEST, "`Upgrade` header did not include 'websocket'"
 }
 
 ws_rejection! {
     /// The HTTP/2 extended-`CONNECT` `:protocol` pseudo-header wasn't `websocket`. Matches
     /// `axum::extract::ws::rejection::InvalidProtocolPseudoheader`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::InvalidProtocolPseudoheader`.*
     pub struct InvalidProtocolPseudoheader => BAD_REQUEST, "`:protocol` pseudo-header did not include 'websocket'"
 }
 
 ws_rejection! {
     /// `Sec-WebSocket-Version` wasn't `13`. Matches
     /// `axum::extract::ws::rejection::InvalidWebSocketVersionHeader`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::InvalidWebSocketVersionHeader`.*
     pub struct InvalidWebSocketVersionHeader => BAD_REQUEST, "`Sec-WebSocket-Version` header did not include '13'"
 }
 
 ws_rejection! {
     /// `Sec-WebSocket-Key` was missing on an HTTP/1.1 handshake. Matches
     /// `axum::extract::ws::rejection::WebSocketKeyHeaderMissing`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::WebSocketKeyHeaderMissing`.*
     pub struct WebSocketKeyHeaderMissing => BAD_REQUEST, "`Sec-WebSocket-Key` header missing"
 }
 
@@ -163,6 +177,8 @@ ws_rejection! {
     /// There was no pending [`hyper::upgrade::OnUpgrade`] on the request — it can't be
     /// upgraded at all (e.g. it arrived over HTTP/1.0). Matches
     /// `axum::extract::ws::rejection::ConnectionNotUpgradable`.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::ConnectionNotUpgradable`.*
     pub struct ConnectionNotUpgradable => UPGRADE_REQUIRED, "WebSocket request couldn't be upgraded since no upgrade state was present"
 }
 
@@ -171,6 +187,8 @@ ws_composite_rejection! {
     ///
     /// Matches `axum::extract::ws::rejection::WebSocketUpgradeRejection` exactly — see the
     /// module docs for how tachyon-specific checks map onto this shared variant set.
+    ///
+    /// *Axum compatibility: drop-in replacement for `axum::extract::ws::rejection::WebSocketUpgradeRejection`.*
     pub enum WebSocketUpgradeRejection {
         MethodNotGet,
         MethodNotConnect,
