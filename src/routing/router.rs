@@ -574,15 +574,23 @@ where
         self.routes = self
             .routes
             .into_iter()
-            .map(|(path, mr)| (path, mr.layer(layer.clone())))
+            .map(|(path, mr)| {
+                (
+                    path,
+                    mr.layer((tower_compat::ResponseAxumBodyLayer::new(), layer.clone())),
+                )
+            })
             .collect();
         if let Some(old) = self.fallback.take() {
             let layer = layer.clone();
-            self.fallback = Some(Arc::new(move |state| old(state).layer(layer.clone())));
+            self.fallback = Some(Arc::new(move |state| {
+                old(state).layer(&(tower_compat::ResponseAxumBodyLayer::new(), layer.clone()))
+            }));
         }
         if let Some(old) = self.method_not_allowed_fallback.take() {
-            self.method_not_allowed_fallback =
-                Some(Arc::new(move |state| old(state).layer(layer.clone())));
+            self.method_not_allowed_fallback = Some(Arc::new(move |state| {
+                old(state).layer(&(tower_compat::ResponseAxumBodyLayer::new(), layer.clone()))
+            }));
         }
         self.compiled = None;
         self
@@ -608,7 +616,12 @@ where
         self.routes = self
             .routes
             .into_iter()
-            .map(|(path, mr)| (path, mr.layer(layer.clone())))
+            .map(|(path, mr)| {
+                (
+                    path,
+                    mr.layer((tower_compat::ResponseAxumBodyLayer::new(), layer.clone())),
+                )
+            })
             .collect();
         self.compiled = None;
         self

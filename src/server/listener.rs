@@ -1,17 +1,11 @@
 //! The `Listener`/`ListenerExt` traits accepted by [`crate::serve`], matching
 //! `axum::serve::{Listener, ListenerExt, TapIo}`.
 //!
-//! Scope note: this crate's actual accept loop lives inside
-//! [`crate::server::Server`]'s `SO_REUSEPORT` worker pool, which binds its own
-//! sockets from a `SocketAddr` rather than accepting connections through a
-//! pre-built listener object — [`crate::serve`] only ever calls
-//! [`Listener::local_addr`] before handing that address off to the worker
-//! pool, never [`Listener::accept`]. `Listener` is still implemented with
-//! real `accept`/`Io` semantics (not stubbed out) so it behaves correctly for
-//! any other caller, and so `TcpListener` genuinely satisfies the same trait
-//! contract Axum's does — but only `TcpListener` (whose `Addr` is a
-//! `SocketAddr`) can actually be passed to [`crate::serve`], since that's the
-//! one address shape the worker pool knows how to rebind.
+//! [`crate::serve`] drives a real accept loop directly against whatever `Listener` it's given —
+//! [`Listener::accept`] runs on every iteration, exactly as it would with axum. This is a
+//! separate accept path from [`crate::server::Server`]'s own `SO_REUSEPORT` worker pool, which
+//! binds its own sockets from a `SocketAddr` rather than accepting through a pre-built listener
+//! object at all; see [`crate::server::serve`]'s module docs for when to reach for which.
 
 use std::fmt;
 use std::future::Future;

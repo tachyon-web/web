@@ -1,14 +1,12 @@
 //! Per-method dispatch table: [`MethodRouter`], the per-verb builder methods
 //! (`.get()`, `.post()`, …), and [`MethodFilter`]/[`on`]/[`on_service`].
 
-use bytes::Bytes;
-use hyper::{Method, Request, Response};
+use crate::http::Request;
+use hyper::Method;
 use std::sync::Arc;
 
-use crate::http::response::Body;
 use crate::routing::handler::Handler;
 use crate::routing::router::RouterError;
-use crate::routing::tower_compat;
 use crate::routing::tower_compat::Route;
 #[cfg(feature = "early-hints")]
 use crate::routing::{fire_early_hints, middleware};
@@ -51,19 +49,20 @@ pub(crate) const fn method_index(m: &Method) -> Option<usize> {
 /// rather than a `Route` directly, deferring the actual `tower::Layer::layer()`
 /// call to materialization time — the same reason Axum's own `MethodRouter`
 /// keeps handlers boxed-but-unbound until `with_state`.
-pub(crate) type BoxedIntoRoute<S> = Arc<dyn Fn(Arc<S>) -> Route + Send + Sync>;
+pub(crate) type BoxedIntoRoute<S, E = std::convert::Infallible> =
+    Arc<dyn Fn(Arc<S>) -> Route<E> + Send + Sync>;
 
 /// Router that dispatches requests to different handlers based on the HTTP method.
 ///
-/// `E` matches axum's `MethodRouter<S, E = Infallible>` shape, but is a phantom marker here
-/// rather than a real, propagated error type: every slot is still always built from a
-/// [`Handler`] or a `tower::Service` whose error is collapsed into a response immediately
-/// (via [`Route`]), so `E` is never actually produced. This means, unlike axum, attaching a
-/// fallible `tower::Layer` via [`MethodRouter::layer`] never requires wrapping it in
-/// [`crate::routing::error_handling::HandleErrorLayer`] first — any `E` (including axum's real, fallible
-/// ones) type-checks here with no extra step.
+/// `E` matches axum's `MethodRouter<S, E = Infallible>` shape and is a real, propagated
+/// error type for raw-`tower::Service` slots (built via `*_service`/`on_service`/
+/// `any_service`): the service's error survives unconverted all the way up to
+/// [`crate::routing::Router::route`], which — like axum — only accepts a `MethodRouter`
+/// once `E = Infallible`. `Handler`-based slots (`.get()`/`.post()`/…) never carry a live
+/// `E` at all, since [`Handler`] has no `Error` type — every handler call already resolves
+/// to a `Response` before it reaches a [`Route`].
 pub struct MethodRouter<S, E = std::convert::Infallible> {
-    pub(crate) handlers: [Option<BoxedIntoRoute<S>>; METHOD_COUNT],
+    pub(crate) handlers: [Option<BoxedIntoRoute<S, E>>; METHOD_COUNT],
     /// Path-parameter names in declaration order, populated by `Router::compile()`. Cloning
     /// an `Arc<str>` into `PathParams` is a refcount bump rather than a per-request
     /// allocation.
@@ -104,7 +103,7 @@ impl<S, E> std::fmt::Debug for MethodRouter<S, E> {
 
 impl<S, E> Default for MethodRouter<S, E>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone,
 {
     fn default() -> Self {
         Self::new()
@@ -113,7 +112,7 @@ where
 
 impl<S, E> MethodRouter<S, E>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone,
 {
     /// Create a new empty `MethodRouter`.
     #[must_use]
@@ -127,15 +126,17 @@ where
         }
     }
 
-    fn set<H, T>(mut self, idx: usize, handler: H) -> Self
+    /// Registers a raw `tower::Service` at `idx`, storing a genuinely fallible `Route<E>` —
+    /// used by the `*_service`/`on_service`/`any_service` constructors. Unlike [`Self::set`]
+    /// (Handler-based, always infallible), this never routes through [`Handler`].
+    fn set_service<Svc>(mut self, idx: usize, service: Svc) -> Self
     where
-        H: Handler<T, S>,
-        T: 'static,
+        Svc: tower::Service<Request, Error = E> + Clone + Send + Sync + 'static,
+        Svc::Response: crate::http::response::IntoResponse + 'static,
+        Svc::Future: Send + 'static,
     {
         if let Some(slot) = self.handlers.get_mut(idx) {
-            *slot = Some(Arc::new(move |state: Arc<S>| {
-                Route::from_handler(handler.clone(), &state)
-            }));
+            *slot = Some(Arc::new(move |_state: Arc<S>| Route::new(service.clone())));
         }
         self
     }
@@ -173,35 +174,82 @@ where
     /// `MethodRouter` **so far** — matching `axum::routing::MethodRouter::layer`.
     /// Call this after the verb builders (`.get()`/`.post()`/...) it should cover.
     #[must_use]
-    pub fn layer<L, RespBody, NewError>(mut self, layer: L) -> MethodRouter<S, NewError>
+    pub fn layer<L, NewError>(mut self, layer: L) -> MethodRouter<S, NewError>
     where
-        L: tower::Layer<Route> + Clone + Send + Sync + 'static,
-        L::Service: tower::Service<Request<Body>, Response = Response<RespBody>>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        <L::Service as tower::Service<Request<Body>>>::Future: Send + 'static,
-        <L::Service as tower::Service<Request<Body>>>::Error:
-            Into<crate::http::error::Error> + Send,
-        RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
-        RespBody::Error: Into<crate::http::error::Error>,
+        L: tower::Layer<Route<E>> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<Request> + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<Request>>::Response:
+            crate::http::response::IntoResponse + 'static,
+        <L::Service as tower::Service<Request>>::Error: Into<NewError> + 'static,
+        <L::Service as tower::Service<Request>>::Future: Send + 'static,
+        E: 'static,
+        S: 'static,
+        NewError: 'static,
     {
-        for slot in &mut self.handlers {
-            if let Some(old) = slot.take() {
+        let mut new_handlers: [Option<BoxedIntoRoute<S, NewError>>; METHOD_COUNT] =
+            [const { None }; METHOD_COUNT];
+        for (slot, old) in new_handlers.iter_mut().zip(self.handlers.iter_mut()) {
+            if let Some(old) = old.take() {
                 let layer = layer.clone();
-                *slot = Some(Arc::new(move |state: Arc<S>| {
-                    old(state).layer(layer.clone())
-                }));
+                *slot = Some(Arc::new(move |state: Arc<S>| old(state).layer(&layer)));
             }
         }
         MethodRouter {
-            handlers: self.handlers,
+            handlers: new_handlers,
             param_names: self.param_names,
             matched_path: self.matched_path,
             nest_prefix: self.nest_prefix,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Capture a state and transition this method router to another state type.
+    #[must_use]
+    pub fn with_state<S2>(self, state: &Arc<S>) -> MethodRouter<S2, E>
+    where
+        S2: Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + 'static,
+        E: 'static,
+    {
+        let mut new_handlers: [Option<BoxedIntoRoute<S2, E>>; METHOD_COUNT] =
+            [const { None }; METHOD_COUNT];
+        for (slot, opt_handler) in new_handlers.iter_mut().zip(self.handlers.iter()) {
+            if let Some(into_route) = opt_handler {
+                let into_route = into_route.clone();
+                let state = state.clone();
+                *slot = Some(Arc::new(move |_new_state: Arc<S2>| {
+                    into_route(state.clone())
+                }));
+            }
+        }
+        MethodRouter {
+            handlers: new_handlers,
+            param_names: self.param_names,
+            matched_path: self.matched_path,
+            nest_prefix: self.nest_prefix,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<S> MethodRouter<S, std::convert::Infallible>
+where
+    S: Clone,
+{
+    /// Registers a [`Handler`] at `idx` — always infallible, since `Handler::call` has no
+    /// `Error` type to propagate.
+    fn set<H, T>(mut self, idx: usize, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+        S: Send + Sync + 'static,
+    {
+        if let Some(slot) = self.handlers.get_mut(idx) {
+            *slot = Some(Arc::new(move |state: Arc<S>| {
+                Route::from_handler(handler.clone(), &state)
+            }));
+        }
+        self
     }
 
     /// Sends a `103 Early Hints` response carrying `links` before this route's handler runs.
@@ -232,7 +280,10 @@ where
     pub fn early_hints(
         self,
         links: impl IntoIterator<Item = crate::http::early_hints::Link>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: 'static,
+    {
         let headers = crate::http::early_hints::links_to_headers(links);
         if headers.is_empty() {
             return self;
@@ -248,9 +299,11 @@ where
         ))
     }
 
-    /// Materializes every `BoxedIntoRoute<S>` slot into a concrete, state-free
+    /// Materializes every `BoxedIntoRoute<S, Infallible>` slot into a concrete, state-free
     /// [`Route`] by calling it with `state` — the one point any layers
-    /// applied so far actually run `tower::Layer::layer()`.
+    /// applied so far actually run `tower::Layer::layer()`. Only ever called from
+    /// [`crate::routing::Router::compile`], which — matching axum — only ever holds
+    /// `MethodRouter<S, Infallible>` entries.
     pub(crate) fn materialize(&self, state: &Arc<S>) -> CompiledMethodRouter {
         let mut handlers: [Option<Route>; METHOD_COUNT] = [const { None }; METHOD_COUNT];
         for (slot, into_route) in handlers.iter_mut().zip(self.handlers.iter()) {
@@ -262,33 +315,6 @@ where
             #[cfg(feature = "matched-path")]
             matched_path: self.matched_path.clone(),
             nest_prefix: self.nest_prefix.clone(),
-        }
-    }
-
-    /// Capture a state and transition this method router to another state type.
-    #[must_use]
-    pub fn with_state<S2>(self, state: &Arc<S>) -> MethodRouter<S2, E>
-    where
-        S2: Clone + Send + Sync + 'static,
-        S: Clone + Send + Sync + 'static,
-    {
-        let mut new_handlers: [Option<BoxedIntoRoute<S2>>; METHOD_COUNT] =
-            [const { None }; METHOD_COUNT];
-        for (slot, opt_handler) in new_handlers.iter_mut().zip(self.handlers.iter()) {
-            if let Some(into_route) = opt_handler {
-                let into_route = into_route.clone();
-                let state = state.clone();
-                *slot = Some(Arc::new(move |_new_state: Arc<S2>| {
-                    into_route(state.clone())
-                }));
-            }
-        }
-        MethodRouter {
-            handlers: new_handlers,
-            param_names: self.param_names,
-            matched_path: self.matched_path,
-            nest_prefix: self.nest_prefix,
-            _marker: std::marker::PhantomData,
         }
     }
 }
@@ -341,7 +367,7 @@ macro_rules! method_routes {
         // missing `on`/`get`/... method rather than a fallback inherent one).
         impl<S> MethodRouter<S, std::convert::Infallible>
         where
-            S: Clone + Send + Sync + 'static,
+            S: Clone,
         {
             $(
                 #[doc = concat!("Add a handler for HTTP ", $verb, " requests.")]
@@ -350,6 +376,7 @@ macro_rules! method_routes {
                 where
                     H: Handler<T, S>,
                     T: 'static,
+                    S: Send + Sync + 'static,
                 {
                     self.set($idx, handler)
                 }
@@ -358,33 +385,23 @@ macro_rules! method_routes {
 
         impl<S, E> MethodRouter<S, E>
         where
-            S: Clone + Send + Sync + 'static,
+            S: Clone,
         {
             $(
                 #[doc = concat!(
                     "Add a raw `tower::Service` handler for HTTP ", $verb,
-                    " requests, matching `axum::routing::method_routing::", stringify!($svc_name), "`."
+                    " requests, matching `axum::routing::method_routing::", stringify!($svc_name), "`. ",
+                    "`service`'s error becomes this router's `E` — chaining another raw service onto ",
+                    "the same `MethodRouter` requires the same error type."
                 )]
                 #[must_use]
-                pub fn $svc_name<Svc, RespBody>(self, service: Svc) -> Self
+                pub fn $svc_name<Svc>(self, service: Svc) -> Self
                 where
-                    Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
-                        + Clone
-                        + Send
-                        + Sync
-                        + 'static,
+                    Svc: tower::Service<Request, Error = E> + Clone + Send + Sync + 'static,
+                    Svc::Response: crate::http::response::IntoResponse + 'static,
                     Svc::Future: Send + 'static,
-                    Svc::Error: Into<crate::http::error::Error> + Send,
-                    RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
-                    RespBody::Error: Into<crate::http::error::Error>,
                 {
-                    self.set(
-                        $idx,
-                        tower_compat::ServiceHandler {
-                            service,
-                            strip_prefix: None,
-                        },
-                    )
+                    self.set_service($idx, service)
                 }
             )+
         }
@@ -404,20 +421,14 @@ macro_rules! method_routes {
                 "Helper to construct a ", $verb,
                 "-only route from a raw `tower::Service`."
             )]
-            pub fn $svc_name<Svc, RespBody, S>(service: Svc) -> MethodRouter<S>
+            pub fn $svc_name<T, S>(svc: T) -> MethodRouter<S, T::Error>
             where
-                Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
-                    + Clone
-                    + Send
-                    + Sync
-                    + 'static,
-                Svc::Future: Send + 'static,
-                Svc::Error: Into<crate::http::error::Error> + Send,
-                RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
-                RespBody::Error: Into<crate::http::error::Error>,
-                S: Clone + Send + Sync + 'static,
+                T: tower::Service<Request> + Clone + Send + Sync + 'static,
+                T::Response: crate::http::response::IntoResponse + 'static,
+                T::Future: Send + 'static,
+                S: Clone,
             {
-                MethodRouter::new().$svc_name(service)
+                MethodRouter::new().$svc_name(svc)
             }
         )+
 
@@ -435,21 +446,15 @@ macro_rules! method_routes {
 
         /// A route dispatching every HTTP method to a raw `tower::Service`, matching
         /// `axum::routing::any_service`.
-        pub fn any_service<Svc, RespBody, S>(service: Svc) -> MethodRouter<S>
+        pub fn any_service<T, S>(svc: T) -> MethodRouter<S, T::Error>
         where
-            Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
-                + Clone
-                + Send
-                + Sync
-                + 'static,
-            Svc::Future: Send + 'static,
-            Svc::Error: Into<crate::http::error::Error> + Send,
-            RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
-            RespBody::Error: Into<crate::http::error::Error>,
-            S: Clone + Send + Sync + 'static,
+            T: tower::Service<Request> + Clone + Send + Sync + 'static,
+            T::Response: crate::http::response::IntoResponse + 'static,
+            T::Future: Send + 'static,
+            S: Clone,
         {
             let router = MethodRouter::new();
-            $( let router = router.$svc_name(service.clone()); )+
+            $( let router = router.$svc_name(svc.clone()); )+
             router
         }
     };
@@ -510,7 +515,7 @@ impl std::ops::BitOr for MethodFilter {
 
 impl<S> MethodRouter<S, std::convert::Infallible>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone,
 {
     /// Add a handler for every HTTP method set in `filter`, matching
     /// `axum::routing::MethodRouter::on`.
@@ -519,6 +524,7 @@ where
     where
         H: Handler<T, S>,
         T: 'static,
+        S: Send + Sync + 'static,
     {
         let indices: Vec<usize> = (0..METHOD_COUNT)
             .filter(|&idx| filter.contains_idx(idx))
@@ -535,22 +541,16 @@ where
 
 impl<S, E> MethodRouter<S, E>
 where
-    S: Clone + Send + Sync + 'static,
+    S: Clone,
 {
     /// Add a raw `tower::Service` handler for every HTTP method set in `filter`, matching
-    /// `axum::routing::MethodRouter::on_service`.
+    /// `axum::routing::MethodRouter::on_service`. `service`'s error becomes this router's `E`.
     #[must_use]
-    pub fn on_service<Svc, RespBody>(mut self, filter: MethodFilter, service: Svc) -> Self
+    pub fn on_service<Svc>(mut self, filter: MethodFilter, service: Svc) -> Self
     where
-        Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
+        Svc: tower::Service<Request, Error = E> + Clone + Send + Sync + 'static,
+        Svc::Response: crate::http::response::IntoResponse + 'static,
         Svc::Future: Send + 'static,
-        Svc::Error: Into<crate::http::error::Error> + Send,
-        RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
-        RespBody::Error: Into<crate::http::error::Error>,
     {
         let indices: Vec<usize> = (0..METHOD_COUNT)
             .filter(|&idx| filter.contains_idx(idx))
@@ -559,21 +559,9 @@ where
             return self;
         };
         for &idx in init {
-            self = self.set(
-                idx,
-                tower_compat::ServiceHandler {
-                    service: service.clone(),
-                    strip_prefix: None,
-                },
-            );
+            self = self.set_service(idx, service.clone());
         }
-        self.set(
-            last,
-            tower_compat::ServiceHandler {
-                service,
-                strip_prefix: None,
-            },
-        )
+        self.set_service(last, service)
     }
 }
 
@@ -590,18 +578,12 @@ where
 
 /// Helper to construct a route for every HTTP method set in `filter` from a raw
 /// `tower::Service`, matching `axum::routing::on_service`.
-pub fn on_service<Svc, RespBody, S>(filter: MethodFilter, service: Svc) -> MethodRouter<S>
+pub fn on_service<T, S>(filter: MethodFilter, svc: T) -> MethodRouter<S, T::Error>
 where
-    Svc: tower::Service<Request<Body>, Response = Response<RespBody>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    Svc::Future: Send + 'static,
-    Svc::Error: Into<crate::http::error::Error> + Send,
-    RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
-    RespBody::Error: Into<crate::http::error::Error>,
-    S: Clone + Send + Sync + 'static,
+    T: tower::Service<Request> + Clone + Send + Sync + 'static,
+    T::Response: crate::http::response::IntoResponse + 'static,
+    T::Future: Send + 'static,
+    S: Clone,
 {
-    MethodRouter::new().on_service(filter, service)
+    MethodRouter::new().on_service(filter, svc)
 }

@@ -20,27 +20,21 @@ use std::task::{Context, Poll};
 use tower::{Layer, Service, ServiceExt as _};
 
 /// A type-erased, cheaply-cloneable `tower::Service` — the atomic unit every
-/// compiled route, fallback, and nested router boils down to. Matches
-/// `axum::routing::Route<E>`.
+/// compiled route, fallback, and nested router boils down to.
 ///
-/// Unlike axum's `Route<E>` (which genuinely propagates a live `E`, forcing
-/// callers to pre-collapse any fallible layer via `HandleErrorLayer` before
-/// it can reach a `Router`), this `Route` is *always* infallible on the
-/// inside: whatever a layered `tower::Service` actually returns as its error
-/// is converted to a response (via `Into<Error>` + [`IntoResponse`]) the
-/// moment it's boxed back into a `Route`, regardless of what `E` names. `E`
-/// exists purely so this type's signature matches axum's — it's never
-/// actually constructed, so any `E` (including axum's real, fallible ones)
-/// works here with no `HandleErrorLayer` required. See the `E`-threading
-/// note in `MethodRouter`'s docs for the same trade-off one level up.
+/// Matches `axum::routing::Route<E>`: `E` is a real, propagated error type — a raw
+/// `tower::Service` handed to `get_service`/`on_service`/etc. keeps its own error all
+/// the way up to [`crate::routing::Router::route`], which (like axum) only accepts it
+/// once `E = Infallible`. `Handler`-based routes never carry a live `E` at all, since
+/// [`Handler::call`](crate::routing::handler::Handler::call) has no `Error` type — it
+/// always resolves to a `Response` via [`IntoResponse`] before it ever reaches a `Route`.
 pub struct Route<E = Infallible>(
-    tower::util::BoxCloneSyncService<Request<Body>, Response<Body>, Infallible>,
-    PhantomData<fn() -> E>,
+    tower::util::BoxCloneSyncService<Request<Body>, Response<Body>, E>,
 );
 
 impl<E> Clone for Route<E> {
     fn clone(&self) -> Self {
-        Self(self.0.clone(), PhantomData)
+        Self(self.0.clone())
     }
 }
 
@@ -53,18 +47,39 @@ impl<E> std::fmt::Debug for Route<E> {
 impl<E> Route<E> {
     pub(crate) fn new<Svc>(svc: Svc) -> Self
     where
-        Svc: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
+        Svc: Service<Request<Body>, Error = E> + Clone + Send + Sync + 'static,
+        Svc::Response: IntoResponse + 'static,
         Svc::Future: Send + 'static,
     {
-        Self(tower::util::BoxCloneSyncService::new(svc), PhantomData)
+        Self(tower::util::BoxCloneSyncService::new(
+            tower::util::MapResponseLayer::new(IntoResponse::into_response).layer(svc),
+        ))
     }
 
+    /// Applies a `tower::Layer` to this route, matching `axum::routing::Route::layer`
+    /// (and, transitively, `Router::layer`/`MethodRouter::layer`). The layered service's
+    /// error is mapped into `NewError` via `Into` — it is never collapsed into a
+    /// [`Response`] here; that only happens where a real `Handler` is built, or where the
+    /// caller explicitly opts in via
+    /// [`HandleErrorLayer`](crate::routing::error_handling::HandleErrorLayer).
+    pub(crate) fn layer<L, NewError>(self, layer: &L) -> Route<NewError>
+    where
+        L: Layer<Self>,
+        L::Service: Service<Request<Body>> + Clone + Send + Sync + 'static,
+        <L::Service as Service<Request<Body>>>::Response: IntoResponse + 'static,
+        <L::Service as Service<Request<Body>>>::Error: Into<NewError> + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send + 'static,
+        NewError: 'static,
+    {
+        let layered = layer.layer(self);
+        Route::new(tower::util::MapErr::new(layered, Into::into))
+    }
+}
+
+impl Route<Infallible> {
     /// Builds the base `Route` for a bare [`Handler`], bound to `state` —
-    /// the starting point every `.layer()` call wraps further.
+    /// the starting point every `.layer()` call wraps further. Always infallible: a
+    /// `Handler` has no error to propagate.
     pub(crate) fn from_handler<H, T, S>(handler: H, state: &Arc<S>) -> Self
     where
         H: Handler<T, S> + Clone + Send + Sync + 'static,
@@ -73,34 +88,15 @@ impl<E> Route<E> {
     {
         Self::new(HandlerService::new(handler, (**state).clone()))
     }
-
-    /// Applies a `tower::Layer` to this route, matching `axum::routing::Route::layer`
-    /// (and, transitively, `Router::layer`/`MethodRouter::layer`).
-    pub(crate) fn layer<L, RespBody, NewError>(self, layer: L) -> Route<NewError>
-    where
-        L: Layer<Self>,
-        L::Service:
-            Service<Request<Body>, Response = Response<RespBody>> + Clone + Send + Sync + 'static,
-        <L::Service as Service<Request<Body>>>::Future: Send + 'static,
-        <L::Service as Service<Request<Body>>>::Error: Into<Error> + Send,
-        RespBody: hyper::body::Body<Data = Bytes> + Send + 'static,
-        RespBody::Error: Into<Error>,
-    {
-        Route::new(ResponseAxumBodyLayer::new().layer(layer.layer(self)))
-    }
 }
 
-impl<E> Service<Request<Body>> for Route<E> {
+impl<E: 'static> Service<Request<Body>> for Route<E> {
     type Response = Response<Body>;
     type Error = E;
     type Future = RouteFuture<E>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self.0.poll_ready(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(never)) => match never {},
-            Poll::Pending => Poll::Pending,
-        }
+        self.0.poll_ready(cx)
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
@@ -109,12 +105,8 @@ impl<E> Service<Request<Body>> for Route<E> {
 }
 
 /// Response future for [`Route`]. Matches `axum::routing::future::RouteFuture`.
-///
-/// Like `Route` itself, `E` is a phantom marker here rather than a type this future can
-/// actually produce: the boxed inner future it drives is always infallible.
 pub struct RouteFuture<E> {
-    inner: Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>,
-    _marker: PhantomData<fn() -> E>,
+    inner: Pin<Box<dyn Future<Output = Result<Response<Body>, E>> + Send>>,
 }
 
 impl<E> std::fmt::Debug for RouteFuture<E> {
@@ -124,12 +116,9 @@ impl<E> std::fmt::Debug for RouteFuture<E> {
 }
 
 impl<E> RouteFuture<E> {
-    fn new(
-        inner: impl Future<Output = Result<Response<Body>, Infallible>> + Send + 'static,
-    ) -> Self {
+    fn new(inner: impl Future<Output = Result<Response<Body>, E>> + Send + 'static) -> Self {
         Self {
             inner: Box::pin(inner),
-            _marker: PhantomData,
         }
     }
 }
@@ -138,12 +127,7 @@ impl<E> Future for RouteFuture<E> {
     type Output = Result<Response<Body>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-        match this.inner.as_mut().poll(cx) {
-            Poll::Ready(Ok(resp)) => Poll::Ready(Ok(resp)),
-            Poll::Ready(Err(never)) => match never {},
-            Poll::Pending => Poll::Pending,
-        }
+        self.get_mut().inner.as_mut().poll(cx)
     }
 }
 
@@ -654,6 +638,27 @@ where
     }
 }
 
+/// Lets a bare `Router` be passed directly to [`crate::server::serve`], matching axum's own
+/// `impl<L> Service<serve::IncomingStream<'_, L>> for Router<()>`: the router is its own trivial
+/// `MakeService`, cloning itself once per accepted connection rather than needing an explicit
+/// `.into_make_service()` call.
+impl<L> Service<IncomingStream<'_, L>> for crate::routing::Router<()>
+where
+    L: crate::server::Listener,
+{
+    type Response = Self;
+    type Error = Infallible;
+    type Future = std::future::Ready<Result<Self, Infallible>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: IncomingStream<'_, L>) -> Self::Future {
+        std::future::ready(Ok(self.clone()))
+    }
+}
+
 /// A [`Router`](crate::routing::Router) converted into a borrowed `tower::Service`.
 ///
 /// Has a fixed body type. Matches `axum::routing::RouterAsService`. Built via
@@ -853,37 +858,42 @@ where
     }
 }
 
-/// A connection accepted by the caller's own accept loop.
+/// A connection accepted by [`crate::serve`]'s (or a caller's own) accept loop, before its
+/// per-connection `tower::Service` is produced from it.
 ///
-/// Handed to a `MakeService` built via
-/// [`ServiceExt::into_make_service_with_connect_info`]. Matches
-/// `axum::serve::IncomingStream` — deliberately minimal, just the two addresses.
-#[derive(Debug, Clone, Copy)]
-pub struct IncomingStream {
-    remote_addr: std::net::SocketAddr,
-    local_addr: std::net::SocketAddr,
+/// Matches `axum::serve::IncomingStream`: generic over the listener type `L`, giving a
+/// `MakeService` access to the raw accepted IO (e.g. for TLS SNI inspection, peer certs,
+/// Unix-socket credentials) as well as the address.
+pub struct IncomingStream<'a, L>
+where
+    L: crate::server::Listener,
+{
+    io: &'a hyper_util::rt::TokioIo<L::Io>,
+    remote_addr: L::Addr,
 }
 
-impl IncomingStream {
-    /// Builds an `IncomingStream` from an accepted connection's addresses.
-    #[must_use]
-    pub const fn new(remote_addr: std::net::SocketAddr, local_addr: std::net::SocketAddr) -> Self {
-        Self {
-            remote_addr,
-            local_addr,
-        }
+impl<'a, L: crate::server::Listener> IncomingStream<'a, L> {
+    /// Builds an `IncomingStream` from an accepted connection's IO and address.
+    pub(crate) const fn new(io: &'a hyper_util::rt::TokioIo<L::Io>, remote_addr: L::Addr) -> Self {
+        Self { io, remote_addr }
     }
 
-    /// The peer's address.
+    /// The raw accepted IO.
     #[must_use]
-    pub const fn remote_addr(&self) -> std::net::SocketAddr {
-        self.remote_addr
+    pub fn io(&self) -> &L::Io {
+        self.io.inner()
     }
 
-    /// The local address the connection was accepted on.
+    /// The peer's address, in whatever shape `L::Addr` reports it.
     #[must_use]
-    pub const fn local_addr(&self) -> std::net::SocketAddr {
-        self.local_addr
+    pub const fn remote_addr(&self) -> &L::Addr {
+        &self.remote_addr
+    }
+}
+
+impl<L: crate::server::Listener> std::fmt::Debug for IncomingStream<'_, L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncomingStream").finish_non_exhaustive()
     }
 }
 
@@ -894,8 +904,8 @@ pub trait Connected<T>: Clone + Send + Sync + 'static {
     fn connect_info(stream: T) -> Self;
 }
 
-impl Connected<IncomingStream> for std::net::SocketAddr {
-    fn connect_info(stream: IncomingStream) -> Self {
+impl Connected<IncomingStream<'_, tokio::net::TcpListener>> for std::net::SocketAddr {
+    fn connect_info(stream: IncomingStream<'_, tokio::net::TcpListener>) -> Self {
         stream.remote_addr
     }
 }
@@ -974,10 +984,11 @@ impl<S, C> std::fmt::Debug for IntoMakeServiceWithConnectInfo<S, C> {
     }
 }
 
-impl<S, C> Service<IncomingStream> for IntoMakeServiceWithConnectInfo<S, C>
+impl<'a, S, C, L> Service<IncomingStream<'a, L>> for IntoMakeServiceWithConnectInfo<S, C>
 where
     S: Clone,
-    C: Connected<IncomingStream>,
+    C: Connected<IncomingStream<'a, L>>,
+    L: crate::server::Listener,
 {
     type Response = ConnectInfoService<S, C>;
     type Error = Infallible;
@@ -987,7 +998,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, target: IncomingStream) -> Self::Future {
+    fn call(&mut self, target: IncomingStream<'a, L>) -> Self::Future {
         let connect_info = C::connect_info(target);
         ResponseFuture {
             inner: std::future::ready(Ok(ConnectInfoService {
@@ -1113,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn route_layer_wraps_and_normalizes_an_arbitrary_tower_layer() {
         let base = Route::<Infallible>::from_handler(hello, &Arc::new(()));
-        let mut layered: Route<Infallible> = base.layer(TagHeaderLayer);
+        let mut layered: Route<Infallible> = base.layer(&TagHeaderLayer);
         let req = Request::builder().body(Body::empty()).unwrap();
         let resp = layered.call(req).await.unwrap();
         assert_eq!(resp.headers().get("x-layered").unwrap(), "yes");
@@ -1123,8 +1134,8 @@ mod tests {
     #[tokio::test]
     async fn route_layer_composes_across_multiple_applications() {
         let base = Route::<Infallible>::from_handler(hello, &Arc::new(()));
-        let once: Route<Infallible> = base.layer(TagHeaderLayer);
-        let twice: Route<Infallible> = once.layer(TagHeaderLayer);
+        let once: Route<Infallible> = base.layer(&TagHeaderLayer);
+        let twice: Route<Infallible> = once.layer(&TagHeaderLayer);
         let req = Request::builder().body(Body::empty()).unwrap();
         let mut twice = twice;
         let resp = twice.call(req).await.unwrap();

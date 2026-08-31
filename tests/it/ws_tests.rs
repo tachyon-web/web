@@ -171,8 +171,10 @@ async fn test_ws_upgrade_rejects_malformed_requests() {
 /// An established WebSocket outlives the HTTP connection it was upgraded from, so it escapes
 /// `max_connections` entirely (hyper resolves the connection future the moment it hands the
 /// socket to the upgrade). `max_websocket_connections` is the ceiling that actually bounds
-/// them: once it's reached the upgrade is refused with `503` *before* the handshake completes,
-/// and the slot is returned when the connection ends.
+/// them: once it's reached the upgrade is refused with `426` (`ConnectionNotUpgradable` — no
+/// dedicated status, since matching `WebSocketUpgradeRejection` to axum's shape exactly means
+/// this reports through the same variant as any other "can't upgrade" rejection) *before* the
+/// handshake completes, and the slot is returned when the connection ends.
 #[tokio::test]
 async fn test_websocket_connection_limit_rejects_and_then_recovers() {
     async fn ws_handler(
@@ -208,8 +210,8 @@ async fn test_websocket_connection_limit_rejects_and_then_recovers() {
     match err {
         tungstenite::Error::Http(resp) => assert_eq!(
             resp.status(),
-            hyper::StatusCode::SERVICE_UNAVAILABLE,
-            "expected 503 once the WebSocket budget is exhausted"
+            hyper::StatusCode::UPGRADE_REQUIRED,
+            "expected 426 once the WebSocket budget is exhausted"
         ),
         other => panic!("expected an HTTP rejection, got: {other:?}"),
     }

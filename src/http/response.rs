@@ -170,13 +170,17 @@ pub trait IntoResponse {
     fn into_response(self) -> Response;
 }
 
-impl IntoResponse for Response {
-    fn into_response(self) -> Self {
-        self
-    }
-}
-
-impl IntoResponse for HttpResponse<http_body_util::Full<Bytes>> {
+/// Matches `axum_core::response::IntoResponse`'s blanket `impl<B> IntoResponse for
+/// http::Response<B>`: any response is convertible regardless of its concrete body type, by
+/// normalizing that body into [`Body`]. Note this means even an already-`Response<Body>` value
+/// is re-boxed here rather than passed through — matching axum's own behavior (its blanket impl
+/// has no special-cased identity path either), traded for not needing a second, narrower
+/// `impl IntoResponse for Response` that would otherwise conflict with this one.
+impl<B> IntoResponse for HttpResponse<B>
+where
+    B: HyperBody<Data = Bytes> + Send + 'static,
+    B::Error: Into<crate::http::error::Error>,
+{
     fn into_response(self) -> Response {
         let (parts, body) = self.into_parts();
         HttpResponse::from_parts(parts, Body::stream(body))

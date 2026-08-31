@@ -773,7 +773,6 @@ mod from_extractor_future {
     where
         E: FromRequestParts<S>,
         T: Service<Request<B>>,
-        S: Sync,
     {
         pub(super) inner: Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>,
         pub(super) _marker: PhantomData<ExtractorMarker<B, T, E, S>>,
@@ -783,7 +782,6 @@ mod from_extractor_future {
     where
         E: FromRequestParts<S>,
         T: Service<Request<B>>,
-        S: Sync,
     {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("ResponseFuture").finish_non_exhaustive()
@@ -794,7 +792,6 @@ mod from_extractor_future {
     where
         E: FromRequestParts<S>,
         T: Service<Request<B>>,
-        S: Sync,
     {
         type Output = Result<Response, Infallible>;
 

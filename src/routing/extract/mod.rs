@@ -56,7 +56,7 @@ use std::future::Future;
 /// `async fn`, matching `axum::extract::FromRequestParts` exactly — most built-in
 /// impls here don't need to await anything and resolve immediately, but a user
 /// extractor that needs to (e.g. a database round trip keyed off a header) can.
-pub trait FromRequestParts<S: Sync>: Sized + Send {
+pub trait FromRequestParts<S>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
 
@@ -83,7 +83,7 @@ pub trait FromRequestParts<S: Sync>: Sized + Send {
 /// implement both [`FromRequestParts`] and `FromRequest` without a coherence conflict — this
 /// crate achieves the same result via per-type macro-generated impls instead, so `M` exists here
 /// purely for signature parity.
-pub trait FromRequest<S: Sync, M = ()>: Sized + Send {
+pub trait FromRequest<S, M = ()>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
 
@@ -161,7 +161,7 @@ impl_from_request_via_parts!(ConnectInfo<T>, T: Clone + Send + Sync + 'static);
 /// Only implemented for the extractors Axum itself implements it for
 /// ([`Extension`], [`MatchedPath`], [`Path`]) — an extractor with no impl of this
 /// trait has no `Option<T>` support at all, matching Axum exactly.
-pub trait OptionalFromRequestParts<S: Sync>: Sized + Send {
+pub trait OptionalFromRequestParts<S>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
 
@@ -183,7 +183,7 @@ pub trait OptionalFromRequestParts<S: Sync>: Sized + Send {
 /// Only implemented for the extractors Axum itself implements it for ([`Json`],
 /// [`Multipart`]) — an extractor with no impl of this trait has no `Option<T>`
 /// support at all, matching Axum exactly.
-pub trait OptionalFromRequest<S: Sync>: Sized + Send {
+pub trait OptionalFromRequest<S>: Sized + Send {
     /// The rejection type returned if extraction fails.
     type Rejection: crate::http::response::IntoResponse;
 

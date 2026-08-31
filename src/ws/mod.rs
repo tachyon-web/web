@@ -50,9 +50,9 @@ use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::http::request::Parts;
 use hyper::{Method, Response, StatusCode};
 use rejection::{
-    ConnectionLimitReached, ConnectionNotUpgradable, HttpVersionNotSupported,
-    InvalidConnectionHeader, InvalidUpgradeHeader, InvalidWebSocketVersionHeader, MethodNotGet,
-    WebSocketKeyHeaderMissing, WebSocketUpgradeRejection,
+    ConnectionNotUpgradable, InvalidConnectionHeader, InvalidUpgradeHeader,
+    InvalidWebSocketVersionHeader, MethodNotGet, WebSocketKeyHeaderMissing,
+    WebSocketUpgradeRejection,
 };
 #[cfg(feature = "http2")]
 use rejection::{InvalidProtocolPseudoheader, MethodNotConnect};
@@ -61,9 +61,8 @@ use std::future::Future;
 use tungstenite::handshake::derive_accept_key;
 
 pub use deflate::DeflateConfig;
-pub use socket::{CloseCode, CloseFrame, Message, WebSocket};
+pub use socket::{CloseCode, CloseFrame, Message, Utf8Bytes, WebSocket};
 pub use tungstenite::protocol::WebSocketConfig;
-pub use tungstenite::protocol::frame::Utf8Bytes;
 
 /// Named WebSocket close-code constants (RFC 6455 §7.4).
 ///
@@ -429,7 +428,7 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
         }
 
         if parts.version > hyper::Version::HTTP_11 {
-            return Err(HttpVersionNotSupported.into());
+            return Err(ConnectionNotUpgradable.into());
         }
         if parts.method != Method::GET {
             return Err(MethodNotGet.into());
@@ -519,8 +518,11 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
 
 /// Reserves a slot against the server's WebSocket budget, if this request carries one.
 ///
-/// During handshake validation rather than after the `101`: refusing with a `503` beats
+/// During handshake validation rather than after the `101`: refusing with a rejection beats
 /// completing the upgrade and leaving the peer holding a connection nothing will service.
+/// Reports through [`ConnectionNotUpgradable`] when the budget is exhausted — axum's own
+/// `WebSocketUpgrade` has no connection budget at all, so there's no dedicated variant to
+/// report through without diverging from its `WebSocketUpgradeRejection` shape.
 fn reserve_connection_slot(
     parts: &Parts,
 ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, WebSocketUpgradeRejection> {
@@ -533,7 +535,7 @@ fn reserve_connection_slot(
         .clone()
         .try_acquire_owned()
         .map(Some)
-        .map_err(|_| ConnectionLimitReached.into())
+        .map_err(|_| ConnectionNotUpgradable.into())
 }
 
 fn parse_sec_websocket_protocol(headers: &HeaderMap) -> SubprotocolList {

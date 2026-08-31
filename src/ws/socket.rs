@@ -25,10 +25,100 @@ use std::task::{Context, Poll};
 use tokio_util::sync::PollSender;
 use tungstenite::Error as WsError;
 use tungstenite::protocol::WebSocketConfig;
+use tungstenite::protocol::frame::Utf8Bytes as TungsteniteUtf8Bytes;
 use tungstenite::protocol::frame::coding::{Control, Data as OpData, OpCode};
 use tungstenite::protocol::frame::{
-    CloseFrame as TungsteniteCloseFrame, Frame, FrameHeader, FrameSocket, Utf8Bytes,
+    CloseFrame as TungsteniteCloseFrame, Frame, FrameHeader, FrameSocket,
 };
+
+/// A UTF-8-validated wire payload, matching `axum::extract::ws::Utf8Bytes`.
+///
+/// A local newtype over `tungstenite`'s own `Utf8Bytes` rather than a direct re-export —
+/// mirrors axum's own choice (it wraps the same underlying type the same way), and keeps this
+/// crate's public API surface independent of `tungstenite`'s exact type shape.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Utf8Bytes(TungsteniteUtf8Bytes);
+
+impl Utf8Bytes {
+    /// Creates from a static str.
+    #[must_use]
+    pub const fn from_static(str: &'static str) -> Self {
+        Self(TungsteniteUtf8Bytes::from_static(str))
+    }
+
+    /// Returns as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub(crate) fn into_tungstenite(self) -> TungsteniteUtf8Bytes {
+        self.0
+    }
+}
+
+impl std::ops::Deref for Utf8Bytes {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for Utf8Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<Bytes> for Utf8Bytes {
+    type Error = std::str::Utf8Error;
+
+    fn try_from(bytes: Bytes) -> Result<Self, Self::Error> {
+        Ok(Self(bytes.try_into()?))
+    }
+}
+
+impl TryFrom<Vec<u8>> for Utf8Bytes {
+    type Error = std::str::Utf8Error;
+
+    fn try_from(v: Vec<u8>) -> Result<Self, Self::Error> {
+        Ok(Self(v.try_into()?))
+    }
+}
+
+impl From<String> for Utf8Bytes {
+    fn from(s: String) -> Self {
+        Self(s.into())
+    }
+}
+
+impl From<&str> for Utf8Bytes {
+    fn from(s: &str) -> Self {
+        Self(s.into())
+    }
+}
+
+impl From<&String> for Utf8Bytes {
+    fn from(s: &String) -> Self {
+        Self(s.into())
+    }
+}
+
+impl From<Utf8Bytes> for Bytes {
+    fn from(Utf8Bytes(bytes): Utf8Bytes) -> Self {
+        bytes.into()
+    }
+}
+
+impl<T> PartialEq<T> for Utf8Bytes
+where
+    for<'a> &'a str: PartialEq<T>,
+{
+    fn eq(&self, other: &T) -> bool {
+        self.as_str() == *other
+    }
+}
 
 /// A WebSocket close code, per RFC 6455 §7.4. Matches `axum::extract::ws::CloseCode`.
 pub type CloseCode = u16;
@@ -47,7 +137,7 @@ impl From<CloseFrame> for TungsteniteCloseFrame {
     fn from(frame: CloseFrame) -> Self {
         Self {
             code: frame.code.into(),
-            reason: frame.reason,
+            reason: frame.reason.into_tungstenite(),
         }
     }
 }

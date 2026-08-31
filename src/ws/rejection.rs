@@ -3,12 +3,18 @@
 //! Each leaf here is a fixed-status, fixed-message unit struct — mirroring axum's own
 //! `__define_rejection!`-generated shape exactly, since every WebSocket handshake failure
 //! (unlike, say, a `Path<T>` deserialize failure) has message text that's always the same
-//! regardless of the request that triggered it. [`WebSocketUpgradeRejection`] additionally
-//! carries two variants axum has no equivalent for — [`HttpVersionNotSupported`] (this
-//! crate's stricter HTTP-version gate ahead of the RFC 8441 bootstrap) and
-//! [`ConnectionLimitReached`] (`Server::max_websocket_connections`, a budget axum's own
-//! `WebSocketUpgrade` has no concept of) — both additive, so code matching on the axum-shared
-//! variants still ports unchanged.
+//! regardless of the request that triggered it. [`WebSocketUpgradeRejection`]'s variant set is
+//! byte-for-byte identical to axum's — two tachyon-specific checks report through the closest
+//! existing variant rather than adding one of their own:
+//!
+//! - This crate's stricter HTTP-version gate ahead of the RFC 8441 bootstrap (rejecting anything
+//!   above HTTP/1.1 that isn't the HTTP/2 extended-`CONNECT` path) reports through
+//!   [`ConnectionNotUpgradable`].
+//! - [`Server::max_websocket_connections`](crate::server::Server::max_websocket_connections)
+//!   (a connection budget axum's own `WebSocketUpgrade` has no concept of) also reports through
+//!   [`ConnectionNotUpgradable`] once exhausted, rather than through a distinct `503` variant —
+//!   the upgrade is refused either way, just under axum's shared `426` status instead of a
+//!   tachyon-only one.
 
 use crate::http::response::{IntoResponse, Response};
 use hyper::StatusCode;
@@ -160,26 +166,11 @@ ws_rejection! {
     pub struct ConnectionNotUpgradable => UPGRADE_REQUIRED, "WebSocket request couldn't be upgraded since no upgrade state was present"
 }
 
-ws_rejection! {
-    /// The request's HTTP version isn't supported for a WebSocket handshake.
-    ///
-    /// Neither HTTP/1.1 (the RFC 6455 bootstrap) nor, with the `http2` feature enabled, HTTP/2
-    /// (the RFC 8441 extended-`CONNECT` bootstrap). Tachyon-only — axum has no equivalent,
-    /// since axum treats every version above HTTP/1.1 as the HTTP/2 bootstrap unconditionally.
-    pub struct HttpVersionNotSupported => UPGRADE_REQUIRED,
-        "WebSocket upgrades require HTTP/1.1 (or HTTP/2 extended CONNECT, with the `http2` feature enabled)"
-}
-
-ws_rejection! {
-    /// [`Server::max_websocket_connections`](crate::server::Server::max_websocket_connections)
-    /// was reached. Tachyon-only — axum's `WebSocketUpgrade` has no built-in connection budget.
-    pub struct ConnectionLimitReached => SERVICE_UNAVAILABLE, "WebSocket connection limit reached"
-}
-
 ws_composite_rejection! {
-    /// Rejection for [`WebSocketUpgrade`](super::WebSocketUpgrade). Matches
-    /// `axum::extract::ws::rejection::WebSocketUpgradeRejection`, plus two tachyon-only
-    /// variants — see the module docs.
+    /// Rejection for [`WebSocketUpgrade`](super::WebSocketUpgrade).
+    ///
+    /// Matches `axum::extract::ws::rejection::WebSocketUpgradeRejection` exactly — see the
+    /// module docs for how tachyon-specific checks map onto this shared variant set.
     pub enum WebSocketUpgradeRejection {
         MethodNotGet,
         MethodNotConnect,
@@ -189,8 +180,6 @@ ws_composite_rejection! {
         InvalidWebSocketVersionHeader,
         WebSocketKeyHeaderMissing,
         ConnectionNotUpgradable,
-        HttpVersionNotSupported,
-        ConnectionLimitReached,
     }
 }
 
@@ -212,17 +201,5 @@ mod tests {
         assert_eq!(rej.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(rej.body_text(), "Request method must be `GET`");
         assert_eq!(rej.to_string(), "Request method must be `GET`");
-    }
-
-    #[test]
-    fn tachyon_only_variants_carry_their_own_status() {
-        assert_eq!(
-            WebSocketUpgradeRejection::from(HttpVersionNotSupported).status(),
-            StatusCode::UPGRADE_REQUIRED
-        );
-        assert_eq!(
-            WebSocketUpgradeRejection::from(ConnectionLimitReached).status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
     }
 }

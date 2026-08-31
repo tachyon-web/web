@@ -18,6 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// to gate internal/trusted-network behaviour) will treat every one of these requests as
 /// trusted, since `0.0.0.0` is not a global address — a real hazard in a process that also
 /// serves a clearnet listener in the same router.
+#[cfg(any(feature = "tor", feature = "i2p"))]
 pub(super) const NO_PEER_ADDR: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
@@ -87,6 +88,97 @@ where
     Ok(())
 }
 
+/// Like [`serve_connection`], but drives the connection to a graceful close (finish in-flight
+/// requests, refuse new ones on the same connection) as soon as `shutdown` resolves, instead of
+/// running until the peer disconnects. Used by [`crate::server::serve`]'s
+/// `.with_graceful_shutdown()`, which — unlike [`crate::server::Server`]'s own worker-pool
+/// accept loop — drives this connection directly and so can cooperate with a real per-connection
+/// shutdown signal.
+pub(super) async fn serve_connection_graceful<IO, Svc, Sig>(
+    io: IO,
+    svc: Svc,
+    shutdown: Sig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    Svc: hyper::service::Service<
+            Request<hyper::body::Incoming>,
+            Response = Response<Body>,
+            Error = std::io::Error,
+        > + Send
+        + 'static,
+    Svc::Future: Send,
+    Sig: std::future::Future<Output = ()>,
+{
+    let io = TokioIo::new(io);
+    tokio::pin!(shutdown);
+
+    #[cfg(all(feature = "http1", feature = "http2"))]
+    {
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let _ = builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(REQUEST_TIMEOUT);
+        let _ = builder
+            .http2()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(REQUEST_TIMEOUT)
+            .keep_alive_timeout(REQUEST_TIMEOUT);
+        #[cfg(feature = "ws")]
+        let _ = builder.http2().enable_connect_protocol();
+        let conn = builder.serve_connection_with_upgrades(io, svc);
+        tokio::pin!(conn);
+        tokio::select! {
+            res = conn.as_mut() => res?,
+            () = &mut shutdown => {
+                conn.as_mut().graceful_shutdown();
+                conn.await?;
+            }
+        }
+    }
+    #[cfg(all(feature = "http1", not(feature = "http2")))]
+    {
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(REQUEST_TIMEOUT)
+            .serve_connection(io, svc)
+            .with_upgrades();
+        tokio::pin!(conn);
+        tokio::select! {
+            res = conn.as_mut() => res?,
+            () = &mut shutdown => {
+                conn.as_mut().graceful_shutdown();
+                conn.await?;
+            }
+        }
+    }
+    #[cfg(all(feature = "http2", not(feature = "http1")))]
+    {
+        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
+        let mut builder =
+            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        let _ = builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .keep_alive_interval(REQUEST_TIMEOUT)
+            .keep_alive_timeout(REQUEST_TIMEOUT);
+        #[cfg(feature = "ws")]
+        let _ = builder.enable_connect_protocol();
+        let conn = builder.serve_connection(io, svc);
+        tokio::pin!(conn);
+        tokio::select! {
+            res = conn.as_mut() => res?,
+            () = &mut shutdown => {
+                conn.as_mut().graceful_shutdown();
+                conn.await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +186,7 @@ mod tests {
     use hyper::service::service_fn;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[cfg(any(feature = "tor", feature = "i2p"))]
     #[test]
     fn no_peer_addr_is_the_unspecified_ipv4_wildcard() {
         assert_eq!(

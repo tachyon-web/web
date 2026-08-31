@@ -52,7 +52,6 @@
 
 #[cfg(any(feature = "tor", feature = "i2p"))]
 mod anon_tls;
-#[cfg(any(feature = "tor", feature = "i2p"))]
 pub(crate) mod conn;
 #[cfg(feature = "early-hints")]
 mod h2;
@@ -73,7 +72,7 @@ mod worker_pool;
 
 pub use listener::{Listener, ListenerExt, TapIo};
 pub use multi::MultiServer;
-pub use serve::{Serve, WithGracefulShutdown};
+pub use serve::{Serve, WithGracefulShutdown, serve};
 #[cfg(feature = "tls")]
 pub use tls_config::{HttpsServer, RustlsConfig, bind_rustls};
 
@@ -413,7 +412,7 @@ where
     /// [`Server::max_websocket_connections`](Self#structfield.max_websocket_connections) for
     /// why these need a ceiling of their own, and how to size it.
     ///
-    /// Over-budget upgrades are refused with `503 Service Unavailable` before the handshake
+    /// Over-budget upgrades are refused with `426 Upgrade Required` before the handshake
     /// completes, rather than accepted and then starved.
     // Only `const`-eligible without `ws`, where there's no semaphore to rebuild — not worth
     // splitting the signature across features for.
@@ -922,34 +921,6 @@ pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
         return true;
     }
     false
-}
-
-/// Start serving requests from the given `TcpListener` using the provided `Router`.
-///
-/// This resolves the listener's local address, automatically compiles the router,
-/// and runs the high-performance worker pool.
-///
-/// Matches `axum::serve`'s shape: the returned [`Serve`] implements
-/// [`IntoFuture`], so `serve(listener, router).await`
-/// behaves exactly like the old `async fn` version did, while
-/// `serve(listener, router).with_graceful_shutdown(signal).await` is now also
-/// available — see [`Serve::with_graceful_shutdown`] for the one real
-/// behavioral difference from Axum's version.
-///
-/// # `listener` is rebound, not adopted
-///
-/// The worker pool binds one `SO_REUSEPORT` socket per core, so `listener` is read for its
-/// local address and then **dropped** before those are created. Two consequences worth
-/// knowing about: the port is briefly unbound, so on a shared host another process can race
-/// in and take it (the resulting bind failure surfaces as an `Err` here); and a listener bound
-/// to port `0` resolves to a concrete port first, so the workers all land on the same one.
-/// Pass the address to [`Server::start_http`]/[`Server::start_http_addr`] instead if you'd
-/// rather never hold the binding twice.
-pub const fn serve<L>(listener: L, router: crate::routing::Router<()>) -> Serve<L>
-where
-    L: Listener<Addr = std::net::SocketAddr>,
-{
-    Serve { listener, router }
 }
 
 #[cfg(test)]
