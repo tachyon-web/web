@@ -411,6 +411,7 @@ impl<T: FromSfvValue> SlotSink for Option<T> {
 /// recover it: see [`capture`].
 ///
 /// *Tachyon extension: no `axum` equivalent.*
+#[doc(hidden)]
 pub type ErrorSlot = Cell<Option<SfvError>>;
 
 /// Runs `result`, and if it is `Err`, stashes the error in `errors` and

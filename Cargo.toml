@@ -191,10 +191,10 @@ unreachable_pub = "deny"
 unsafe_code = "deny"
 
 [lints.clippy]
-all = "deny"
-pedantic = "deny"
-nursery = "deny"
-cargo = "deny"
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
@@ -205,6 +205,11 @@ dbg_macro = "deny"
 indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 as_conversions = "deny"
+# The lint assumes an item's own module chain is the only path to it; it
+# misses cases where a `pub use` elsewhere re-exports a `pub(crate)` item
+# into a public module, which is exactly the pattern used to keep internal
+# types out of the public API while flattening submodules away.
+redundant_pub_crate = "allow"
 
 [lints.rustdoc]
 all = "deny"

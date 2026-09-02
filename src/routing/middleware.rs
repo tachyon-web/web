@@ -11,10 +11,10 @@
 ///
 /// See that module's docs for how closely this matches Axum's real,
 /// extractor-arity-based version.
-pub mod from_fn;
+mod from_fn;
 /// The `tower::Service` [`Extension`](crate::routing::extract::Extension)'s `tower::Layer`
 /// impl produces, at the path `axum::middleware` uses for it.
-pub use crate::routing::extract::parts::AddExtension;
+pub use crate::routing::extract::AddExtension;
 /// The response-body-normalizing `tower::Service`/`tower::Layer` every `.layer()` call
 /// funnels through, at the path `axum::middleware` uses for them.
 pub use crate::routing::tower_compat::{

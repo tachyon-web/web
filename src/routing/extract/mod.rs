@@ -1,22 +1,29 @@
 //! Type-safe request extractors.
 //!
-//! Split by concern: [`path`] (URI path parameters), [`query`] (query strings,
-//! shared with [`body::Form`]), [`body`] (body-consuming extractors and the
-//! body-size-limit machinery), [`parts`] (metadata-only extractors), and
-//! [`ext`] (the [`RequestPartsExt`]/[`RequestExt`] sugar traits). Every public
-//! item from those submodules is re-exported here, at the same
-//! `tachyon_web::extract::X` path Axum uses.
+//! Internally split by concern — path parameters, query strings, request
+//! bodies, metadata-only extractors, and the [`RequestPartsExt`]/[`RequestExt`]
+//! sugar traits — but every item is re-exported flat here, at the same
+//! `tachyon_web::extract::X` path Axum uses. [`path`] is the one submodule
+//! kept public, matching `axum::extract::path`.
 
 /// Per-extractor rejection types, matching `axum::extract::rejection`.
 pub mod rejection;
 
-/// WebSocket upgrade extractor and connection types (`WebSocketUpgrade`,
-/// `WebSocket`, `Message`, ...) — re-exported here at the same path Axum uses
-/// (`axum::extract::ws`), so `use tachyon_web::extract::ws::*;` matches
-/// `use axum::extract::ws::*;` verbatim. See [`crate::ws`] for the full docs.
-/// Requires the `ws` feature.
+/// WebSocket upgrade extractor and connection types.
+///
+/// `WebSocketUpgrade`, `WebSocket`, `Message`, ... — re-exported here at the
+/// same path Axum uses (`axum::extract::ws`), so
+/// `use tachyon_web::extract::ws::*;` matches `use axum::extract::ws::*;`
+/// verbatim. Requires the `ws` feature.
 #[cfg(feature = "ws")]
-pub use crate::ws;
+pub mod ws {
+    pub use crate::ws::close_code;
+    pub use crate::ws::rejection;
+    pub use crate::ws::{
+        CloseCode, CloseFrame, DefaultOnFailedUpgrade, DeflateConfig, Message, OnFailedUpgrade,
+        Utf8Bytes, WebSocket, WebSocketConfig, WebSocketUpgrade,
+    };
+}
 /// Flattened re-export matching `axum::extract::WebSocketUpgrade`.
 #[cfg(feature = "ws")]
 pub use crate::ws::WebSocketUpgrade;
@@ -36,17 +43,30 @@ pub mod multipart;
 #[cfg(feature = "multipart")]
 pub use multipart::Multipart;
 
-pub mod body;
-pub mod ext;
-pub mod parts;
+mod body;
+mod ext;
+mod parts;
 pub mod path;
-pub mod query;
+mod query;
 
-pub use body::*;
-pub use ext::*;
-pub use parts::*;
+#[cfg(feature = "json")]
+pub use body::Json;
+pub use body::{BodyStream, DefaultBodyLimit, DefaultBodyLimitService};
+#[cfg(feature = "form")]
+pub use body::{Form, RawForm};
+pub(crate) use body::{MaxBodySize, max_body_size};
+pub use ext::{RequestExt, RequestPartsExt};
+#[cfg(feature = "cookies")]
+pub use parts::Cookies;
+#[cfg(feature = "matched-path")]
+pub use parts::MatchedPath;
+#[cfg(feature = "original-uri")]
+pub use parts::OriginalUri;
+pub use parts::{AddExtension, ConnectInfo, Extension, FromRef, Host, NestedPath, State};
 pub use path::*;
-pub use query::*;
+#[cfg(feature = "query")]
+pub use query::Query;
+pub use query::RawQuery;
 
 /// The request type extractors receive, matching `axum::extract::Request`.
 ///

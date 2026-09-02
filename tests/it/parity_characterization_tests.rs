@@ -15,8 +15,8 @@
 #[cfg(feature = "ws")]
 mod ws_handshake_rejections {
     use hyper::{Method, Request, StatusCode, header};
+    use tachyon_web::extract::ws::WebSocketUpgrade;
     use tachyon_web::http::response::Body;
-    use tachyon_web::ws::WebSocketUpgrade;
 
     fn base_request(method: Method) -> Request<Body> {
         Request::builder()

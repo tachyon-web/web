@@ -245,7 +245,7 @@ pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
 #[cfg(feature = "ws")]
-pub mod ws;
+mod ws;
 
 /// Re-export of [`bytes::Bytes`], matching `axum::body::Bytes`.
 pub use bytes::Bytes;

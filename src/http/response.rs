@@ -437,12 +437,12 @@ impl std::io::Write for BytesMutWriter<'_> {
 #[cfg(feature = "json")]
 pub use crate::routing::extract::Json;
 
-/// Re-export of the [`Extension`](crate::routing::extract::parts::Extension) extractor
+/// Re-export of the [`Extension`](crate::routing::extract::Extension) extractor
 /// at the path `axum::response::Extension` uses (it doubles as a response type
 /// there too).
 pub use crate::routing::extract::Extension;
 
-/// Re-export of the [`Form`](crate::routing::extract::body::Form) extractor at the
+/// Re-export of the [`Form`](crate::routing::extract::Form) extractor at the
 /// path `axum::response::Form` uses. Requires the `form` feature.
 #[cfg(feature = "form")]
 pub use crate::routing::extract::Form;

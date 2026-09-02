@@ -5,7 +5,7 @@
 
 use crate::common::TestServer;
 use futures_util::{SinkExt, StreamExt};
-use tachyon_web::ws::{Message, WebSocket, WebSocketUpgrade};
+use tachyon_web::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use tachyon_web::{Router, get};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite;
@@ -330,16 +330,13 @@ async fn test_wss_echo_over_tls() {
 
 /// Axum's WebSocket types live at `axum::extract::ws::*` (and
 /// `axum::extract::WebSocketUpgrade` as a flattened re-export). Confirms both
-/// equivalent tachyon-web paths resolve to the exact same types as the
-/// `tachyon_web::ws::*` path used throughout this file — if they didn't, this
+/// tachyon-web paths resolve to the exact same type — if they didn't, this
 /// wouldn't type-check.
 #[test]
 fn test_extract_ws_path_matches_axum_layout() {
     fn takes_via_extract_path(_: tachyon_web::extract::ws::WebSocketUpgrade) {}
-    fn takes_via_flat_path(_: tachyon_web::extract::WebSocketUpgrade) {}
-    fn takes_via_ws_path(u: tachyon_web::ws::WebSocketUpgrade) {
+    fn takes_via_flat_path(u: tachyon_web::extract::WebSocketUpgrade) {
         takes_via_extract_path(u);
     }
-    let _ = takes_via_ws_path;
     let _ = takes_via_flat_path;
 }

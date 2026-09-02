@@ -19,7 +19,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use tachyon_web::ws::{WebSocket, WebSocketUpgrade};
+//! use tachyon_web::extract::ws::{WebSocket, WebSocketUpgrade};
 //! use tachyon_web::http::Response;
 //! use tachyon_web::http::response::Body;
 //! use tachyon_web::{Router, get};
