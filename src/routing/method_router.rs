@@ -8,8 +8,6 @@ use std::sync::Arc;
 use crate::routing::handler::Handler;
 use crate::routing::router::RouterError;
 use crate::routing::tower_compat::Route;
-#[cfg(feature = "early-hints")]
-use crate::routing::{fire_early_hints, middleware};
 
 pub(crate) const IDX_GET: usize = 0;
 const IDX_POST: usize = 1;
@@ -379,53 +377,6 @@ where
             Route::from_handler(handler.clone(), &state)
         }));
         self
-    }
-
-    /// Sends a `103 Early Hints` response carrying `links` before this route's handler runs.
-    ///
-    /// The `Link` header block is rendered once, here, and cloned per request — there is no
-    /// per-request formatting, and the hint goes out before any other middleware on this
-    /// route has done work. On a transport that cannot carry a 103 this costs one map
-    /// lookup and nothing else.
-    ///
-    /// Use this for hints that don't depend on the request. For hints that do, extract
-    /// [`EarlyHints`](crate::http::early_hints::EarlyHints) in the handler instead.
-    ///
-    /// **Do not attach this to a route that may redirect.** Hints preceding a `3xx` preload
-    /// resources for a page that is never rendered — see
-    /// [`http::early_hints`](crate::http::early_hints).
-    ///
-    /// ```rust
-    /// use tachyon_web::{Router, get};
-    /// use tachyon_web::http::early_hints::Link;
-    ///
-    /// let app: Router = Router::new().route(
-    ///     "/",
-    ///     get(|| async { "…" }).early_hints([Link::preload("/app.css").as_style()]),
-    /// );
-    /// ```
-    #[cfg(feature = "early-hints")]
-    #[must_use]
-    pub fn early_hints(
-        self,
-        links: impl IntoIterator<Item = crate::http::early_hints::Link>,
-    ) -> Self
-    where
-        S: 'static,
-    {
-        let headers = crate::http::early_hints::links_to_headers(links);
-        if headers.is_empty() {
-            return self;
-        }
-        self.layer(middleware::from_fn(
-            move |req: crate::http::Request, next: middleware::Next| {
-                let headers = headers.clone();
-                async move {
-                    fire_early_hints(&req, headers);
-                    next.run(req).await
-                }
-            },
-        ))
     }
 
     /// Materializes every `BoxedIntoRoute<S, Infallible>` slot into a concrete, state-free

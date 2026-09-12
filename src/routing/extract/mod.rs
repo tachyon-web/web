@@ -28,12 +28,6 @@ pub mod ws {
 #[cfg(feature = "ws")]
 pub use crate::ws::WebSocketUpgrade;
 
-/// Structured-field typed-header extractor, re-exported at the extractor path.
-/// See [`crate::http::sfv`] for the data model and the `sfv_dictionary!` macro.
-/// Requires the `sfv` feature.
-#[cfg(feature = "sfv")]
-pub use crate::http::sfv::StructuredHeader;
-
 /// `multipart/form-data` extractor (`Multipart`, `Field`, `MultipartError`).
 ///
 /// Matches `axum::extract::multipart`. Requires the `multipart` feature.
@@ -51,10 +45,10 @@ mod query;
 
 #[cfg(feature = "json")]
 pub use body::Json;
+pub(crate) use body::MaxBodySize;
 pub use body::{BodyStream, DefaultBodyLimit, DefaultBodyLimitService};
 #[cfg(feature = "form")]
 pub use body::{Form, RawForm};
-pub(crate) use body::{MaxBodySize, max_body_size};
 pub use ext::{RequestExt, RequestPartsExt};
 #[cfg(feature = "cookies")]
 pub use parts::Cookies;
@@ -170,8 +164,6 @@ macro_rules! impl_from_request_via_parts {
 }
 
 impl_from_request_via_parts!(RawQuery);
-#[cfg(feature = "early-hints")]
-impl_from_request_via_parts!(crate::http::early_hints::EarlyHints);
 impl_from_request_via_parts!(hyper::header::HeaderMap);
 impl_from_request_via_parts!(hyper::Method);
 impl_from_request_via_parts!(hyper::Uri);

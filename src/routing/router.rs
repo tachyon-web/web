@@ -6,8 +6,6 @@ use std::sync::Arc;
 
 use crate::http::response::Body;
 use crate::routing::compiled::{CompiledRouter, extract_param_names};
-#[cfg(feature = "early-hints")]
-use crate::routing::fire_early_hints;
 use crate::routing::handler::Handler;
 use crate::routing::method_router::{BoxedIntoRoute, CompiledMethodRouter, MethodRouter, any, get};
 use crate::routing::tower_compat::Route;
@@ -698,50 +696,6 @@ where
     #[must_use]
     pub const fn without_v07_checks(self) -> Self {
         self
-    }
-
-    /// Sends a `103 Early Hints` response carrying `links` before the handler of any route
-    /// registered on this router **so far**.
-    ///
-    /// Like [`layer`](Self::layer), it wraps the current route table rather than a later
-    /// one, so call it after the routes it should cover. For per-route hints, use
-    /// [`MethodRouter::early_hints`] instead; for request-dependent hints, extract
-    /// [`EarlyHints`](crate::http::early_hints::EarlyHints) in the handler.
-    ///
-    /// **Do not apply this to routes that may redirect** — see
-    /// [`http::early_hints`](crate::http::early_hints).
-    ///
-    /// ```rust
-    /// use tachyon_web::{Router, get};
-    /// use tachyon_web::http::early_hints::Link;
-    ///
-    /// let app: Router = Router::new()
-    ///     .route("/", get(|| async { "…" }))
-    ///     .route("/about", get(|| async { "…" }))
-    ///     .early_hints([
-    ///         Link::preload("/static/app.css").as_style(),
-    ///         Link::preconnect("https://cdn.example.com"),
-    ///     ]);
-    /// ```
-    #[cfg(feature = "early-hints")]
-    #[must_use]
-    pub fn early_hints(
-        self,
-        links: impl IntoIterator<Item = crate::http::early_hints::Link>,
-    ) -> Self {
-        let headers = crate::http::early_hints::links_to_headers(links);
-        if headers.is_empty() {
-            return self;
-        }
-        self.layer(middleware::from_fn(
-            move |req: crate::http::Request, next: middleware::Next| {
-                let headers = headers.clone();
-                async move {
-                    fire_early_hints(&req, headers);
-                    next.run(req).await
-                }
-            },
-        ))
     }
 
     /// Compresses responses from this router's routes, negotiating the coding against each

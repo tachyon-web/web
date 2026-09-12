@@ -53,8 +53,6 @@
 #[cfg(any(feature = "tor", feature = "i2p"))]
 mod anon_tls;
 pub(crate) mod conn;
-#[cfg(feature = "early-hints")]
-mod h2;
 #[cfg(feature = "http3")]
 mod h3;
 mod http;
@@ -66,6 +64,8 @@ mod redirect;
 pub mod serve;
 #[cfg(feature = "tls")]
 mod tls_config;
+#[macro_use]
+mod tuning;
 #[cfg(feature = "tor")]
 pub mod tor;
 mod worker_pool;
@@ -224,11 +224,6 @@ pub struct Server<S> {
     /// Response compression, applied to every transport — see [`Server::compression`].
     /// `None` (the default) sends every response uncoded.
     pub(crate) compression: Option<crate::http::compression::Compression>,
-    /// `103 Early Hints` policy — see [`Server::early_hints`]. `None` (the default) leaves
-    /// HTTPS connections on `hyper`'s HTTP/2 server and hands handlers a no-op
-    /// [`EarlyHints`](crate::http::early_hints::EarlyHints) handle.
-    #[cfg(feature = "early-hints")]
-    pub(crate) early_hints: Option<crate::http::early_hints::EarlyHintsConfig>,
 }
 
 impl<S> Clone for Server<S>
@@ -248,8 +243,6 @@ where
             #[cfg(feature = "tls")]
             tls_policy: self.tls_policy.clone(),
             compression: self.compression.clone(),
-            #[cfg(feature = "early-hints")]
-            early_hints: self.early_hints.clone(),
         }
     }
 }
@@ -277,8 +270,6 @@ impl Server<()> {
             #[cfg(feature = "tls")]
             tls_policy: None,
             compression: None,
-            #[cfg(feature = "early-hints")]
-            early_hints: None,
         }
     }
 }
@@ -353,36 +344,6 @@ where
     #[must_use]
     pub fn compression(mut self, compression: crate::http::compression::Compression) -> Self {
         self.compression = Some(compression);
-        self
-    }
-
-    /// Enables `103 Early Hints` ([RFC 8297]) on the transports that can carry them.
-    ///
-    /// This does two things. It lets handlers' [`EarlyHints`] handles actually reach the
-    /// wire, and — because `hyper` cannot emit an informational response — it moves HTTPS
-    /// connections that negotiate `h2` onto Tachyon's own HTTP/2 driver. HTTP/1.1
-    /// connections, h2c, Tor and I2P are untouched and continue to hand handlers a no-op
-    /// handle.
-    ///
-    /// Read [`http::early_hints`](crate::http::early_hints) before enabling this: it covers
-    /// the transport matrix, the `Sec-Fetch-Mode: navigate` gate, and the one behavioural
-    /// difference the native HTTP/2 driver brings (RFC 8441 `WebSocket`s over HTTP/2 are
-    /// answered `501`).
-    ///
-    /// ```rust,no_run
-    /// # use tachyon_web::{Router, Server};
-    /// use tachyon_web::http::early_hints::EarlyHintsConfig;
-    ///
-    /// # let app: Router = Router::new();
-    /// let server = Server::new(app).early_hints(EarlyHintsConfig::new());
-    /// ```
-    ///
-    /// [RFC 8297]: https://www.rfc-editor.org/rfc/rfc8297
-    /// [`EarlyHints`]: crate::http::early_hints::EarlyHints
-    #[cfg(feature = "early-hints")]
-    #[must_use]
-    pub const fn early_hints(mut self, config: crate::http::early_hints::EarlyHintsConfig) -> Self {
-        self.early_hints = Some(config);
         self
     }
 

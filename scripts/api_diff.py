@@ -81,7 +81,7 @@ ALLOW_FILE = REPO_ROOT / "scripts" / "api_parity_allow.txt"
 # Kept in sync with the CI "full (no tor/i2p)" matrix entry.
 TACHYON_FEATURES = (
     "json,cookies,matched-path,original-uri,http1,http2,tower-log,ws,form,query,"
-    "sse,sfv,tls,cert-gen,lets-encrypt,http3,compression-full,early-hints,multipart"
+    "sse,tls,cert-gen,lets-encrypt,http3,compression-full,multipart"
 )
 
 # Every non-private axum 0.8 feature, so nothing feature-gated is invisible here.

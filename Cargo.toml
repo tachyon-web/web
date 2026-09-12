@@ -23,7 +23,6 @@ pin-project-lite = "0.2"
 hyper = { version = "1", default-features = false, features = ["server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
-sfv = "0.15"
 
 # QUIC & HTTP/3
 tachyon-quic = { version = "0.3", optional = true }
@@ -66,9 +65,6 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"], opti
 brotli = { version = "8", default-features = false, features = ["std"], optional = true }
 zstd = { version = "0.13", default-features = false, optional = true }
 async-compression = { version = "0.4", default-features = false, features = ["tokio"], optional = true }
-
-# Optional native HTTP/2 connection driver (see the `early-hints` feature).
-h2 = { version = "0.4", optional = true }
 
 # Optional native .onion hidden-service support (see the `tor` feature).
 arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
@@ -140,7 +136,6 @@ lets-encrypt = [
     "hyper-util/client-legacy",
 ]
 sse = ["dep:serde_json"]
-sfv = []
 tor = [
     "dep:arti-client", "dep:tor-hsservice", "dep:tor-proto", "dep:tor-cell",
     "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",
@@ -155,9 +150,6 @@ compression-zstd = ["dep:zstd", "dep:async-compression", "async-compression/zstd
 compression-full = [
     "compression-gzip", "compression-deflate", "compression-br", "compression-zstd",
 ]
-
-# RFC 8297 `103 Early Hints`.
-early-hints = ["dep:h2", "http2", "tls"]
 
 [workspace]
 members = [
@@ -226,10 +218,6 @@ required-features = ["json", "query"]
 [[example]]
 name = "sync_handlers"
 required-features = ["json"]
-
-[[example]]
-name = "compression_early_hints"
-required-features = ["compression-full", "early-hints", "cert-gen"]
 
 [package.metadata.docs.rs]
 all-features = true

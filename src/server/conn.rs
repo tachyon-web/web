@@ -3,7 +3,10 @@
 //! negotiation logic exists exactly once instead of being duplicated per transport.
 
 use crate::http::response::Body;
-use crate::server::REQUEST_TIMEOUT;
+#[cfg(feature = "http1")]
+use crate::server::tuning::tune_http1;
+#[cfg(feature = "http2")]
+use crate::server::tuning::tune_http2;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,6 +26,9 @@ pub(super) const NO_PEER_ADDR: std::net::SocketAddr =
     std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Serves one hyper connection over `io`, using whichever of `http1`/`http2` are enabled.
+///
+/// Tuning comes from [`tuning`](crate::server::tuning), the same place the TCP and TLS
+/// listeners get theirs, so a limit added there applies to every transport at once.
 pub(super) async fn serve_connection<IO, Svc>(
     io: IO,
     svc: Svc,
@@ -37,55 +43,9 @@ where
         + 'static,
     Svc::Future: Send,
 {
-    let io = TokioIo::new(io);
-
-    #[cfg(all(feature = "http1", feature = "http2"))]
-    {
-        let mut builder =
-            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-        // Without a `Timer`, hyper silently drops `header_read_timeout` (only a `warn!`, no
-        // error) — leaving a peer that opens a stream and never finishes its request line
-        // able to hold this connection's slot in `max_connections` forever (Slowloris).
-        let _ = builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(REQUEST_TIMEOUT);
-        let _ = builder
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(REQUEST_TIMEOUT)
-            .keep_alive_timeout(REQUEST_TIMEOUT);
-        // RFC 8441: advertise support for the extended CONNECT bootstrap so `ws::WebSocketUpgrade`
-        // can accept WebSocket-over-HTTP/2 requests.
-        #[cfg(feature = "ws")]
-        let _ = builder.http2().enable_connect_protocol();
-        builder.serve_connection_with_upgrades(io, svc).await?;
-    }
-    #[cfg(all(feature = "http1", not(feature = "http2")))]
-    {
-        hyper::server::conn::http1::Builder::new()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(REQUEST_TIMEOUT)
-            .serve_connection(io, svc)
-            .with_upgrades()
-            .await?;
-    }
-    #[cfg(all(feature = "http2", not(feature = "http1")))]
-    {
-        // As above: `mut` is only load-bearing under `ws`.
-        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
-        let mut builder =
-            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
-        let _ = builder
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(REQUEST_TIMEOUT)
-            .keep_alive_timeout(REQUEST_TIMEOUT);
-        #[cfg(feature = "ws")]
-        let _ = builder.enable_connect_protocol();
-        builder.serve_connection(io, svc).await?;
-    }
-
-    Ok(())
+    // A shutdown signal that never fires: `select!` then always takes the connection arm,
+    // which is exactly the non-graceful behaviour.
+    serve_connection_graceful(io, svc, std::future::pending()).await
 }
 
 /// Like [`serve_connection`], but drives the connection to a graceful close (finish in-flight
@@ -113,66 +73,43 @@ where
     let io = TokioIo::new(io);
     tokio::pin!(shutdown);
 
+    // Exactly one of these three is compiled — see the crate-level `compile_error!` in `lib.rs`.
+    // The builder is bound at function scope because the connection future borrows it.
     #[cfg(all(feature = "http1", feature = "http2"))]
-    {
-        let mut builder =
+    let builder = {
+        let mut b =
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-        let _ = builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(REQUEST_TIMEOUT);
-        let _ = builder
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(REQUEST_TIMEOUT)
-            .keep_alive_timeout(REQUEST_TIMEOUT);
-        #[cfg(feature = "ws")]
-        let _ = builder.http2().enable_connect_protocol();
-        let conn = builder.serve_connection_with_upgrades(io, svc);
-        tokio::pin!(conn);
-        tokio::select! {
-            res = conn.as_mut() => res?,
-            () = &mut shutdown => {
-                conn.as_mut().graceful_shutdown();
-                conn.await?;
-            }
-        }
-    }
+        tune_http1!(b.http1());
+        tune_http2!(b.http2());
+        b
+    };
+    #[cfg(all(feature = "http1", feature = "http2"))]
+    let conn = builder.serve_connection_with_upgrades(io, svc);
+
     #[cfg(all(feature = "http1", not(feature = "http2")))]
-    {
-        let conn = hyper::server::conn::http1::Builder::new()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(REQUEST_TIMEOUT)
-            .serve_connection(io, svc)
-            .with_upgrades();
-        tokio::pin!(conn);
-        tokio::select! {
-            res = conn.as_mut() => res?,
-            () = &mut shutdown => {
-                conn.as_mut().graceful_shutdown();
-                conn.await?;
-            }
-        }
-    }
+    let builder = {
+        let mut b = hyper::server::conn::http1::Builder::new();
+        tune_http1!(b);
+        b
+    };
+    #[cfg(all(feature = "http1", not(feature = "http2")))]
+    let conn = builder.serve_connection(io, svc).with_upgrades();
+
     #[cfg(all(feature = "http2", not(feature = "http1")))]
-    {
-        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
-        let mut builder =
-            hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
-        let _ = builder
-            .timer(hyper_util::rt::TokioTimer::new())
-            .keep_alive_interval(REQUEST_TIMEOUT)
-            .keep_alive_timeout(REQUEST_TIMEOUT);
-        #[cfg(feature = "ws")]
-        let _ = builder.enable_connect_protocol();
-        let conn = builder.serve_connection(io, svc);
-        tokio::pin!(conn);
-        tokio::select! {
-            res = conn.as_mut() => res?,
-            () = &mut shutdown => {
-                conn.as_mut().graceful_shutdown();
-                conn.await?;
-            }
+    let builder = {
+        let mut b = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
+        tune_http2!(b);
+        b
+    };
+    #[cfg(all(feature = "http2", not(feature = "http1")))]
+    let conn = builder.serve_connection(io, svc);
+
+    tokio::pin!(conn);
+    tokio::select! {
+        res = conn.as_mut() => res?,
+        () = &mut shutdown => {
+            conn.as_mut().graceful_shutdown();
+            conn.await?;
         }
     }
 
@@ -233,5 +170,79 @@ mod tests {
             .await
             .expect("server task join")
             .expect("serve_connection ok");
+    }
+
+    /// `serve_connection` is the path Tor and I2P take. It used to build its own hyper
+    /// builders and set only the keep-alives, so those two transports ran on hyper's default
+    /// HTTP/2 settings while plain TCP and TLS ran on `tuning::tune_http2!`. Most of those
+    /// defaults happen to coincide with the tuned values, but the initial *stream* window does
+    /// not: hyper defaults to 1 MiB, the shared tuning pins 64 KiB. Asserting on that value is
+    /// what makes this a real guard — it is the one setting that tells "went through the shared
+    /// tuning" apart from "got hyper's defaults".
+    #[cfg(feature = "http2")]
+    #[tokio::test]
+    async fn serve_connection_applies_the_shared_http2_tuning() {
+        // RFC 9113 §6.5.2 setting identifiers.
+        const MAX_CONCURRENT_STREAMS: u16 = 0x3;
+        const INITIAL_WINDOW_SIZE: u16 = 0x4;
+        const SETTINGS_FRAME: u8 = 0x4;
+        const ACK: u8 = 0x1;
+
+        let (mut client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let svc = service_fn(|_req: Request<hyper::body::Incoming>| async {
+            Ok::<_, std::io::Error>(Response::new(Body::empty()))
+        });
+        drop(tokio::spawn(async move {
+            serve_connection(server_io, svc).await
+        }));
+
+        // Client connection preface + an empty SETTINGS frame, so the server finishes its
+        // half of the handshake and flushes the SETTINGS we want to inspect.
+        client_io
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("write preface");
+        client_io
+            .write_all(&[0, 0, 0, SETTINGS_FRAME, 0, 0, 0, 0, 0])
+            .await
+            .expect("write empty settings");
+
+        let mut header = [0u8; 9];
+        let mut settings = Vec::new();
+        // The server's SETTINGS is the first frame it sends; spare iterations cover a
+        // WINDOW_UPDATE or PING arriving first.
+        for _ in 0..4u8 {
+            client_io
+                .read_exact(&mut header)
+                .await
+                .expect("read frame header");
+            let len = usize::try_from(u32::from_be_bytes([0, header[0], header[1], header[2]]))
+                .expect("frame length fits usize");
+            let mut payload = vec![0u8; len];
+            client_io
+                .read_exact(&mut payload)
+                .await
+                .expect("read frame payload");
+
+            if header[3] != SETTINGS_FRAME || header[4] & ACK != 0 {
+                continue;
+            }
+            for entry in payload.as_chunks::<6>().0 {
+                settings.push((
+                    u16::from_be_bytes([entry[0], entry[1]]),
+                    u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]),
+                ));
+            }
+            break;
+        }
+
+        let get = |id: u16| settings.iter().find(|(k, _)| *k == id).map(|(_, v)| *v);
+        assert_eq!(
+            get(INITIAL_WINDOW_SIZE),
+            Some(65535),
+            "serve_connection must go through tuning::tune_http2!, which pins the initial \
+             stream window to 64 KiB; hyper's default is 1 MiB. Got {settings:?}"
+        );
+        assert_eq!(get(MAX_CONCURRENT_STREAMS), Some(200), "got {settings:?}");
     }
 }

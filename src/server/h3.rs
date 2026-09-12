@@ -251,39 +251,7 @@ where
             }
         };
 
-        #[cfg(feature = "early-hints")]
-        let hints_permitted = self
-            .early_hints
-            .as_ref()
-            .is_some_and(|config| config.permits(&parts.method, &parts.headers));
-
-        #[allow(unused_mut)]
-        let mut req = Request::from_parts(parts, crate::http::response::Body::full(body_bytes));
-
-        #[cfg(feature = "early-hints")]
-        let full_resp = if hints_permitted {
-            let (mut receiver, handle) = crate::http::early_hints::channel();
-            let _ = req.extensions_mut().insert(handle);
-            let mut dispatch = std::pin::pin!(self.dispatch(req, peer));
-            loop {
-                tokio::select! {
-                    biased;
-                    Some(headers) = receiver.recv() => {
-                        let mut hint = Response::new(());
-                        *hint.status_mut() = StatusCode::EARLY_HINTS;
-                        *hint.headers_mut() = headers;
-                        if let Err(e) = stream.send_response(hint).await {
-                            tracing::debug!("[h3] early hint not sent: {e}");
-                        }
-                    }
-                    response = &mut dispatch => break response,
-                }
-            }
-        } else {
-            self.dispatch(req, peer).await
-        };
-
-        #[cfg(not(feature = "early-hints"))]
+        let req = Request::from_parts(parts, crate::http::response::Body::full(body_bytes));
         let full_resp = self.dispatch(req, peer).await;
 
         let (resp_parts, body) = full_resp.into_parts();

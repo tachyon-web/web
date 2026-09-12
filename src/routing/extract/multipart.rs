@@ -5,7 +5,8 @@
 //! bespoke parser, so boundary/header/field parsing behavior matches byte-for-byte.
 
 use crate::http::response::{Body, IntoResponse, Response};
-use crate::routing::extract::{FromRequest, max_body_size, rejection};
+use crate::routing::extract::body::max_body_size;
+use crate::routing::extract::{FromRequest, rejection};
 use bytes::Bytes;
 use futures_core::Stream;
 use http_body_util::BodyExt as _;

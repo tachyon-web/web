@@ -150,8 +150,6 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `http3` | | HTTP/3 over QUIC via `s2n-quic`; needs `tls` |
 | `lets-encrypt` | | automatic Let's Encrypt certificate management; needs `tls`, `cert-gen` |
 | `sse` | | Server-Sent Events (`response::sse::{Event, Sse, KeepAlive}`) |
-| `sfv` | | Structured Field Values (RFC 9651): the `StructuredHeader` extractor, `sfv_dictionary!`, and the raw `sfv` model re-exports |
-| `early-hints` | | `103 Early Hints` (RFC 8297), plus the native HTTP/2 driver that emits them; needs `tls` |
 | `fips` | | enforce FIPS-mode cryptography at startup; refuses to start otherwise; needs `tls` |
 | `tor` | | Tor v3 `.onion` support (`Server::serve_tor`/`serve_onion`) via `arti-client` |
 | `i2p` | | I2P `.b32.i2p` support (`Server::serve_i2p`/`serve_i2p_config`) via an embedded `libi2pd`. Links `unsafe` FFI — see [Tor and I2P](#tor-and-i2p) |

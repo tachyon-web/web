@@ -1,6 +1,10 @@
 use crate::http::response::Body;
 #[cfg(feature = "tls")]
 use crate::server::TLS_HANDSHAKE_TIMEOUT;
+#[cfg(feature = "http1")]
+use crate::server::tuning::tune_http1;
+#[cfg(feature = "http2")]
+use crate::server::tuning::tune_http2;
 use crate::server::{IS_LOCAL_WORKER, REQUEST_TIMEOUT, Server};
 use bytes::Bytes;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
@@ -64,52 +68,6 @@ impl HyperBody for DeadlineBody {
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
-}
-
-/// Applies the HTTP/1.1 connection tuning shared by every listener.
-///
-/// A macro rather than a function because the settings apply to two unrelated types with
-/// identical setters: `hyper::server::conn::http1::Builder` and `hyper_util`'s
-/// `auto::Http1Builder`.
-///
-/// `writev` is opt-in per call site — forcing vectored writes over a TLS stream, which buffers
-/// its own records, is a different tradeoff than over a bare socket.
-///
-/// Gated on `http1` because every call site is, and `unused_macros` is denied.
-#[cfg(feature = "http1")]
-macro_rules! tune_http1 {
-    ($builder:expr) => {{
-        let tuned = &mut $builder;
-        let _ = tuned
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(REQUEST_TIMEOUT)
-            .keep_alive(true)
-            .max_buf_size(8192);
-    }};
-}
-
-/// Applies the HTTP/2 connection tuning shared by every listener — see [`tune_http1`] for why
-/// this is a macro.
-#[cfg(feature = "http2")]
-macro_rules! tune_http2 {
-    ($builder:expr) => {{
-        let tuned = &mut $builder;
-        let _ = tuned
-            .timer(hyper_util::rt::TokioTimer::new())
-            .initial_stream_window_size(65535)
-            .initial_connection_window_size(1024 * 1024)
-            .max_frame_size(16384)
-            .max_concurrent_streams(200)
-            // `keep_alive_timeout` alone does nothing — hyper only sends the pings (and
-            // enforces the timeout) once `keep_alive_interval` is also set. Without this, a
-            // dead or idle peer that completes the handshake and goes silent holds its
-            // connection permit forever.
-            .keep_alive_interval(REQUEST_TIMEOUT)
-            .keep_alive_timeout(REQUEST_TIMEOUT);
-        // RFC 8441: let `ws::WebSocketUpgrade` accept WebSocket-over-HTTP/2 requests.
-        #[cfg(feature = "ws")]
-        let _ = tuned.enable_connect_protocol();
-    }};
 }
 
 /// Accepts one connection, applying the socket tuning shared by every transport.
@@ -325,20 +283,6 @@ where
                     let (_, connection) = tls_stream.get_ref();
                     connection.alpn_protocol() == Some(b"h2")
                 };
-
-                // `hyper`'s HTTP/2 server has no way to emit an informational response, so
-                // an early-hints deployment takes the h2 half of the connection space onto
-                // Tachyon's own driver. Everything else stays on `hyper`.
-                #[cfg(feature = "early-hints")]
-                if is_h2 && state.early_hints.is_some() {
-                    if let Err(e) =
-                        crate::server::h2::serve_connection(state, tls_stream, peer).await
-                    {
-                        tracing::debug!("[https] native http/2 connection error: {}", e);
-                    }
-                    drop(permit);
-                    return;
-                }
 
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
                 let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer));

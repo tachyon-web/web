@@ -5726,17 +5726,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sfv"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "890ef0e5532daf21fdaa3dbaf991417187f3a87ab69231fe69be942495746480"
-dependencies = [
- "base64 0.22.1",
- "indexmap 2.14.1",
- "ref-cast",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6245,7 +6234,6 @@ dependencies = [
  "futures",
  "futures-core",
  "futures-util",
- "h2 0.4.19",
  "http-body-util",
  "hyper 1.11.1",
  "hyper-rustls",
@@ -6263,7 +6251,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
- "sfv",
  "smallvec",
  "socket2 0.6.5",
  "tachyon-i2p",

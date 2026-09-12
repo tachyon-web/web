@@ -9,9 +9,6 @@
 //! per-verb dispatch table, [`router`] is the route-table builder API, and
 //! [`compiled`] is the `matchit`-backed request-dispatch hot path.
 
-#[cfg(feature = "early-hints")]
-use hyper::Request;
-
 pub mod compiled;
 pub mod error_handling;
 pub mod extract;
@@ -21,9 +18,6 @@ pub mod middleware;
 pub mod router;
 pub mod static_dir;
 pub mod tower_compat;
-
-#[cfg(feature = "early-hints")]
-use crate::http::response::Body;
 
 pub use compiled::CompiledRouter;
 #[allow(unused_imports)]
@@ -50,20 +44,6 @@ pub mod future {
     pub use crate::routing::tower_compat::{
         InfallibleRouteFuture, IntoMakeServiceFuture, RouteFuture,
     };
-}
-
-/// Emits a pre-rendered `103 Early Hints` block for `req`, if the transport wired one up.
-///
-/// Shared by the [`MethodRouter`] and [`Router`] forms of `early_hints`, which differ only
-/// in what they are attached to.
-#[cfg(feature = "early-hints")]
-pub(crate) fn fire_early_hints(req: &Request<Body>, headers: hyper::HeaderMap) {
-    if let Some(hints) = req
-        .extensions()
-        .get::<crate::http::early_hints::EarlyHints>()
-    {
-        let _ = hints.send_headers(headers);
-    }
 }
 
 #[cfg(test)]
