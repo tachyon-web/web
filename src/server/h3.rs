@@ -3,6 +3,7 @@ use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::server::accept::ConnectionLimit;
 use crate::server::{REQUEST_TIMEOUT, Server};
 
 /// Builds the QUIC endpoint HTTP/3 is served over, from a rustls config and a bind address.
@@ -87,16 +88,15 @@ where
     ) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
-        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
+        let limit = ConnectionLimit::new(state.max_connections);
 
-        while let Some(conn) = quic_server.accept().await {
-            let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+        while let Some(permit) = limit.acquire().await {
+            let Some(conn) = quic_server.accept().await else {
                 break;
             };
             let state = state.clone();
-            tokio::spawn(async move {
+            ConnectionLimit::serve(permit, async move {
                 state.handle_h3_connection(conn).await;
-                drop(permit);
             });
         }
         Ok(())

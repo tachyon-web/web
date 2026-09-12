@@ -3,6 +3,7 @@
 use super::I2pConfig;
 use super::config::validate_nickname;
 use crate::server::Server;
+use crate::server::accept::ConnectionLimit;
 #[cfg(feature = "tls")]
 use crate::server::anon_tls::AnonTls;
 use crate::server::conn::{NO_PEER_ADDR as I2P_PEER_ADDR, serve_connection};
@@ -126,29 +127,18 @@ where
             };
 
             let state = Arc::new(self);
-            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
-            loop {
-                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-                    return Ok(());
-                };
-                let stream = match destination.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!("[i2p] accept error: {e}");
-                        drop(permit);
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
+            let limit = ConnectionLimit::new(state.max_connections);
+            while let Some(permit) = limit.acquire().await {
+                let stream = accept_i2p_forever(&mut destination).await;
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
-                drop(tokio::spawn(async move {
+                ConnectionLimit::serve(permit, async move {
                     if let Err(e) = handle_i2p_stream(state, stream, tls_acceptor).await {
                         tracing::debug!("[i2p] connection error: {e}");
                     }
-                    drop(permit);
-                }));
+                });
             }
+            Ok(())
         }
 
         // No `tls` feature compiled in at all: `config.tls` can only ever be `AnonTls::None`
@@ -156,27 +146,33 @@ where
         #[cfg(not(feature = "tls"))]
         {
             let state = Arc::new(self);
-            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
-            loop {
-                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-                    return Ok(());
-                };
-                let stream = match destination.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!("[i2p] accept error: {e}");
-                        drop(permit);
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                };
+            let limit = ConnectionLimit::new(state.max_connections);
+            while let Some(permit) = limit.acquire().await {
+                let stream = accept_i2p_forever(&mut destination).await;
                 let state = state.clone();
-                drop(tokio::spawn(async move {
+                ConnectionLimit::serve(permit, async move {
                     if let Err(e) = handle_i2p_stream_plaintext(state, stream).await {
                         tracing::debug!("[i2p] connection error: {e}");
                     }
-                    drop(permit);
-                }));
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Accepts the next I2P stream, retrying after recoverable errors.
+///
+/// Mirrors [`crate::server::http::accept_forever`]: a failed accept is logged and retried
+/// after a short back-off rather than ending the eepsite, so the caller's loop only ever
+/// stops when the connection limiter is closed.
+async fn accept_i2p_forever(destination: &mut tachyon_i2p::Destination) -> tachyon_i2p::I2pStream {
+    loop {
+        match destination.accept().await {
+            Ok(stream) => return stream,
+            Err(e) => {
+                tracing::debug!("[i2p] accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }

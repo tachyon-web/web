@@ -1,6 +1,7 @@
 use crate::http::response::Body;
 #[cfg(feature = "tls")]
 use crate::server::TLS_HANDSHAKE_TIMEOUT;
+use crate::server::accept::ConnectionLimit;
 #[cfg(feature = "http1")]
 use crate::server::tuning::tune_http1;
 #[cfg(feature = "http2")]
@@ -70,11 +71,26 @@ impl HyperBody for DeadlineBody {
     }
 }
 
+/// Accepts the next connection, retrying until one arrives.
+///
+/// A failed accept is logged (and, on resource exhaustion, briefly backed off) and then
+/// retried, so a single bad connection never tears the listener down. It never gives up,
+/// which is what lets [`bounded_accept_loop`]'s `None` mean "stop" and nothing else.
+pub(super) async fn accept_forever(
+    listener: &TcpListener,
+    log_tag: &str,
+) -> (tokio::net::TcpStream, std::net::SocketAddr) {
+    loop {
+        if let Some(conn) = accept_tuned(listener, log_tag).await {
+            return conn;
+        }
+    }
+}
+
 /// Accepts one connection, applying the socket tuning shared by every transport.
 ///
 /// Returns `None` after logging (and, on resource exhaustion, briefly backing off) when the
-/// accept failed, so the caller continues its loop rather than tearing the listener down over
-/// a single bad connection.
+/// accept failed.
 async fn accept_tuned(
     listener: &TcpListener,
     log_tag: &str,
@@ -160,7 +176,7 @@ where
     pub async fn serve_http(self, listener: TcpListener) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
-        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
+        let max_connections = state.max_connections;
 
         // Build once outside the loop — `clone()` inside is a few pointer copies.
         // Three cases, matching whichever of `http1`/`http2` are enabled (at least
@@ -192,19 +208,13 @@ where
             b
         };
 
-        loop {
-            let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-                break;
-            };
-
-            let Some((stream, peer)) = accept_tuned(&listener, "http").await else {
-                drop(permit);
-                continue;
-            };
+        let limit = ConnectionLimit::new(max_connections);
+        while let Some(permit) = limit.acquire().await {
+            let (stream, peer) = accept_forever(&listener, "http").await;
             let state = state.clone();
             let builder = builder.clone();
 
-            let serve_fut = async move {
+            ConnectionLimit::serve(permit, async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer));
                 #[cfg(all(feature = "http1", feature = "http2"))]
@@ -216,10 +226,7 @@ where
                 if let Err(e) = result {
                     tracing::debug!("[http] connection error: {}", e);
                 }
-                drop(permit);
-            };
-
-            spawn_connection(serve_fut);
+            });
         }
         Ok(())
     }
@@ -244,21 +251,15 @@ where
         #[cfg(feature = "fips")]
         crate::server::assert_fips_server_config(acceptor.config())?;
         let state = Arc::new(self);
-        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
+        let max_connections = state.max_connections;
 
-        loop {
-            let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-                break;
-            };
-
-            let Some((tcp_stream, peer)) = accept_tuned(&listener, "https").await else {
-                drop(permit);
-                continue;
-            };
+        let limit = ConnectionLimit::new(max_connections);
+        while let Some(permit) = limit.acquire().await {
+            let (tcp_stream, peer) = accept_forever(&listener, "https").await;
             let acceptor = acceptor.clone();
             let state = state.clone();
 
-            let serve_fut = async move {
+            ConnectionLimit::serve(permit, async move {
                 let tls_stream =
                     match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream))
                         .await
@@ -266,12 +267,10 @@ where
                         Ok(Ok(stream)) => stream,
                         Ok(Err(e)) => {
                             tracing::debug!("[https] tls handshake error: {}", e);
-                            drop(permit);
                             return;
                         }
                         Err(_) => {
                             tracing::debug!("[https] tls handshake timed out");
-                            drop(permit);
                             return;
                         }
                     };
@@ -295,7 +294,6 @@ where
                     if let Err(e) = builder.serve_connection(io, svc).await {
                         tracing::debug!("[https] http/2 connection error: {}", e);
                     }
-                    drop(permit);
                     return;
                 }
 
@@ -314,10 +312,7 @@ where
                         tracing::debug!("[https] http/1.1 connection error: {}", e);
                     }
                 }
-                drop(permit);
-            };
-
-            spawn_connection(serve_fut);
+            });
         }
         Ok(())
     }

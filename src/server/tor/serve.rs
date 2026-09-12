@@ -5,6 +5,7 @@ use super::config::parse_nickname;
 #[cfg(feature = "tls")]
 use crate::http::response::Body;
 use crate::server::Server;
+use crate::server::accept::ConnectionLimit;
 #[cfg(feature = "tls")]
 use crate::server::anon_tls::AnonTls;
 use crate::server::conn::{NO_PEER_ADDR as ONION_PEER_ADDR, serve_connection};
@@ -120,23 +121,7 @@ where
 
         wait_until_reachable(&service).await;
 
-        let state = Arc::new(self);
-        let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
-        let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
-        tokio::pin!(stream_requests);
-
-        while let Some(stream_request) = stream_requests.next().await {
-            let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-                break;
-            };
-            let state = state.clone();
-            drop(tokio::spawn(async move {
-                if let Err(e) = handle_plaintext_only_stream(state, stream_request).await {
-                    tracing::debug!("[tor] connection error: {e}");
-                }
-                drop(permit);
-            }));
-        }
+        serve_plaintext_onion_streams(Arc::new(self), request_stream).await;
 
         drop(service);
         Ok(())
@@ -259,18 +244,18 @@ where
             let redirect_http = config.redirect_http;
 
             let state = Arc::new(self);
-            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
+            let limit = ConnectionLimit::new(state.max_connections);
             let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
             tokio::pin!(stream_requests);
 
-            while let Some(stream_request) = stream_requests.next().await {
-                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
+            while let Some(permit) = limit.acquire().await {
+                let Some(stream_request) = stream_requests.next().await else {
                     break;
                 };
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let onion_host = onion_host.clone();
-                drop(tokio::spawn(async move {
+                ConnectionLimit::serve(permit, async move {
                     if let Err(e) = handle_onion_stream(
                         state,
                         stream_request,
@@ -282,8 +267,7 @@ where
                     {
                         tracing::debug!("[tor] connection error: {e}");
                     }
-                    drop(permit);
-                }));
+                });
             }
 
             drop(service);
@@ -291,27 +275,11 @@ where
         }
 
         // No `tls` feature compiled in at all: `config.tls` can only ever be `AnonTls::None`
-        // (the only variant that exists in this build), so this is functionally identical to
+        // (the only variant that exists in this build), so this is exactly
         // `serve_tor_with_client`'s plaintext-only dispatch.
         #[cfg(not(feature = "tls"))]
         {
-            let state = Arc::new(self);
-            let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(state.max_connections));
-            let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
-            tokio::pin!(stream_requests);
-
-            while let Some(stream_request) = stream_requests.next().await {
-                let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-                    break;
-                };
-                let state = state.clone();
-                drop(tokio::spawn(async move {
-                    if let Err(e) = handle_plaintext_only_stream(state, stream_request).await {
-                        tracing::debug!("[tor] connection error: {e}");
-                    }
-                    drop(permit);
-                }));
-            }
+            serve_plaintext_onion_streams(Arc::new(self), request_stream).await;
 
             drop(service);
             Ok(())
@@ -432,6 +400,34 @@ const fn route_onion_request(port: u16, tls_enabled: bool, redirect_http: bool) 
 #[cfg(feature = "tls")]
 fn redirect_location(onion_host: &str, path_and_query: &str) -> String {
     format!("https://{onion_host}{path_and_query}")
+}
+
+/// Serves plaintext HTTP over every rendezvous stream the service receives, bounded by the
+/// server's `max_connections`, until the stream of requests ends.
+///
+/// Shared by [`serve_tor_with_client`](Server::serve_tor_with_client) and — in builds without
+/// the `tls` feature, where `AnonTls::None` is the only variant that exists — by
+/// [`serve_onion_with_client`](Server::serve_onion_with_client).
+async fn serve_plaintext_onion_streams<S, R>(state: Arc<Server<S>>, request_stream: R)
+where
+    S: Clone + Send + Sync + 'static,
+    R: futures_util::Stream<Item = tor_hsservice::RendRequest> + Send,
+{
+    let limit = ConnectionLimit::new(state.max_connections);
+    let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
+    tokio::pin!(stream_requests);
+
+    while let Some(permit) = limit.acquire().await {
+        let Some(stream_request) = stream_requests.next().await else {
+            break;
+        };
+        let state = state.clone();
+        ConnectionLimit::serve(permit, async move {
+            if let Err(e) = handle_plaintext_only_stream(state, stream_request).await {
+                tracing::debug!("[tor] connection error: {e}");
+            }
+        });
+    }
 }
 
 /// Handles a single rendezvous stream for [`Server::serve_tor_with_client`] — plaintext HTTP on

@@ -50,6 +50,7 @@
 //! # }
 //! ```
 
+mod accept;
 #[cfg(any(feature = "tor", feature = "i2p"))]
 mod anon_tls;
 pub(crate) mod conn;

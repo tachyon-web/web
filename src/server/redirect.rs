@@ -9,7 +9,11 @@ use tokio::net::TcpListener;
 #[cfg(feature = "tls")]
 use crate::http::response::Body;
 #[cfg(feature = "tls")]
-use crate::server::{REQUEST_TIMEOUT, is_resource_exhaustion};
+use crate::server::accept::ConnectionLimit;
+#[cfg(all(feature = "tls", feature = "http1"))]
+use crate::server::tuning::tune_http1;
+#[cfg(all(feature = "tls", feature = "http2"))]
+use crate::server::tuning::tune_http2;
 #[cfg(feature = "tls")]
 use hyper::service::service_fn;
 #[cfg(feature = "tls")]
@@ -125,45 +129,26 @@ pub async fn serve_http_redirect_and_challenges(
     https_port: u16,
     allowed_hosts: Option<Arc<[String]>>,
 ) {
+    // This listener is bound to port 80 and reachable by anyone, so it gets exactly the same
+    // hardening as the real one — `tune_http1!` carries the `header_read_timeout` that stops a
+    // client from opening a connection, never finishing its request line, and holding one of
+    // [`REDIRECT_MAX_CONNECTIONS`] permits forever (Slowloris).
+    #[cfg_attr(not(feature = "http1"), allow(unused_mut))]
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    // Without a `Timer`, hyper silently drops `header_read_timeout` (only a `warn!`, no
-    // error) — this listener is bound to port 80 and reachable by anyone, so a client that
-    // opens a connection and never finishes its request line would otherwise hold one of
-    // [`REDIRECT_MAX_CONNECTIONS`] permits forever (Slowloris).
-    let _ = builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(REQUEST_TIMEOUT);
+    #[cfg(feature = "http1")]
+    tune_http1!(builder.http1());
     #[cfg(feature = "http2")]
-    let _ = builder
-        .http2()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .keep_alive_interval(REQUEST_TIMEOUT)
-        .keep_alive_timeout(REQUEST_TIMEOUT);
-    let connection_semaphore = Arc::new(tokio::sync::Semaphore::new(REDIRECT_MAX_CONNECTIONS));
+    tune_http2!(builder.http2());
+    let limit = ConnectionLimit::new(REDIRECT_MAX_CONNECTIONS);
 
-    loop {
-        let Ok(permit) = connection_semaphore.clone().acquire_owned().await else {
-            return;
-        };
-        let (stream, _peer) = match listener.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("[http-redirect] accept error: {e}");
-                drop(permit);
-                if is_resource_exhaustion(&e) {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                continue;
-            }
-        };
-        let _ = stream.set_nodelay(true);
+    while let Some(permit) = limit.acquire().await {
+        let (stream, _peer) = crate::server::http::accept_forever(&listener, "http-redirect").await;
         let io = hyper_util::rt::TokioIo::new(stream);
         let builder = builder.clone();
         let allowed_hosts = allowed_hosts.clone();
 
-        drop(tokio::spawn(async move {
+        ConnectionLimit::serve(permit, async move {
             let _ = builder
                 .serve_connection(
                     io,
@@ -216,7 +201,6 @@ pub async fn serve_http_redirect_and_challenges(
                     }),
                 )
                 .await;
-            drop(permit);
-        }));
+        });
     }
 }
