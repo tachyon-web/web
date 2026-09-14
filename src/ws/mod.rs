@@ -178,6 +178,31 @@ impl<F> std::fmt::Debug for WebSocketUpgrade<F> {
     }
 }
 
+/// Default ceiling on outgoing bytes buffered for one WebSocket connection.
+///
+/// tungstenite's own default is `usize::MAX`, i.e. none: a peer that completes the handshake
+/// and then simply stops reading, while the application keeps sending (a broadcast or pub/sub
+/// route will), makes the server buffer without limit until it is killed. The peer spends
+/// nothing to do it. This is the WebSocket counterpart to bounding HTTP/2's per-stream
+/// `max_send_buf_size`, and like it, a connection whose peer is actually reading never
+/// approaches the ceiling.
+///
+/// 8 MiB — far above any interactive message, and 64x the 128 KiB write buffer it backstops.
+/// An application that sends larger single messages must raise it via
+/// [`WebSocketUpgrade::max_write_buffer_size`], because tungstenite refuses to queue a frame
+/// bigger than this ceiling at all.
+///
+/// *Tachyon extension: no `axum` equivalent.*
+pub const DEFAULT_MAX_WRITE_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+
+/// tungstenite's defaults, with the unbounded write buffer replaced — see
+/// [`DEFAULT_MAX_WRITE_BUFFER_SIZE`].
+fn default_ws_config() -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    config.max_write_buffer_size = DEFAULT_MAX_WRITE_BUFFER_SIZE;
+    config
+}
+
 impl<F> WebSocketUpgrade<F> {
     /// Read buffer capacity. The default value is 128 KiB.
     pub const fn read_buffer_size(mut self, size: usize) -> Self {
@@ -189,14 +214,34 @@ impl<F> WebSocketUpgrade<F> {
     /// to the underlying stream. The default value is 128 KiB.
     ///
     /// If set to `0`, each message is eagerly written to the underlying stream.
+    ///
+    /// Raises [`max_write_buffer_size`](Self::max_write_buffer_size) if it would otherwise end
+    /// up at or below `size` — tungstenite *panics* on that combination when the socket is
+    /// built, and a configuration mistake should not be able to take the process down.
     pub const fn write_buffer_size(mut self, size: usize) -> Self {
         self.config.write_buffer_size = size;
+        if self.config.max_write_buffer_size <= size {
+            self.config.max_write_buffer_size = size.saturating_add(1);
+        }
         self
     }
 
-    /// The max size of the write buffer in bytes. The default value is unlimited.
+    /// The hard ceiling on buffered outgoing bytes, past which a send fails with
+    /// `WriteBufferFull` rather than growing. The default is
+    /// [`DEFAULT_MAX_WRITE_BUFFER_SIZE`].
+    ///
+    /// Raise this if the application sends single messages larger than that; a message bigger
+    /// than this ceiling can never be queued, since tungstenite checks
+    /// `frame.len() + buffered > max` before accepting it.
+    ///
+    /// Clamped to stay above [`write_buffer_size`](Self::write_buffer_size) for the reason
+    /// given there.
     pub const fn max_write_buffer_size(mut self, max: usize) -> Self {
-        self.config.max_write_buffer_size = max;
+        self.config.max_write_buffer_size = if max > self.config.write_buffer_size {
+            max
+        } else {
+            self.config.write_buffer_size.saturating_add(1)
+        };
         self
     }
 
@@ -510,7 +555,7 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
         let deflate_offers = deflate::parse_offers(&parts.headers);
 
         Ok(Self {
-            config: WebSocketConfig::default(),
+            config: default_ws_config(),
             protocol: None,
             kind: UpgradeKind::Http1 { sec_websocket_key },
             on_upgrade,
@@ -553,7 +598,7 @@ impl WebSocketUpgrade<DefaultOnFailedUpgrade> {
         let deflate_offers = deflate::parse_offers(&parts.headers);
 
         Ok(Self {
-            config: WebSocketConfig::default(),
+            config: default_ws_config(),
             protocol: None,
             kind: UpgradeKind::Http2,
             on_upgrade,

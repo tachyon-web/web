@@ -202,8 +202,17 @@ impl I2pConfig {
 pub(super) fn validate_nickname(
     nickname: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if nickname.is_empty() || nickname.contains(['/', '\\']) || nickname == "." || nickname == ".."
-    {
+    // The nickname becomes a single path component under `data_dir` (see
+    // `I2pConfig::keys_path`), so reject anything the OS could read as more than a plain file
+    // name. Both separators are checked by hand — `\\` is only one to Windows, but a nickname
+    // carrying it has no business on disk anywhere — and `components()` covers the rest by the
+    // running platform's own path rules: empty, `.`, `..`, and a Windows drive prefix like
+    // `C:`, which `Path::join` treats as absolute and would silently escape `data_dir`.
+    let mut components = std::path::Path::new(nickname).components();
+    let is_plain_name = !nickname.contains(['/', '\\'])
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !is_plain_name {
         return Err(format!("invalid I2P eepsite nickname {nickname:?}").into());
     }
     Ok(())
@@ -226,6 +235,9 @@ mod tests {
         assert!(validate_nickname("../../etc/passwd").is_err());
         assert!(validate_nickname("a/b").is_err());
         assert!(validate_nickname("a\\b").is_err());
+        // Drive-relative on Windows, where `Path::join` would drop `data_dir` entirely.
+        #[cfg(windows)]
+        assert!(validate_nickname("C:keys").is_err());
     }
 
     #[test]

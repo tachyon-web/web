@@ -110,54 +110,41 @@ where
             on_ready(&address);
         }
 
+        // Without the `tls` feature `config.tls` can only ever be `AnonTls::None` (the only
+        // variant that exists in that build), so there is no acceptor to build and the loop
+        // below is unconditionally plaintext.
         #[cfg(feature = "tls")]
-        {
-            let tls_acceptor = match &config.tls {
-                AnonTls::None => None,
-                #[cfg(feature = "cert-gen")]
-                AnonTls::SelfSigned => {
-                    let cert = crate::tls::generate_self_signed_cert(vec![address.clone()])?;
-                    let server_config = self.effective_tls_policy().server_config_from_pem(
-                        cert.cert_pem.as_bytes(),
-                        cert.key_pem.as_bytes(),
-                    )?;
-                    Some(TlsAcceptor::from(Arc::new(server_config)))
+        let tls_acceptor = match &config.tls {
+            AnonTls::None => None,
+            #[cfg(feature = "cert-gen")]
+            AnonTls::SelfSigned => {
+                let cert = crate::tls::generate_self_signed_cert(vec![address.clone()])?;
+                let server_config = self
+                    .effective_tls_policy()
+                    .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())?;
+                Some(TlsAcceptor::from(Arc::new(server_config)))
+            }
+            AnonTls::Custom(server_config) => Some(TlsAcceptor::from(server_config.clone())),
+        };
+
+        let state = Arc::new(self);
+        let limit = ConnectionLimit::new(state.max_connections);
+        while let Some(permit) = limit.acquire().await {
+            let stream = accept_i2p_forever(&mut destination).await;
+            let state = state.clone();
+            #[cfg(feature = "tls")]
+            let tls_acceptor = tls_acceptor.clone();
+            ConnectionLimit::serve(permit, async move {
+                #[cfg(feature = "tls")]
+                let result = handle_i2p_stream(state, stream, tls_acceptor).await;
+                #[cfg(not(feature = "tls"))]
+                let result = handle_i2p_stream_plaintext(state, stream).await;
+                if let Err(e) = result {
+                    tracing::debug!("[i2p] connection error: {e}");
                 }
-                AnonTls::Custom(server_config) => Some(TlsAcceptor::from(server_config.clone())),
-            };
-
-            let state = Arc::new(self);
-            let limit = ConnectionLimit::new(state.max_connections);
-            while let Some(permit) = limit.acquire().await {
-                let stream = accept_i2p_forever(&mut destination).await;
-                let state = state.clone();
-                let tls_acceptor = tls_acceptor.clone();
-                ConnectionLimit::serve(permit, async move {
-                    if let Err(e) = handle_i2p_stream(state, stream, tls_acceptor).await {
-                        tracing::debug!("[i2p] connection error: {e}");
-                    }
-                });
-            }
-            Ok(())
+            });
         }
-
-        // No `tls` feature compiled in at all: `config.tls` can only ever be `AnonTls::None`
-        // (the only variant that exists in this build), so this is unconditionally plaintext.
-        #[cfg(not(feature = "tls"))]
-        {
-            let state = Arc::new(self);
-            let limit = ConnectionLimit::new(state.max_connections);
-            while let Some(permit) = limit.acquire().await {
-                let stream = accept_i2p_forever(&mut destination).await;
-                let state = state.clone();
-                ConnectionLimit::serve(permit, async move {
-                    if let Err(e) = handle_i2p_stream_plaintext(state, stream).await {
-                        tracing::debug!("[i2p] connection error: {e}");
-                    }
-                });
-            }
-            Ok(())
-        }
+        Ok(())
     }
 }
 

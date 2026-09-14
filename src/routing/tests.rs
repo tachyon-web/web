@@ -997,3 +997,24 @@ async fn test_normalize_trailing_slash_no_trailing_slash_is_untouched() {
     let resp = root_app.handle_request(make_req("GET", "/")).await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// RFC 3986 §2.1 defines a percent-escape as `"%" HEXDIG HEXDIG`, and nothing else.
+///
+/// The decoder used to hand the two bytes to `u8::from_str_radix`, which accepts a leading
+/// sign — so `%+0` decoded to a NUL byte that no strict decoder produces. A screening layer in
+/// front of this server (WAF, proxy, CDN) that rejects `%00` would not recognise `%+0` as the
+/// same thing, which is exactly how filter bypasses are built.
+#[test]
+fn percent_decode_rejects_escapes_that_are_not_two_hex_digits() {
+    for malformed in ["%+0", "%-1", "%+f", "% 0", "%0", "%"] {
+        assert_eq!(
+            percent_decode(malformed),
+            None,
+            "must reject {malformed:?}: only `%` HEXDIG HEXDIG is an escape"
+        );
+    }
+    // Well-formed escapes still decode, in either case.
+    assert_eq!(percent_decode("%2f").as_deref(), Some("/"));
+    assert_eq!(percent_decode("%2F").as_deref(), Some("/"));
+    assert_eq!(percent_decode("a%20b").as_deref(), Some("a b"));
+}

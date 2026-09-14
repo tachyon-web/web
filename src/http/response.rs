@@ -12,7 +12,9 @@ use http_body_util::combinators::UnsyncBoxBody as BoxBody;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use hyper::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Response as HttpResponse, StatusCode};
-#[cfg(feature = "json")]
+// `Form`'s `IntoResponse` needs this too, so it can't be gated on `json` alone — a
+// `form`-without-`json` build failed to compile before this.
+#[cfg(any(feature = "json", feature = "form"))]
 use serde::Serialize;
 use std::marker::PhantomData;
 use std::pin::Pin;

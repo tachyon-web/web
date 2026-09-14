@@ -71,6 +71,14 @@ impl HyperBody for DeadlineBody {
     }
 }
 
+/// Backoff after an accept failed because *this* process is out of descriptors or memory —
+/// short, because the condition often clears as in-flight connections close.
+const ACCEPT_EXHAUSTION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// Backoff after any other accept failure. Longer, because a listener failing for a reason
+/// that isn't resource pressure is usually broken for good and retrying it is pointless —
+/// matching the free-standing `serve()` path's own accept backoff in `listener.rs`.
+const ACCEPT_FAULT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Accepts the next connection, retrying until one arrives.
 ///
 /// A failed accept is logged (and, on resource exhaustion, briefly backed off) and then
@@ -97,18 +105,27 @@ async fn accept_tuned(
 ) -> Option<(tokio::net::TcpStream, std::net::SocketAddr)> {
     match listener.accept().await {
         Ok((stream, peer)) => {
-            let _ = stream.set_nodelay(true);
-            #[cfg(target_os = "linux")]
-            {
-                let _ = socket2::SockRef::from(&stream).set_tcp_quickack(true);
-            }
+            crate::server::accept::tune_tcp_stream(&stream);
             Some((stream, peer))
         }
         Err(e) => {
-            tracing::error!("[{log_tag}] accept error: {e}");
-            if crate::server::is_resource_exhaustion(&e) {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if crate::server::accept::is_connection_error(&e) {
+                // The peer vanished before we got to it — routine, and remote-triggerable, so
+                // it must not reach `error!`. No backoff either: these consume one queued
+                // connection each, so the loop can't spin on them.
+                tracing::debug!("[{log_tag}] accept error: {e}");
+                return None;
             }
+            tracing::error!("[{log_tag}] accept error: {e}");
+            // Everything else fails again immediately on retry, so without a pause
+            // `accept_forever` would spin a core flat and flood the log for as long as the
+            // condition lasts.
+            let backoff = if crate::server::is_resource_exhaustion(&e) {
+                ACCEPT_EXHAUSTION_BACKOFF
+            } else {
+                ACCEPT_FAULT_BACKOFF
+            };
+            tokio::time::sleep(backoff).await;
             None
         }
     }
@@ -124,13 +141,11 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    IS_LOCAL_WORKER.with(|flag| {
-        if flag.get() {
-            drop(tokio::task::spawn_local(fut));
-        } else {
-            drop(tokio::spawn(fut));
-        }
-    });
+    if IS_LOCAL_WORKER.get() {
+        drop(tokio::task::spawn_local(fut));
+    } else {
+        drop(tokio::spawn(fut));
+    }
 }
 
 #[cfg(feature = "http2")]
@@ -336,6 +351,23 @@ where
     }
 }
 
+/// Wraps an inbound request body in the shared read deadline.
+///
+/// Every entry point that hands a body to user code must go through here. Without it a peer
+/// can send complete headers declaring a body and then dribble it forever, pinning a
+/// connection permit for as long as it likes — `serve()` used to map `Incoming` straight into
+/// a `Body`, and so had no body-read timeout at all.
+pub(super) fn body_with_deadline(incoming: hyper::body::Incoming) -> Body {
+    if HyperBody::is_end_stream(&incoming) {
+        Body::empty()
+    } else {
+        Body::stream(DeadlineBody {
+            inner: incoming,
+            deadline: None,
+        })
+    }
+}
+
 pub(super) async fn hyper_handler<S>(
     state: Arc<Server<S>>,
     req: Request<hyper::body::Incoming>,
@@ -345,15 +377,7 @@ where
     S: Clone + Send + Sync + 'static,
 {
     let (parts, incoming_body) = req.into_parts();
-
-    let body = if HyperBody::is_end_stream(&incoming_body) {
-        Body::empty()
-    } else {
-        Body::stream(DeadlineBody {
-            inner: incoming_body,
-            deadline: None,
-        })
-    };
+    let body = body_with_deadline(incoming_body);
 
     Ok(state.dispatch(Request::from_parts(parts, body), peer).await)
 }

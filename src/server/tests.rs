@@ -70,7 +70,31 @@ fn resolve_redirect_host_echoes_unchecked_when_no_allow_list_is_known() {
     // long-standing behaviour there.
     assert_eq!(
         resolve_redirect_host("attacker.example:80", None),
-        "attacker.example"
+        Some("attacker.example")
+    );
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn resolve_redirect_host_rejects_a_host_that_is_not_host_shaped() {
+    // With no allow-list the `Host` is echoed, so anything that isn't a bare authority lets
+    // the peer control the `Location` path/query as well as its origin.
+    for hostile in [
+        "evil.example/path",
+        "evil.example?x=1",
+        "evil.example#frag",
+        "user@evil.example",
+        "",
+        "..",
+    ] {
+        assert_eq!(resolve_redirect_host(hostile, None), None, "{hostile}");
+    }
+    // Ordinary authorities still pass, including IPv6 literals and IPv4.
+    assert_eq!(resolve_redirect_host("[::1]:8443", None), Some("[::1]"));
+    assert_eq!(resolve_redirect_host("10.0.0.1:80", None), Some("10.0.0.1"));
+    assert_eq!(
+        resolve_redirect_host("sub.example-1.com", None),
+        Some("sub.example-1.com")
     );
 }
 
@@ -80,13 +104,13 @@ fn resolve_redirect_host_accepts_a_matching_allowed_host() {
     let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
     assert_eq!(
         resolve_redirect_host("EXAMPLE.com:80", Some(&allowed)),
-        "example.com",
+        Some("example.com"),
         "matching must be case-insensitive, and the request's own casing is dropped in \
          favor of the configured domain"
     );
     assert_eq!(
         resolve_redirect_host("www.example.com", Some(&allowed)),
-        "www.example.com"
+        Some("www.example.com")
     );
 }
 
@@ -99,8 +123,14 @@ fn resolve_redirect_host_falls_back_to_the_first_allowed_domain_on_a_mismatch() 
     let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
     assert_eq!(
         resolve_redirect_host("evil.example:80", Some(&allowed)),
-        "example.com"
+        Some("example.com")
     );
+
+    // An allow-list that is present but empty used to fall through `allowed.first()` straight
+    // back to the inbound `Host`, i.e. fail open into the very redirect this guards against.
+    // With no trustworthy host and nothing to fall back to, the only safe answer is no
+    // redirect at all — the caller turns this into a 400.
+    assert_eq!(resolve_redirect_host("evil.example:80", Some(&[])), None);
 }
 
 #[test]

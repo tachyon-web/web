@@ -174,17 +174,19 @@ mod tests {
 
     /// `serve_connection` is the path Tor and I2P take. It used to build its own hyper
     /// builders and set only the keep-alives, so those two transports ran on hyper's default
-    /// HTTP/2 settings while plain TCP and TLS ran on `tuning::tune_http2!`. Most of those
-    /// defaults happen to coincide with the tuned values, but the initial *stream* window does
-    /// not: hyper defaults to 1 MiB, the shared tuning pins 64 KiB. Asserting on that value is
-    /// what makes this a real guard — it is the one setting that tells "went through the shared
-    /// tuning" apart from "got hyper's defaults".
-    #[cfg(feature = "http2")]
+    /// HTTP/2 settings while plain TCP and TLS ran on `tuning::tune_http2!`.
+    ///
+    /// Every window/frame/stream value the tuning pins now coincides with hyper's own
+    /// defaults, so none of them can tell the two apart. `enable_connect_protocol` can:
+    /// hyper leaves it off, `tune_http2!` turns it on. That assertion is the real guard here;
+    /// the rest are ordinary value checks that would catch a typo'd constant.
+    #[cfg(all(feature = "http2", feature = "ws"))]
     #[tokio::test]
     async fn serve_connection_applies_the_shared_http2_tuning() {
-        // RFC 9113 §6.5.2 setting identifiers.
+        // RFC 9113 §6.5.2 and RFC 8441 §3 setting identifiers.
         const MAX_CONCURRENT_STREAMS: u16 = 0x3;
         const INITIAL_WINDOW_SIZE: u16 = 0x4;
+        const ENABLE_CONNECT_PROTOCOL: u16 = 0x8;
         const SETTINGS_FRAME: u8 = 0x4;
         const ACK: u8 = 0x1;
 
@@ -238,10 +240,15 @@ mod tests {
 
         let get = |id: u16| settings.iter().find(|(k, _)| *k == id).map(|(_, v)| *v);
         assert_eq!(
+            get(ENABLE_CONNECT_PROTOCOL),
+            Some(1),
+            "serve_connection must go through tuning::tune_http2!, which enables RFC 8441 \
+             CONNECT; hyper leaves it off, so this is what tells the two apart. Got {settings:?}"
+        );
+        assert_eq!(
             get(INITIAL_WINDOW_SIZE),
-            Some(65535),
-            "serve_connection must go through tuning::tune_http2!, which pins the initial \
-             stream window to 64 KiB; hyper's default is 1 MiB. Got {settings:?}"
+            Some(1024 * 1024),
+            "got {settings:?}"
         );
         assert_eq!(get(MAX_CONCURRENT_STREAMS), Some(200), "got {settings:?}");
     }

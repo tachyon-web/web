@@ -45,7 +45,13 @@ impl Listener for TcpListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             match Self::accept(self).await {
-                Ok(tup) => return tup,
+                // Deliberately *not* axum's behaviour, which leaves socket options to
+                // `ListenerExt::tap_io`: every other accept path in this crate disables Nagle,
+                // and silently differing on latency by entry point is the worse surprise.
+                Ok((stream, addr)) => {
+                    crate::server::accept::tune_tcp_stream(&stream);
+                    return (stream, addr);
+                }
                 Err(e) => handle_accept_error(e).await,
             }
         }
@@ -115,20 +121,11 @@ where
 }
 
 async fn handle_accept_error(e: io::Error) {
-    if is_connection_error(&e) {
+    if crate::server::accept::is_connection_error(&e) {
         return;
     }
     error!("accept error: {e}");
     tokio::time::sleep(Duration::from_secs(1)).await;
-}
-
-fn is_connection_error(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-    )
 }
 
 #[cfg(test)]
@@ -140,6 +137,20 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = Listener::local_addr(&listener).unwrap();
         assert_eq!(addr.ip(), std::net::Ipv4Addr::LOCALHOST);
+    }
+
+    /// Deliberate divergence from axum, which leaves socket options to `tap_io` — pinned here
+    /// so it isn't "corrected" back into a silent per-entry-point latency difference.
+    #[tokio::test]
+    async fn accepted_streams_have_nagle_disabled() {
+        let mut listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = Listener::local_addr(&listener).unwrap();
+
+        let connector = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (io, _addr) = Listener::accept(&mut listener).await;
+        connector.await.unwrap().unwrap();
+
+        assert!(io.nodelay().unwrap());
     }
 
     #[tokio::test]

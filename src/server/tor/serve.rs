@@ -338,6 +338,25 @@ fn require_onion_host_for_redirect(
 /// network activity (introduction points built, descriptor accepted by `HsDirs`) with no built-in
 /// timeout, so it can legitimately take minutes on a slow or first-run bootstrap — every state
 /// transition is logged so that wait doesn't look hung.
+/// Accepts a rendezvous stream, bounded in time.
+///
+/// `StreamRequest::accept` writes a CONNECTED cell onto the circuit, and a peer that simply
+/// stops reading can hold that write open by leaving the circuit's flow-control window shut.
+/// This runs while holding one of `max_connections` permits, so an unbounded await here lets
+/// a peer pin the whole accept budget without ever speaking HTTP — the point at which every
+/// other timeout in this crate would have applied.
+async fn accept_onion_stream(
+    request: StreamRequest,
+) -> Result<tor_proto::client::stream::DataStream, Box<dyn std::error::Error + Send + Sync>> {
+    tokio::time::timeout(
+        crate::server::REQUEST_TIMEOUT,
+        request.accept(Connected::new_empty()),
+    )
+    .await
+    .map_err(|_| "timed out accepting onion stream")?
+    .map_err(Into::into)
+}
+
 async fn wait_until_reachable(service: &tor_hsservice::RunningOnionService) {
     let mut status_events = service.status_events();
     let mut last_state = None;
@@ -449,7 +468,7 @@ where
         return Ok(());
     }
 
-    let onion_stream = stream_request.accept(Connected::new_empty()).await?;
+    let onion_stream = accept_onion_stream(stream_request).await?;
     let svc =
         hyper::service::service_fn(move |req| hyper_handler(state.clone(), req, ONION_PEER_ADDR));
     serve_connection(onion_stream, svc).await
@@ -480,14 +499,14 @@ where
             Ok(())
         }
         OnionAction::ServePlaintext => {
-            let onion_stream = stream_request.accept(Connected::new_empty()).await?;
+            let onion_stream = accept_onion_stream(stream_request).await?;
             let svc = hyper::service::service_fn(move |req| {
                 hyper_handler(state.clone(), req, ONION_PEER_ADDR)
             });
             serve_connection(onion_stream, svc).await
         }
         OnionAction::Redirect => {
-            let onion_stream = stream_request.accept(Connected::new_empty()).await?;
+            let onion_stream = accept_onion_stream(stream_request).await?;
             let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let onion_host = onion_host.clone();
                 async move { Ok::<_, std::io::Error>(redirect_response(&req, &onion_host)) }
@@ -499,7 +518,7 @@ where
                 stream_request.shutdown_circuit()?;
                 return Ok(());
             };
-            let onion_stream = stream_request.accept(Connected::new_empty()).await?;
+            let onion_stream = accept_onion_stream(stream_request).await?;
             let tls_stream = tokio::time::timeout(
                 crate::server::TLS_HANDSHAKE_TIMEOUT,
                 acceptor.accept(onion_stream),

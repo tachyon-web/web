@@ -54,7 +54,7 @@ async fn run_worker_thread<S, F, Fut>(
     F: Fn(Server<S>, TcpListener) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<(), std::io::Error>> + Send + 'static,
 {
-    IS_LOCAL_WORKER.with(|flag| flag.set(true));
+    IS_LOCAL_WORKER.set(true);
 
     // Only used for the HTTP->HTTPS redirect listener, which requires TLS.
     #[cfg(not(feature = "tls"))]
@@ -115,7 +115,6 @@ where
 
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let mut handles = Vec::new();
     let server = Arc::new(server);
     let serve_fn = Arc::new(serve_fn);
     // Each worker thread reports whether it managed to bind its listener, so
@@ -130,19 +129,27 @@ where
         let core_id = core_ids.get(i).copied();
         let bind_tx = bind_tx.clone();
         let redirect_info = redirect_info.clone();
-        let handle = std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name(format!("tachyon-worker-{i}"))
             .spawn(move || {
                 if let Some(id) = core_id {
                     let _ = core_affinity::set_for_current(id);
                 }
 
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                // Every worker must report exactly once — the wait below reads `cores`
+                // messages, and the senders held by the workers that *did* start keep the
+                // channel open, so a thread that returns without sending hangs that wait
+                // for good.
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                else {
-                    tracing::error!("failed to build tokio runtime for worker thread");
-                    return;
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("failed to build tokio runtime for worker thread: {e}");
+                        let _ = bind_tx.send(Err(e));
+                        return;
+                    }
                 };
 
                 let local = tokio::task::LocalSet::new();
@@ -151,7 +158,9 @@ where
                     run_worker_thread(server, serve_fn, addr, redirect_info, bind_tx),
                 );
             })?;
-        handles.push(handle);
+        // Detached deliberately: the pool's liveness is tracked through `bind_tx` below, not
+        // by joining these threads, which are expected to run for the process's lifetime.
+        drop(worker);
     }
     drop(bind_tx);
 
@@ -178,7 +187,6 @@ where
         );
     }
 
-    let _ = handles;
     // Each worker's accept loop runs indefinitely, so under normal operation this task
     // should never resolve. But a worker can still exit early *after* a successful bind —
     // e.g. `serve_fn`'s own `enforce_fips_compliance()` check failing right at the start of

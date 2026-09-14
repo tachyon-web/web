@@ -85,6 +85,17 @@ pub(crate) fn extract_param_names(path: &str) -> Arc<[Arc<str>]> {
 /// the whole decode (path segments, where the caller falls back to the raw, still-encoded
 /// value on `None`) or keep the `%` literally and continue (query/form values, where a
 /// dropped `%` mid-value would be a worse failure mode than a partially-decoded string).
+/// One ASCII hex digit's value, or `None` for anything else — including the `+`/`-` signs
+/// `from_str_radix` would otherwise accept.
+const fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte.saturating_sub(b'0')),
+        b'a'..=b'f' => Some(byte.saturating_sub(b'a').saturating_add(10)),
+        b'A'..=b'F' => Some(byte.saturating_sub(b'A').saturating_add(10)),
+        _ => None,
+    }
+}
+
 fn decode_percent_bytes(
     s: &str,
     plus_as_space: bool,
@@ -100,12 +111,15 @@ fn decode_percent_bytes(
     while let Some(&byte) = bytes.get(i) {
         match byte {
             b'%' => {
-                let hex = bytes.get(i.saturating_add(1)..i.saturating_add(3));
-                if let Some(hex) = hex
-                    && let Ok(hex_str) = std::str::from_utf8(hex)
-                    && let Ok(val) = u8::from_str_radix(hex_str, 16)
+                // Both digits checked by hand rather than via `u8::from_str_radix`, which
+                // accepts a leading sign: it read `%+0` as the byte 0x00, where RFC 3986 §2.1
+                // requires `"%" HEXDIG HEXDIG` and every strict decoder rejects it. Disagreeing
+                // with other decoders about what an escape means is a filter-bypass primitive
+                // — a WAF or proxy that screens for `%00` would not recognise `%+0` as one.
+                if let Some(hi) = bytes.get(i.saturating_add(1)).copied().and_then(hex_digit)
+                    && let Some(lo) = bytes.get(i.saturating_add(2)).copied().and_then(hex_digit)
                 {
-                    decoded.push(val);
+                    decoded.push(hi.wrapping_shl(4) | lo);
                     i = i.saturating_add(3);
                     continue;
                 }

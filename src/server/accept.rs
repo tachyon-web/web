@@ -14,6 +14,35 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Applies the per-connection socket tuning every TCP accept path shares.
+///
+/// Both paths go through here — [`Server`](crate::server::Server)'s worker-pool loop and the
+/// free-standing [`serve()`](crate::server::serve) — so the two can't drift apart on socket
+/// options the way they previously did (`serve()` left Nagle on, adding up to a round of
+/// delayed-ACK latency to every small response it wrote).
+pub(super) fn tune_tcp_stream(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = socket2::SockRef::from(stream).set_tcp_quickack(true);
+    }
+}
+
+/// Whether an accept error is an ordinary vanished-peer case rather than a listener fault.
+///
+/// A peer that aborts between SYN and `accept` makes the call fail; that is routine traffic,
+/// not an operational problem. Logging it at `error!` would let any remote peer drive
+/// unbounded log volume, which is its own denial of service — on disk, on a log pipeline's
+/// bill, and on an operator's ability to spot a real event in the noise.
+pub(super) fn is_connection_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 /// Bounds how many connections a transport serves concurrently.
 #[derive(Debug, Clone)]
 pub(super) struct ConnectionLimit(Arc<Semaphore>);

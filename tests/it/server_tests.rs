@@ -355,3 +355,44 @@ async fn test_bind_rustls_https_server_serve_with_http3_enabled() {
     .await;
     handle.abort();
 }
+
+/// `serve()` must put a read deadline on request bodies, the same as `Server::serve_http`.
+///
+/// It used to map `hyper::body::Incoming` straight into a `Body`, skipping the `DeadlineBody`
+/// wrapper the `Server` path applies. A peer could then send complete headers announcing a
+/// body and simply never send it, pinning a connection for as long as it liked — and since
+/// `serve()` now caps concurrency, enough such peers lock the listener out entirely rather
+/// than merely growing memory.
+///
+/// Ignored by default: the deadline is `REQUEST_TIMEOUT` (30s), so proving it fires means
+/// actually waiting it out, which is too slow for a default run.
+#[cfg(feature = "http1")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "waits out the 30s body-read deadline; run explicitly with `-- --ignored`"]
+async fn serve_applies_a_request_body_read_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app: Router<()> = Router::new().route(
+        "/echo",
+        post(|body: Bytes| async move { format!("got {}", body.len()) }),
+    );
+    let handle = tokio::spawn(std::future::IntoFuture::into_future(tachyon_web::serve(
+        listener, app,
+    )));
+    wait_until_listening(addr).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Complete headers announcing a body, then send exactly nothing.
+    stream
+        .write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = Vec::new();
+    let drained = tokio::time::timeout(Duration::from_secs(45), stream.read_to_end(&mut buf)).await;
+    assert!(
+        drained.is_ok(),
+        "connection was still held open after 45s — the body read deadline is not being applied"
+    );
+    handle.abort();
+}

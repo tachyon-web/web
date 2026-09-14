@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::server::accept::ConnectionLimit;
-use crate::server::{REQUEST_TIMEOUT, Server};
+use crate::server::{REQUEST_TIMEOUT, RESPONSE_WRITE_TIMEOUT, Server};
 
 /// Builds the QUIC endpoint HTTP/3 is served over, from a rustls config and a bind address.
 ///
@@ -14,6 +14,7 @@ pub(super) fn build_quic_server(
     io: impl tachyon_quic::s2n_quic::provider::io::TryInto<
         Error: std::error::Error + Send + Sync + 'static,
     >,
+    max_concurrent_streams: usize,
 ) -> Result<tachyon_quic::s2n_quic::Server, Box<dyn std::error::Error + Send + Sync>> {
     let limits = tachyon_quic::s2n_quic::provider::limits::Limits::new()
         // 1 MB flow-control windows match H/2 settings and saturate LAN pipes.
@@ -22,8 +23,13 @@ pub(super) fn build_quic_server(
         .with_bidirectional_remote_data_window(1_048_576)?
         // 100ms is a safe, standard default initial RTT for public internet clients.
         .with_initial_round_trip_time(Duration::from_millis(100))?
-        // More simultaneous streams per connection.
-        .with_max_open_remote_bidirectional_streams(4096)?
+        // Matches `Server::max_h3_concurrent_streams`, the per-connection budget
+        // `handle_h3_connection` actually enforces. Advertising a larger credit than that
+        // only invites the peer to open streams we then reset on arrival; keeping the two
+        // equal lets QUIC's own flow control apply the backpressure instead.
+        .with_max_open_remote_bidirectional_streams(
+            u64::try_from(max_concurrent_streams).unwrap_or(u64::MAX),
+        )?
         // Keep ACK overhead low: ACK every 4th packet (default is every 2nd).
         .with_ack_elicitation_interval(4)?
         // Disable active migration (saves state tracking).
@@ -54,12 +60,27 @@ pub(super) fn spawn_h3<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    let quic_server = build_quic_server(config, io)?;
+    let quic_server = build_quic_server(config, io, server.max_h3_concurrent_streams)?;
     let server = server.clone();
     drop(tokio::spawn(async move {
         let _ = server.serve_h3(quic_server).await;
     }));
     Ok(())
+}
+
+/// Bounds one response-write await by [`RESPONSE_WRITE_TIMEOUT`], collapsing a stall into the
+/// same `Err` the caller already handles by abandoning the stream.
+async fn write_within<T, E>(
+    write: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, ()> {
+    match tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, write).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(()),
+        Err(_) => {
+            tracing::debug!("[h3] response write stalled; abandoning stream");
+            Err(())
+        }
+    }
 }
 
 impl<S> Server<S>
@@ -257,28 +278,28 @@ where
         let (resp_parts, body) = full_resp.into_parts();
         let resp = Response::from_parts(resp_parts, ());
 
-        if stream.send_response(resp).await.is_ok() {
+        // Each write is bounded, but `body.frame()` deliberately is not: that await is the
+        // handler producing data, which an SSE or long-poll route is entitled to sit on
+        // indefinitely. Only the *write* is something a peer can stall, by holding its
+        // flow-control window shut, and only that needs a deadline.
+        if write_within(stream.send_response(resp)).await.is_ok() {
             use http_body_util::BodyExt;
             let mut body = body;
-            while let Some(frame_res) = body.frame().await {
-                if let Ok(frame) = frame_res {
-                    let send_res = if let Some(data) = frame.data_ref() {
-                        stream.send_data(data.clone()).await
-                    } else if let Some(trailers) = frame.trailers_ref() {
-                        stream.send_trailers(trailers.clone()).await
-                    } else {
-                        Ok(())
-                    };
-
-                    if send_res.is_err() {
-                        break;
-                    }
+            while let Some(Ok(frame)) = body.frame().await {
+                let send_res = if let Some(data) = frame.data_ref() {
+                    write_within(stream.send_data(data.clone())).await
+                } else if let Some(trailers) = frame.trailers_ref() {
+                    write_within(stream.send_trailers(trailers.clone())).await
                 } else {
+                    Ok(())
+                };
+
+                if send_res.is_err() {
                     break;
                 }
             }
         }
-        let _ = stream.finish().await;
+        let _ = write_within(stream.finish()).await;
     }
 }
 

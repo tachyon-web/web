@@ -20,8 +20,9 @@ pub mod ws {
     pub use crate::ws::close_code;
     pub use crate::ws::rejection;
     pub use crate::ws::{
-        CloseCode, CloseFrame, DefaultOnFailedUpgrade, DeflateConfig, Message, OnFailedUpgrade,
-        Utf8Bytes, WebSocket, WebSocketConfig, WebSocketUpgrade,
+        CloseCode, CloseFrame, DEFAULT_MAX_WRITE_BUFFER_SIZE, DefaultOnFailedUpgrade,
+        DeflateConfig, Message, OnFailedUpgrade, Utf8Bytes, WebSocket, WebSocketConfig,
+        WebSocketUpgrade,
     };
 }
 /// Flattened re-export matching `axum::extract::WebSocketUpgrade`.

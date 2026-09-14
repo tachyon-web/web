@@ -85,7 +85,7 @@ use tokio::net::TcpListener;
 
 use crate::http::response::Body;
 use hyper::{Request, Response};
-#[cfg(any(feature = "cert-gen", feature = "lets-encrypt", feature = "http3"))]
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
 use redirect::parse_addr;
@@ -107,7 +107,21 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default handshake timeout for TLS connections.
 #[cfg(feature = "tls")]
 pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a single response write may make no progress before the stream is abandoned.
+///
+/// Deliberately per-write rather than a budget for the whole response: a slow client that is
+/// still consuming keeps resetting it, so long downloads and open SSE streams are unaffected,
+/// while a peer that has simply stopped reading — holding its flow-control window shut to pin
+/// the stream and its buffers — is dropped. This is the QUIC-side counterpart to bounding
+/// `max_send_buf_size` on HTTP/2 (see `tuning`).
+#[cfg(feature = "http3")]
+pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default for [`Server::max_connections`], and the fixed ceiling the free-standing
+/// [`serve()`](fn@serve) enforces — see that field for how to size it.
+///
+/// *Tachyon extension: no `axum` equivalent.*
+pub const DEFAULT_MAX_CONNECTIONS: usize = 25_600;
 /// Default for [`Server::max_websocket_connections`] — see that field for how to size it.
 ///
 /// *Tachyon extension: no `axum` equivalent.*
@@ -174,6 +188,10 @@ pub struct Server<S> {
     /// [`serve_https`]: Server::serve_https
     /// [`serve_all_acme`]: Server::serve_all_acme
     /// [`serve_h3`]: Server::serve_h3
+    ///
+    /// The free-standing [`serve()`](fn@serve) has no `Server` to read this from, so it
+    /// enforces [`DEFAULT_MAX_CONNECTIONS`] as a fixed ceiling instead — axum leaves that
+    /// entry point uncapped, but an unbounded accept loop is not a default worth matching.
     ///
     /// Default: 25,600 — matching `actix-server`'s own per-worker
     /// `max_concurrent_connections`.
@@ -260,7 +278,7 @@ impl Server<()> {
         Self {
             router: compiled,
             max_body_size: 2 * 1024 * 1024, // 2 MiB (matches Axum's `DefaultBodyLimit` default)
-            max_connections: 25_600,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
             #[cfg(feature = "ws")]
             websocket_permits: Arc::new(tokio::sync::Semaphore::new(
@@ -550,10 +568,15 @@ where
         addr: std::net::SocketAddr,
         config: rustls::ServerConfig,
     ) -> Result<(), std::io::Error> {
-        let config = Arc::new(config);
+        // One acceptor shared by every worker rather than a `ServerConfig` deep-cloned per
+        // core: `TlsAcceptor` is `Arc`-backed, so cloning it is a refcount bump, and the
+        // workers then share one TLS session cache — separate caches would mean a resuming
+        // client that `SO_REUSEPORT` steers to a different worker falls back to a full
+        // handshake.
+        let acceptor = TlsAcceptor::from(Arc::new(config));
         run_worker_pool(self, addr, None, move |server, listener| {
-            let config = config.clone();
-            async move { server.serve_https_config(listener, (*config).clone()).await }
+            let acceptor = acceptor.clone();
+            async move { server.serve_https(listener, acceptor).await }
         })
         .await
     }
@@ -595,10 +618,9 @@ where
 
         let addr = parse_addr(tls_addr)?;
         let tls_acceptor = TlsAcceptor::from(config);
-        let tls_acceptor = Arc::new(tls_acceptor);
         run_worker_pool(self, addr, None, move |server, listener| {
             let tls_acceptor = tls_acceptor.clone();
-            async move { server.serve_https(listener, (*tls_acceptor).clone()).await }
+            async move { server.serve_https(listener, tls_acceptor).await }
         })
         .await?;
 
@@ -683,6 +705,11 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::tls::acme::AcmeManager;
         enforce_fips_compliance()?;
+        if domains.is_empty() {
+            // An ACME order needs at least one identifier (RFC 8555 §7.4), and the port-80
+            // listener below would otherwise come up with an allow-list it can never match.
+            return Err("serve_all_acme requires at least one domain".into());
+        }
 
         // Built with this server's own policy so the ACME-issued certificate's signing key is
         // loaded through the same crypto provider the `ServerConfig` below negotiates with —
@@ -703,17 +730,20 @@ where
         // hang startup forever; those early connections will fail until the
         // cert lands, same as today, but the common case (cached or
         // fast-issued cert) now actually gets served from the start.
-        let wait_start = tokio::time::Instant::now();
-        while !resolver.has_certificate() {
-            if wait_start.elapsed() >= FIRST_CERT_TIMEOUT {
-                tracing::warn!(
-                    "[acme] No certificate ready after {:?}; starting TLS listener anyway — \
-                     connections will fail until provisioning completes",
-                    FIRST_CERT_TIMEOUT
-                );
-                break;
+        let first_cert = async {
+            while !resolver.has_certificate() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        if tokio::time::timeout(FIRST_CERT_TIMEOUT, first_cert)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "[acme] No certificate ready after {:?}; starting TLS listener anyway — \
+                 connections will fail until provisioning completes",
+                FIRST_CERT_TIMEOUT
+            );
         }
 
         // Build the TLS config backed by the ACME hot-swap resolver, sharing the same
@@ -730,7 +760,6 @@ where
 
         // Bind the HTTPS listener and serve (blocks the calling task).
         let addr = parse_addr(tls_addr)?;
-        let tls_acceptor = Arc::new(tls_acceptor);
         let redirect_addr = parse_addr(cleartext_addr)?;
         let https_port = parse_port(tls_addr, 443);
         run_worker_pool(
@@ -743,7 +772,7 @@ where
             }),
             move |server, listener| {
                 let tls_acceptor = tls_acceptor.clone();
-                async move { server.serve_https(listener, (*tls_acceptor).clone()).await }
+                async move { server.serve_https(listener, tls_acceptor).await }
             },
         )
         .await?;
@@ -811,10 +840,9 @@ where
 
         // Start the HTTPS listener (blocks this task).
         let addr = parse_addr(tls_addr)?;
-        let tls_acceptor = Arc::new(tls_acceptor);
         run_worker_pool(self, addr, redirect_info, move |server, listener| {
             let tls_acceptor = tls_acceptor.clone();
-            async move { server.serve_https(listener, (*tls_acceptor).clone()).await }
+            async move { server.serve_https(listener, tls_acceptor).await }
         })
         .await?;
 

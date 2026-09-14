@@ -10,11 +10,31 @@
 //! entry point no longer gets the worker pool's multi-core accept scaling: reach for
 //! [`Server::serve_http`](crate::server::Server::serve_http)/`.start_http_addr()` instead if
 //! that matters more to you than the axum-drop-in signature.
+//!
+//! # Where this deliberately diverges from axum
+//!
+//! The *signature* is axum's; two behaviours are not, both because matching axum there would
+//! mean shipping a weaker default than the rest of this crate enforces:
+//!
+//! - **Connections are capped.** Concurrency is bounded at
+//!   [`DEFAULT_MAX_CONNECTIONS`](crate::server::DEFAULT_MAX_CONNECTIONS), acquired before each
+//!   accept so a saturated server leaves connections on the listen backlog. Axum's `serve`
+//!   spawns per accepted connection with no ceiling, which is a memory-exhaustion primitive
+//!   for anyone who can open sockets. Unlike [`Server::max_connections`], this is a fixed
+//!   ceiling — there is no `Server` here to configure it from, so use
+//!   [`Server::serve_http`](crate::server::Server::serve_http) if you need to size it.
+//! - **Nagle is disabled** on accepted `TcpStream`s (plus `TCP_QUICKACK` on Linux), matching
+//!   every other accept path in this crate. Axum leaves socket options to
+//!   [`ListenerExt::tap_io`]; differing on small-response latency by entry point is the worse
+//!   surprise.
 
-use crate::http::response::Body;
 /// Re-exported at this path so `tachyon_web::serve::{IncomingStream, Listener, ListenerExt,
 /// TapIo}` matches `axum::serve::{IncomingStream, Listener, ListenerExt, TapIo}`.
 pub use crate::routing::tower_compat::IncomingStream;
+use crate::server::DEFAULT_MAX_CONNECTIONS;
+#[cfg(feature = "ws")]
+use crate::server::DEFAULT_MAX_WEBSOCKET_CONNECTIONS;
+use crate::server::accept::ConnectionLimit;
 pub use crate::server::{Listener, ListenerExt, TapIo};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
@@ -168,6 +188,23 @@ where
     }
 }
 
+/// The WebSocket budget shared by every [`fn@serve`] listener in this process.
+///
+/// [`Server`](crate::server::Server) owns a per-instance semaphore sized by
+/// [`Server::max_websocket_connections`](crate::server::Server::max_websocket_connections);
+/// this entry point has no `Server`, so it shares one fixed budget instead. Sized to
+/// [`DEFAULT_MAX_WEBSOCKET_CONNECTIONS`], the same default a `Server` starts with.
+#[cfg(feature = "ws")]
+fn websocket_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(
+            DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
+        ))
+    })
+}
+
 /// Adapts a `tower::Service` into the `hyper::service::Service` shape
 /// [`crate::server::conn`]'s connection drivers expect, mapping the (statically unreachable)
 /// `Infallible` error into the `io::Error` they require.
@@ -184,7 +221,18 @@ where
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let mut svc = self.0.clone();
-        let req = req.map(Body::stream);
+        // `body_with_deadline`, not a bare `Body::stream`: without it a peer can announce a
+        // body in its headers and then never send it, pinning a connection permit forever.
+        #[cfg_attr(not(feature = "ws"), allow(unused_mut))]
+        let mut req = req.map(crate::server::http::body_with_deadline);
+        // There is no `Server` on this path to carry the WebSocket budget, so attach the
+        // process-wide one: `reserve_connection_slot` treats a missing extension as "no
+        // budget configured" and lets the upgrade through uncounted, which would leave every
+        // `serve()` deployment able to be driven to OOM a few hundred KiB at a time.
+        #[cfg(feature = "ws")]
+        let _ = req
+            .extensions_mut()
+            .insert(crate::ws::WebSocketLimit(websocket_permits().clone()));
         Box::pin(async move {
             use tower::ServiceExt as _;
             match svc.ready().await {
@@ -205,7 +253,10 @@ where
     S: Service<Request, Response = Response, Error = Infallible> + Clone + Send + 'static,
     S::Future: Send,
 {
-    loop {
+    // Capacity is taken *before* accepting, so a server at its ceiling leaves connections on
+    // the listen backlog instead of accepting them into an unbounded task pile.
+    let limit = ConnectionLimit::new(DEFAULT_MAX_CONNECTIONS);
+    while let Some(permit) = limit.acquire().await {
         let (io, remote_addr) = listener.accept().await;
         let io = TokioIo::new(io);
 
@@ -217,11 +268,12 @@ where
             .await
             .unwrap_or_else(|never: Infallible| match never {});
 
-        tokio::spawn(async move {
+        ConnectionLimit::serve(permit, async move {
             let _ = crate::server::conn::serve_connection(io.into_inner(), HyperService(tower_svc))
                 .await;
         });
     }
+    Ok(())
 }
 
 async fn run_with_shutdown<L, M, S, F>(
@@ -244,44 +296,54 @@ where
         let _ = shutdown_tx.send(true);
     });
 
+    let limit = ConnectionLimit::new(DEFAULT_MAX_CONNECTIONS);
     loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (io, remote_addr) = accepted;
-                let io = TokioIo::new(io);
-
-                std::future::poll_fn(|cx| make_service.poll_ready(cx))
-                    .await
-                    .unwrap_or_else(|never: Infallible| match never {});
-                let tower_svc = make_service
-                    .call(IncomingStream::new(&io, remote_addr))
-                    .await
-                    .unwrap_or_else(|never: Infallible| match never {});
-
-                let mut conn_shutdown = shutdown_rx.clone();
-                let close_tx = close_tx.clone();
-                tokio::spawn(async move {
-                    let shutdown_signal = async move {
-                        // A receiver cloned *after* the flip would otherwise wait for the
-                        // *next* change, which never comes — check the already-flipped value
-                        // first rather than relying solely on `changed()`.
-                        if !*conn_shutdown.borrow() {
-                            let _ = conn_shutdown.changed().await;
-                        }
-                    };
-                    let _ = crate::server::conn::serve_connection_graceful(
-                        io.into_inner(),
-                        HyperService(tower_svc),
-                        shutdown_signal,
-                    )
-                    .await;
-                    drop(close_tx);
-                });
+        // Capacity first (see `run`), but still racing the shutdown signal — otherwise a
+        // server sitting at its ceiling would ignore shutdown until a connection drained.
+        let permit = tokio::select! {
+            permit = limit.acquire() => {
+                let Some(permit) = permit else { break };
+                permit
             }
+            _ = shutdown_rx.changed() => break,
+        };
+
+        let (io, remote_addr) = tokio::select! {
+            accepted = listener.accept() => accepted,
             _ = shutdown_rx.changed() => {
+                drop(permit);
                 break;
             }
-        }
+        };
+        let io = TokioIo::new(io);
+
+        std::future::poll_fn(|cx| make_service.poll_ready(cx))
+            .await
+            .unwrap_or_else(|never: Infallible| match never {});
+        let tower_svc = make_service
+            .call(IncomingStream::new(&io, remote_addr))
+            .await
+            .unwrap_or_else(|never: Infallible| match never {});
+
+        let mut conn_shutdown = shutdown_rx.clone();
+        let close_tx = close_tx.clone();
+        ConnectionLimit::serve(permit, async move {
+            let shutdown_signal = async move {
+                // A receiver cloned *after* the flip would otherwise wait for the *next*
+                // change, which never comes — check the already-flipped value first rather
+                // than relying solely on `changed()`.
+                if !*conn_shutdown.borrow() {
+                    let _ = conn_shutdown.changed().await;
+                }
+            };
+            let _ = crate::server::conn::serve_connection_graceful(
+                io.into_inner(),
+                HyperService(tower_svc),
+                shutdown_signal,
+            )
+            .await;
+            drop(close_tx);
+        });
     }
 
     drop(close_tx);
