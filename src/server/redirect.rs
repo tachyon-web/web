@@ -30,9 +30,9 @@ pub(super) const REDIRECT_MAX_CONNECTIONS: usize = 2048;
 /// Parameters for the plaintext port-80 redirect/ACME-challenge listener spawned alongside a
 /// TLS listener — see [`serve_http_redirect_and_challenges`].
 ///
-/// Always defined because the shared bind path accepts redirect configuration with or without TLS.
+/// Always defined because the shared bind path, [`bind_and_serve`](crate::server::bind::bind_and_serve),
 /// takes `Option<RedirectInfo>` unconditionally — only *constructing* a `Some` (and consuming
-/// it in [`run_worker_thread`]) requires the `tls` feature.
+/// it there) requires the `tls` feature.
 #[derive(Clone)]
 pub(super) struct RedirectInfo {
     // All three fields are only ever populated behind `#[cfg(feature = "tls")]` construction
@@ -211,7 +211,6 @@ pub(super) async fn serve_http_redirect_and_challenges(
                                 return Ok::<_, std::convert::Infallible>(resp);
                             }
 
-                            // 308 Permanent Redirect to HTTPS (preserves method).
                             let host = req
                                 .headers()
                                 .get("host")
@@ -235,7 +234,7 @@ pub(super) async fn serve_http_redirect_and_challenges(
                                 format!("https://{redirect_host}{port_suffix}{path_and_query}");
 
                             let resp = Response::builder()
-                                .status(308) // 308 Permanent Redirect preserves the HTTP method.
+                                .status(308)
                                 .header("location", &location)
                                 .body(Body::empty())
                                 .unwrap_or_else(|_| Response::new(Body::empty()));

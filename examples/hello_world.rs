@@ -1,14 +1,14 @@
 //! Routing, path/query extraction, JSON payloads, custom status codes.
 
-use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
-use tachyon_web::http::StatusCode;
-use tachyon_web::{
+use axum::http::StatusCode;
+use axum::{
     Router,
     extract::{Json, Path, Query},
     response::{Html, IntoResponse},
     routing::{get, post},
 };
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
@@ -62,7 +62,7 @@ async fn create_user(Json(payload): Json<CreateUserRequest>) -> impl IntoRespons
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/", get(index))
-        .route("/hello/:name", get(greet))
+        .route("/hello/{name}", get(greet))
         .route("/search", get(search))
         .route("/api/users", post(create_user));
 
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tachyon_web::serve(listener, app).await?;
+    tachyon_web::Server::new(app).serve_http(listener).await?;
 
     Ok(())
 }

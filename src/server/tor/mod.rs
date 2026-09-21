@@ -31,7 +31,8 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, routing::get};
+//! use axum::{Router, routing::get};
+//! use tachyon_web::Server;
 //!
 //! async fn hello() -> &'static str { "Hello from an onion service!" }
 //!
@@ -52,7 +53,8 @@
 //! certificate shown here) alongside `tor` — see the [module docs](self) above.
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, routing::get};
+//! use axum::{Router, routing::get};
+//! use tachyon_web::Server;
 //! use tachyon_web::server::tor::OnionConfig;
 //!
 //! async fn hello() -> &'static str { "Hello, secure onion world!" }

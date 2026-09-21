@@ -5,38 +5,49 @@
 [![License](https://img.shields.io/badge/license-0BSD-8da0cb.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](#minimum-supported-rust-version)
 
-A multi-protocol Axum server for Rust, built on [`hyper`](https://crates.io/crates/hyper) and
-[`s2n-quic`](https://crates.io/crates/s2n-quic): Axum itself, plus HTTP/1.1,
-h2c, HTTP/2, HTTP/3, Let's Encrypt, Tor and I2P all
-in one crate rather than five.
+Tachyon-Web is a literal drop-in replacement for serving an [Axum](https://github.com/tokio-rs/axum)
+app: write the app against `axum` exactly as you already would, and change one line to serve
+it — `tachyon_web::Server` in place of `axum::serve`. `Router`, extractors, responses,
+middleware and Tower integration all stay Axum's own types; nothing about the app changes.
 
-## ⚠️ Read this before depending on it
+What Tachyon adds is everything *around* the app: the transport layer. Native TLS 1.3, HTTP/3,
+Let's Encrypt, and — because "protective" here means more than TLS — first-class Tor `.onion`
+and I2P `.i2p` hidden-service serving, with the same hardened connection handling underneath
+every one of them. One crate instead of an Axum app plus a reverse proxy plus a certbot cron job
+plus a separate onion-service setup.
 
-This is `0.0.x` — there has not been a release anyone should call stable.
+## Why "Tachyon"
 
-Breaking changes can land in any release. Logical bugs are expected; nobody can honestly
-claim otherwise about a project this young. What is guaranteed is narrower: the crate
-compiles under `#![forbid(unsafe_code)]`, which is a compiler error rather than a promise,
-so the memory-safety class of bugs is off the table. Resource-exhaustion and data-exposure
-bugs are not — following best practice on input handling and request lifecycle lowers that
-risk, it does not prove its absence.
+Not speed — a tachyon is a hypothetical particle that has never been observed, by design faster
+than the fastest thing that could ever catch it. That's the property being named here: traffic
+this crate serves over Tor or I2P is architecturally hard to pin to a physical origin. Nothing
+in this project claims to outrun anyone; it claims to be difficult to catch.
 
-If an outage or a security incident is unacceptable — payments, healthcare, anything
-regulated, anything with an on-call rotation — use [`axum`](https://crates.io/crates/axum).
-It has a maintaining team and years of production track record, and that is worth more than
-anything on this page.
+## ⚠️ Still `0.0.x`
 
-For side projects, internal tools, and prototypes, try it and report what broke.
+Breaking changes can land in any release — nothing here should be called stable yet. Tachyon
+leans on audited, widely-deployed crates for the parts that matter most (`axum` for the app
+layer, `rustls`/`aws-lc-rs` for TLS, `arti-client` for Tor) rather than reimplementing them, and
+compiles under `#![forbid(unsafe_code)]`, so it isn't starting from zero — but a young
+integration layer around mature pieces is still a young integration layer. Try it, expect API
+changes across `0.0.x` releases, and report what broke.
+
+**Tachyon-Web is an independent project.** It is not affiliated with, endorsed by, or
+associated with the Axum project, Tokio, the Tor Project, I2P, or any other project it
+interoperates with. "Drop-in replacement" describes API compatibility, not a relationship with
+their maintainers.
 
 ## Quick start
 
+The app is written against `axum` directly, same as any other Axum app:
+
 ```rust,no_run
-use tachyon_web::{Router, Server, routing::get};
-use tachyon_web::response::Html;
+use axum::{Router, routing::get};
+use axum::response::Html;
 use tokio::net::TcpListener;
 
 async fn hello_world() -> Html<&'static str> {
-    Html("<h1>Hello from Tachyon-Web!</h1>")
+    Html("<h1>Hello from Axum!</h1>")
 }
 
 #[tokio::main]
@@ -45,21 +56,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/", get(hello_world));
 
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    Server::new(app).serve_http(listener).await?;
+    tachyon_web::Server::new(app).serve_http(listener).await?;
     Ok(())
 }
 ```
 
-Path/query/JSON extraction, middleware, shared state, static files and
-serving over Tor/I2P each have an example in [`examples/`](examples/), run with
-`cargo run --example <name>`. Some need extra features; the example file says which.
+Everything above the last line is plain `axum` — nothing to migrate. The one line that changes
+going to production is the serve call: `axum::serve(listener, app)` becomes
+`tachyon_web::Server::new(app).serve_http(listener)`, which brings hardened connection handling
+(read/handshake timeouts, per-connection body/stream limits, Slowloris and
+flow-control-exhaustion mitigations) shared across every transport below, instead of
+hand-rolling it per protocol.
+
+See [`examples/`](examples/) for path/query/JSON extraction
+([`hello_world.rs`](examples/hello_world.rs)) and serving the same app over Tor and I2P at once
+([`onion_i2p_server.rs`](examples/onion_i2p_server.rs)), run with `cargo run --example <name>`.
+Some need extra features; the example file says which.
 
 ## HTTPS
 
 Throwaway self-signed certificate, for development:
 
 ```rust,no_run
-use tachyon_web::{Router, Server, routing::get, tls};
+use axum::{Router, routing::get};
+use tachyon_web::tls;
 
 async fn hello() -> &'static str { "secure hello" }
 
@@ -69,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cert = tls::generate_self_signed_cert(vec!["localhost".to_string()])?;
 
-    Server::new(app)
+    tachyon_web::Server::new(app)
         .start_all(
             "0.0.0.0:443",
             Some("0.0.0.0:80"), // optional HTTP -> HTTPS redirect
@@ -85,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 the HTTP-01 challenge, disk caching, and renewal 30 days before expiry:
 
 ```rust,no_run
-use tachyon_web::{Router, Server, routing::get};
+use axum::{Router, routing::get};
 
 async fn hello() -> &'static str { "Hello, secure world!" }
 
@@ -93,7 +113,7 @@ async fn hello() -> &'static str { "Hello, secure world!" }
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new().route("/", get(hello));
 
-    Server::new(app)
+    tachyon_web::Server::new(app)
         .serve_all_acme(
             "0.0.0.0:443",                   // HTTPS / HTTP/2 / HTTP/3
             "0.0.0.0:80",                    // HTTP redirect + ACME challenges
@@ -141,7 +161,7 @@ Tachyon's own additions default off, the way Axum treats its extras:
 |---|---|---|
 | `tls` | | TLS via `rustls` + `aws-lc-rs` |
 | `cert-gen` | | self-signed certificate generation (`tls::generate_self_signed_cert`); needs `tls` |
-| `http3` | | HTTP/3 over QUIC via `s2n-quic`; needs `tls` |
+| `http3` | | HTTP/3 over QUIC via [`tachyon-quic`](https://crates.io/crates/tachyon-quic) (built on `s2n-quic`); needs `tls` |
 | `lets-encrypt` | | automatic Let's Encrypt certificate management; needs `tls`, `cert-gen` |
 | `fips` | | enforce FIPS-mode cryptography at startup; refuses to start otherwise; needs `tls` |
 | `tor` | | Tor v3 `.onion` support (`Server::serve_tor`/`serve_onion`) via `arti-client` |
@@ -159,15 +179,19 @@ service meshes that terminate TLS upstream will.
 
 ## Acknowledgements
 
-[Axum](https://github.com/tokio-rs/axum) provides `Router`, extractors, responses, and
-middleware directly; Tachyon focuses on hardened transport and deployment integrations.
-[Actix Web](https://github.com/actix/actix-web) inspired treating a per-request allocation as
-a cost worth counting. [Salvo](https://github.com/salvo-rs/salvo) is the reason
-TLS, HTTP/3, and certificate management are built in rather than assembled by every user.
+[Axum](https://github.com/tokio-rs/axum) *is* the application layer here — `Router`,
+extractors, responses, and middleware come from it directly, unmodified. See
+[`NOTICE.md`](NOTICE.md) for the required MIT attribution. [Salvo](https://github.com/salvo-rs/salvo)
+is the reason TLS, HTTP/3, and certificate management are built in rather than assembled by
+every user.
 
 ## License
 
-Licensed under the [0BSD license](https://github.com/hacer-bark/cargo-unikernel/blob/main/LICENSE).
+Licensed under the [0BSD license](LICENSE).
+
+Tachyon-Web's own code is 0BSD; it is built directly on [Axum](https://github.com/tokio-rs/axum),
+used under the MIT license — see [`NOTICE.md`](NOTICE.md) for the full attribution required by
+that license.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 this crate shall be licensed as above, without any additional terms or conditions.

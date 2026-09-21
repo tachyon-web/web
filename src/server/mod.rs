@@ -34,7 +34,8 @@
 //!
 //! ```rust,no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//! use tachyon_web::{Router, Server, routing::get};
+//! use axum::{Router, routing::get};
+//! use tachyon_web::Server;
 //!
 //! let app: Router = Router::new().route("/", get(|| async { "hi" }));
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
@@ -134,7 +135,8 @@ const FIRST_CERT_TIMEOUT: Duration = Duration::from_mins(1);
 /// # Example
 ///
 /// ```rust,no_run
-/// use tachyon_web::{Router, Server, routing::get};
+/// use axum::{Router, routing::get};
+/// use tachyon_web::Server;
 /// use tokio::net::TcpListener;
 ///
 /// async fn hello() -> &'static str { "hello" }
@@ -258,7 +260,8 @@ where
     ///
     /// # Example
     /// ```rust,no_run
-    /// # use tachyon_web::{Router, Server};
+    /// # use axum::Router;
+    /// # use tachyon_web::Server;
     /// # let router = Router::new();
     /// let server = Server::new(router).max_body_size(64 * 1024 * 1024); // 64 MiB
     /// ```
@@ -517,7 +520,8 @@ where
     /// # Example
     ///
     /// ```rust,no_run
-    /// use tachyon_web::{Router, Server, routing::get};
+    /// use axum::{Router, routing::get};
+    /// use tachyon_web::Server;
     ///
     /// async fn hello() -> &'static str { "Hello, HTTPS World!" }
     ///

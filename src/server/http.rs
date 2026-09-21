@@ -102,7 +102,9 @@ const ACCEPT_FAULT_BACKOFF: std::time::Duration = std::time::Duration::from_secs
 ///
 /// A failed accept is logged (and, on resource exhaustion, briefly backed off) and then
 /// retried, so a single bad connection never tears the listener down. It never gives up,
-/// which is what lets [`bounded_accept_loop`]'s `None` mean "stop" and nothing else.
+/// which is what lets a caller looping on
+/// [`ConnectionLimit::acquire`](crate::server::accept::ConnectionLimit::acquire)'s `None` treat
+/// that as the only reason to stop.
 pub(super) async fn accept_forever(
     listener: &TcpListener,
     log_tag: &str,

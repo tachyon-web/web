@@ -9,12 +9,12 @@
 //! ## Plain HTTP
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, routing::get};
-//! use tachyon_web::response::Html;
+//! use axum::{Router, routing::get};
+//! use axum::response::Html;
 //! use tokio::net::TcpListener;
 //!
 //! async fn hello_world() -> Html<&'static str> {
-//!     Html("<h1>Hello from Tachyon-Web!</h1>")
+//!     Html("<h1>Hello from Axum!</h1>")
 //! }
 //!
 //! #[tokio::main]
@@ -23,7 +23,7 @@
 //!         .route("/", get(hello_world));
 //!
 //!     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-//!     Server::new(app).serve_http(listener).await?;
+//!     tachyon_web::Server::new(app).serve_http(listener).await?;
 //!     Ok(())
 //! }
 //! ```
@@ -35,7 +35,7 @@
 //! days before expiry, and hot-swaps the result into the running TLS stack.
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, routing::get};
+//! use axum::{Router, routing::get};
 //!
 //! async fn hello() -> &'static str { "Hello, secure world!" }
 //!
@@ -45,7 +45,7 @@
 //!     {
 //!         let app = Router::new().route("/", get(hello));
 //!
-//!         Server::new(app)
+//!         tachyon_web::Server::new(app)
 //!             .serve_all_acme(
 //!                 "0.0.0.0:443",                   // HTTPS / HTTP/2 / HTTP/3
 //!                 "0.0.0.0:80",                    // HTTP redirect + ACME challenges
@@ -65,7 +65,7 @@
 //! For development or when you manage certificates externally:
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, routing::get};
+//! use axum::{Router, routing::get};
 //!
 //! async fn hello() -> &'static str { "secure hello" }
 //!
@@ -79,7 +79,7 @@
 //!
 //!         let cert = tls::generate_self_signed_cert(vec!["localhost".to_string()])?;
 //!
-//!         Server::new(app)
+//!         tachyon_web::Server::new(app)
 //!             .start_all(
 //!                 "0.0.0.0:443",
 //!                 Some("0.0.0.0:80"), // optional HTTP → HTTPS redirect
@@ -99,7 +99,7 @@
 //! with no external `tor` daemon or reverse proxy required:
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, routing::get};
+//! use axum::{Router, routing::get};
 //!
 //! async fn hello() -> &'static str { "Hello from an onion service!" }
 //!
@@ -108,7 +108,7 @@
 //! #   #[cfg(feature = "tor")]
 //! #   {
 //!     let app = Router::new().route("/", get(hello));
-//!     Server::new(app).serve_tor("my-hidden-service").await?;
+//!     tachyon_web::Server::new(app).serve_tor("my-hidden-service").await?;
 //! #   }
 //!     Ok(())
 //! }
@@ -121,7 +121,7 @@
 //! with no external `i2pd`/Java-I2P process required:
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, routing::get};
+//! use axum::{Router, routing::get};
 //!
 //! async fn hello() -> &'static str { "Hello from an eepsite!" }
 //!
@@ -130,7 +130,7 @@
 //! #   #[cfg(feature = "i2p")]
 //! #   {
 //!     let app = Router::new().route("/", get(hello));
-//!     Server::new(app).serve_i2p("my-eepsite").await?;
+//!     tachyon_web::Server::new(app).serve_i2p("my-eepsite").await?;
 //! #   }
 //!     Ok(())
 //! }

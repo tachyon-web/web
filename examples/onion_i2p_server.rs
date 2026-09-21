@@ -7,9 +7,10 @@
 //! cargo run --example onion_i2p_server --features tor,i2p
 //! ```
 
+use axum::{Router, routing::get};
+use tachyon_web::Server;
 use tachyon_web::server::i2p::I2pConfig;
 use tachyon_web::server::tor::OnionConfig;
-use tachyon_web::{Router, Server, routing::get};
 
 async fn hello() -> &'static str {
     "Hello from Tachyon-Web, reachable over Tor and I2P!"

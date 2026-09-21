@@ -12,7 +12,8 @@ use crate::server::Server;
 /// [`TlsPolicy::fips`](crate::tls::TlsPolicy::fips) is the only provider a `TlsPolicy` can hold
 /// under `fips` (see its docs), but a `ServerConfig` can also reach this crate through doors
 /// that never touch `TlsPolicy` at all: [`Server::serve_https_config`],
-/// [`Server::start_https_with_config`]/[`_addr`], [`Server::start_https_and_h3_with_config`],
+/// [`Server::start_https_with_config`]/[`Server::start_https_with_config_addr`],
+/// [`Server::start_https_and_h3_with_config`],
 /// [`Server::with_https`]/[`MultiServer::with_https`](crate::server::multi::MultiServer::with_https),
 /// [`RustlsConfig::from_pem`], `OnionTls::Custom`, and `I2pTls::Custom`. Without this check, a
 /// caller could hand any of those a ChaCha20-only or X25519-only config and it would be served

@@ -17,9 +17,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// Applies the per-connection socket tuning every TCP accept path shares.
 ///
 /// Both paths go through here — [`Server`](crate::server::Server)'s accept loop and the
-/// free-standing [`serve()`](crate::server::serve) — so the two can't drift apart on socket
-/// options the way they previously did (`serve()` left Nagle on, adding up to a round of
-/// delayed-ACK latency to every small response it wrote).
+/// free-standing [`axum::serve`] — so the two can't drift apart on socket options the way they
+/// previously did (`axum::serve` left Nagle on, adding up to a round of delayed-ACK latency to
+/// every small response it wrote).
 pub(super) fn tune_tcp_stream(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
 }
