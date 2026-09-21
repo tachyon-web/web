@@ -1,6 +1,7 @@
 use crate::common::TestServer;
 use std::fs;
-use tachyon_web::{Router, ServeDir};
+use tachyon_web::Router;
+use tower_http::services::ServeDir;
 
 #[tokio::test]
 async fn test_static_dir_serving() {
@@ -14,7 +15,7 @@ async fn test_static_dir_serving() {
     let static_service = ServeDir::new(dir.path()).append_index_html_on_directories(true);
 
     // Serve at / — root → index.html, /style.css → style.css
-    let app: Router<()> = Router::new().serve_dir("/", static_service);
+    let app: Router<()> = Router::new().fallback_service(static_service);
     let server = TestServer::spawn(app).await;
 
     for (path, expected_type, expected_body) in [

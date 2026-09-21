@@ -7,10 +7,11 @@ use std::time::Instant;
 use tachyon_web::http::header::AUTHORIZATION;
 use tachyon_web::http::{Request, StatusCode};
 use tachyon_web::{
-    Next, Router,
+    Router,
+    body::Body,
     extract::State,
-    middleware::{from_fn, from_fn_with_state},
-    response::{Body, IntoResponse},
+    middleware::{Next, from_fn, from_fn_with_state},
+    response::IntoResponse,
     routing::get,
 };
 

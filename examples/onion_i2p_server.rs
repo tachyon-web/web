@@ -9,7 +9,7 @@
 
 use tachyon_web::server::i2p::I2pConfig;
 use tachyon_web::server::tor::OnionConfig;
-use tachyon_web::{Router, Server, get};
+use tachyon_web::{Router, Server, routing::get};
 
 async fn hello() -> &'static str {
     "Hello from Tachyon-Web, reachable over Tor and I2P!"

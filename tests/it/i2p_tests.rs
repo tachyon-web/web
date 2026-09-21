@@ -58,7 +58,7 @@ fn i2p_config_builder_methods_chain_in_any_order() {
 #[ignore = "needs live I2P network egress; run explicitly with `-- --ignored`"]
 async fn eepsite_round_trip_over_a_real_i2p_stream() {
     use std::time::Duration;
-    use tachyon_web::{Server, get};
+    use tachyon_web::{Server, routing::get};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn hello() -> &'static str {

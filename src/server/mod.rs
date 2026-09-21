@@ -1,4 +1,4 @@
-//! The [`Server`] engine: wraps a [`CompiledRouter`] and dispatches incoming streams for
+//! The [`Server`] engine: wraps an Axum [`Router`] and dispatches incoming streams for
 //! every supported transport.
 //!
 //! # Protocol support
@@ -22,7 +22,6 @@
 //! [`serve_all_acme`]: Server::serve_all_acme
 //! [`serve_tor`]: Server::serve_tor
 //! [`serve_i2p`]: Server::serve_i2p
-//! [`CompiledRouter`]: crate::routing::CompiledRouter
 //!
 //! # Publishing over more than one transport at once
 //!
@@ -35,7 +34,7 @@
 //!
 //! ```rust,no_run
 //! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::{Router, Server, routing::get};
 //!
 //! let app: Router = Router::new().route("/", get(|| async { "hi" }));
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
@@ -53,44 +52,42 @@
 mod accept;
 #[cfg(any(feature = "tor", feature = "i2p"))]
 mod anon_tls;
+mod bind;
+#[cfg(any(feature = "tor", feature = "i2p", test))]
 pub(crate) mod conn;
 #[cfg(feature = "http3")]
 mod h3;
 mod http;
 #[cfg(feature = "i2p")]
 pub mod i2p;
-mod listener;
 mod multi;
 mod redirect;
-pub mod serve;
 #[cfg(feature = "tls")]
 mod tls_config;
 #[macro_use]
 mod tuning;
 #[cfg(feature = "tor")]
 pub mod tor;
-mod worker_pool;
 
-pub use listener::{Listener, ListenerExt, TapIo};
 pub use multi::MultiServer;
-pub use serve::{Serve, WithGracefulShutdown, serve};
 #[cfg(feature = "tls")]
 pub use tls_config::{HttpsServer, RustlsConfig, bind_rustls};
 
-use crate::routing::CompiledRouter;
-#[cfg(any(feature = "ws", feature = "tls"))]
+use axum::Router;
+use std::marker::PhantomData;
+#[cfg(feature = "tls")]
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tower::ServiceExt as _;
 
-use crate::http::response::Body;
+use axum::body::Body;
 use hyper::{Request, Response};
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
+use bind::bind_and_serve;
 use redirect::parse_addr;
-#[cfg(feature = "tls")]
-pub use redirect::{REDIRECT_MAX_CONNECTIONS, serve_http_redirect_and_challenges};
 #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
 use redirect::{RedirectInfo, parse_port};
 #[cfg(any(feature = "cert-gen", feature = "lets-encrypt", feature = "http3"))]
@@ -99,7 +96,6 @@ pub(crate) use tls_config::alpn_protocols;
 use tls_config::assert_fips_server_config;
 #[cfg(any(feature = "lets-encrypt", feature = "cert-gen"))]
 use tls_config::tls_config_builder;
-use worker_pool::run_worker_pool;
 
 /// Default read timeout for both plaintext and TLS connections.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -116,15 +112,10 @@ pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(feature = "http3")]
 pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default for [`Server::max_connections`], and the fixed ceiling the free-standing
-/// [`serve()`](fn@serve) enforces — see that field for how to size it.
+/// Default for [`Server::max_connections`].
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 pub const DEFAULT_MAX_CONNECTIONS: usize = 25_600;
-/// Default for [`Server::max_websocket_connections`] — see that field for how to size it.
-///
-/// *Tachyon extension: no `axum` equivalent.*
-pub const DEFAULT_MAX_WEBSOCKET_CONNECTIONS: usize = 25_600;
 /// Default for [`Server::max_h3_concurrent_streams`] — see that field for how to size it.
 ///
 /// *Tachyon extension: no `axum` equivalent.*
@@ -137,13 +128,13 @@ const FIRST_CERT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Main server configuration and runner.
 ///
-/// Wraps a [`CompiledRouter`] and provides multiple `serve_*` methods for different
+/// Wraps an Axum [`Router`] and provides multiple `serve_*` methods for different
 /// transport protocols. The server is cheaply cloneable via `Arc` internally.
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// use tachyon_web::{Router, Server, get};
+/// use tachyon_web::{Router, Server, routing::get};
 /// use tokio::net::TcpListener;
 ///
 /// async fn hello() -> &'static str { "hello" }
@@ -160,7 +151,8 @@ const FIRST_CERT_TIMEOUT: Duration = Duration::from_mins(1);
 /// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
 pub struct Server<S> {
-    pub(crate) router: CompiledRouter<S>,
+    pub(crate) router: Router,
+    pub(crate) state: PhantomData<fn() -> S>,
     /// Maximum permitted request body size in bytes (default: 2 MiB, matching
     /// Axum's `DefaultBodyLimit` default).
     pub max_body_size: usize,
@@ -175,32 +167,8 @@ pub struct Server<S> {
     /// [`serve_all_acme`]: Server::serve_all_acme
     /// [`serve_h3`]: Server::serve_h3
     ///
-    /// The free-standing [`serve()`](fn@serve) has no `Server` to read this from, so it
-    /// enforces [`DEFAULT_MAX_CONNECTIONS`] as a fixed ceiling instead — axum leaves that
-    /// entry point uncapped, but an unbounded accept loop is not a default worth matching.
-    ///
     /// Default: 25,600.
     pub max_connections: usize,
-    /// Maximum number of concurrent established WebSocket connections, process-wide.
-    ///
-    /// Upgraded connections escape [`max_connections`](Self::max_connections): hyper's
-    /// connection future completes as soon as it hands the socket to the upgrade, releasing
-    /// that permit while the WebSocket lives on in its own task. Without this ceiling a peer
-    /// can hold open an unbounded number of them.
-    ///
-    /// One semaphore is shared by every clone and transport.
-    ///
-    /// Size it by memory, not connection count: tungstenite defaults to a 128 KiB read plus
-    /// 128 KiB write buffer per socket, so the default is worth several GiB at saturation.
-    /// Lower it, or the buffers via
-    /// [`WebSocketUpgrade::read_buffer_size`](crate::ws::WebSocketUpgrade::read_buffer_size)
-    /// and [`write_buffer_size`](crate::ws::WebSocketUpgrade::write_buffer_size).
-    ///
-    /// Default: 25,600.
-    pub max_websocket_connections: usize,
-    /// Backs [`max_websocket_connections`](Self::max_websocket_connections).
-    #[cfg(feature = "ws")]
-    pub(crate) websocket_permits: Arc<tokio::sync::Semaphore>,
     /// Maximum number of HTTP/3 streams handled concurrently **per QUIC connection** — see
     /// [`serve_h3`](Server::serve_h3). Distinct from [`max_connections`](Self::max_connections),
     /// which caps whole connections, not streams within one: a single peer can open many
@@ -232,11 +200,9 @@ where
     fn clone(&self) -> Self {
         Self {
             router: self.router.clone(),
+            state: PhantomData,
             max_body_size: self.max_body_size,
             max_connections: self.max_connections,
-            max_websocket_connections: self.max_websocket_connections,
-            #[cfg(feature = "ws")]
-            websocket_permits: self.websocket_permits.clone(),
             #[cfg(feature = "http3")]
             max_h3_concurrent_streams: self.max_h3_concurrent_streams,
             #[cfg(feature = "tls")]
@@ -248,21 +214,13 @@ where
 impl Server<()> {
     /// Creates a new `Server` with default settings and the given router.
     ///
-    /// # Panics
-    /// Panics if router compilation fails (e.g. a duplicate route was registered).
     #[must_use]
-    #[allow(clippy::expect_used)]
-    pub fn new(router: crate::routing::Router<()>) -> Self {
-        let compiled = router.compile().expect("Router compilation failed");
+    pub fn new(router: Router) -> Self {
         Self {
-            router: compiled,
+            router,
+            state: PhantomData,
             max_body_size: 2 * 1024 * 1024, // 2 MiB (matches Axum's `DefaultBodyLimit` default)
             max_connections: DEFAULT_MAX_CONNECTIONS,
-            max_websocket_connections: DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
-            #[cfg(feature = "ws")]
-            websocket_permits: Arc::new(tokio::sync::Semaphore::new(
-                DEFAULT_MAX_WEBSOCKET_CONNECTIONS,
-            )),
             #[cfg(feature = "http3")]
             max_h3_concurrent_streams: DEFAULT_MAX_H3_CONCURRENT_STREAMS,
             #[cfg(feature = "tls")]
@@ -285,27 +243,18 @@ where
         mut req: Request<Body>,
         peer: std::net::SocketAddr,
     ) -> Response<Body> {
-        #[cfg(feature = "original-uri")]
-        {
-            let original_uri = crate::routing::extract::OriginalUri(req.uri().clone());
-            let _ = req.extensions_mut().insert(original_uri);
-        }
         let extensions = req.extensions_mut();
-        let _ = extensions.insert(crate::routing::extract::ConnectInfo(peer));
-        let _ = extensions.insert(crate::routing::extract::MaxBodySize(self.max_body_size));
-        // Threaded through extensions because the WebSocket extractor runs inside the router,
-        // with no path back to the `Server`.
-        #[cfg(feature = "ws")]
-        let _ = extensions.insert(crate::ws::WebSocketLimit(self.websocket_permits.clone()));
-
-        self.router.handle_request(req).await
+        let _ = extensions.insert(axum::extract::ConnectInfo(peer));
+        match self.router.clone().oneshot(req).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
     }
 
     /// Overrides the maximum request body size (in bytes).
     ///
-    /// Requests whose body exceeds this limit are rejected with `413 Content Too Large`
-    /// before the body bytes are fully buffered. The default is **2 MiB**, matching
-    /// Axum's `DefaultBodyLimit` default.
+    /// Request streams exceeding this limit are terminated before the excess bytes are
+    /// buffered. The default is **2 MiB**, matching Axum's `DefaultBodyLimit` default.
     ///
     /// # Example
     /// ```rust,no_run
@@ -323,26 +272,6 @@ where
     #[must_use]
     pub const fn max_connections(mut self, limit: usize) -> Self {
         self.max_connections = limit;
-        self
-    }
-
-    /// Overrides the maximum number of concurrent established WebSocket connections
-    /// (process-wide, default 25,600) — see
-    /// [`Server::max_websocket_connections`](Self#structfield.max_websocket_connections) for
-    /// why these need a ceiling of their own, and how to size it.
-    ///
-    /// Over-budget upgrades are refused with `426 Upgrade Required` before the handshake
-    /// completes, rather than accepted and then starved.
-    // Only `const`-eligible without `ws`, where there's no semaphore to rebuild — not worth
-    // splitting the signature across features for.
-    #[cfg_attr(not(feature = "ws"), allow(clippy::missing_const_for_fn))]
-    #[must_use]
-    pub fn max_websocket_connections(mut self, limit: usize) -> Self {
-        self.max_websocket_connections = limit;
-        #[cfg(feature = "ws")]
-        {
-            self.websocket_permits = Arc::new(tokio::sync::Semaphore::new(limit));
-        }
         self
     }
 
@@ -476,7 +405,7 @@ where
     /// # Errors
     /// Returns an error if the server fails to run.
     pub async fn start_http_addr(self, addr: std::net::SocketAddr) -> Result<(), std::io::Error> {
-        run_worker_pool(self, addr, None, |server, listener| async move {
+        bind_and_serve(self, addr, None, |server, listener| async move {
             server.serve_http(listener).await
         })
         .await
@@ -502,9 +431,8 @@ where
         config: rustls::ServerConfig,
     ) -> Result<(), std::io::Error> {
         let acceptor = TlsAcceptor::from(Arc::new(config));
-        run_worker_pool(self, addr, None, move |server, listener| {
-            let acceptor = acceptor.clone();
-            async move { server.serve_https(listener, acceptor).await }
+        bind_and_serve(self, addr, None, move |server, listener| async move {
+            server.serve_https(listener, acceptor).await
         })
         .await
     }
@@ -546,9 +474,8 @@ where
 
         let addr = parse_addr(tls_addr)?;
         let tls_acceptor = TlsAcceptor::from(config);
-        run_worker_pool(self, addr, None, move |server, listener| {
-            let tls_acceptor = tls_acceptor.clone();
-            async move { server.serve_https(listener, tls_acceptor).await }
+        bind_and_serve(self, addr, None, move |server, listener| async move {
+            server.serve_https(listener, tls_acceptor).await
         })
         .await?;
 
@@ -590,7 +517,7 @@ where
     /// # Example
     ///
     /// ```rust,no_run
-    /// use tachyon_web::{Router, Server, get};
+    /// use tachyon_web::{Router, Server, routing::get};
     ///
     /// async fn hello() -> &'static str { "Hello, HTTPS World!" }
     ///
@@ -690,7 +617,7 @@ where
         let addr = parse_addr(tls_addr)?;
         let redirect_addr = parse_addr(cleartext_addr)?;
         let https_port = parse_port(tls_addr, 443);
-        run_worker_pool(
+        bind_and_serve(
             self,
             addr,
             Some(RedirectInfo {
@@ -698,10 +625,7 @@ where
                 https_port,
                 allowed_hosts: Some(allowed_hosts),
             }),
-            move |server, listener| {
-                let tls_acceptor = tls_acceptor.clone();
-                async move { server.serve_https(listener, tls_acceptor).await }
-            },
+            move |server, listener| async move { server.serve_https(listener, tls_acceptor).await },
         )
         .await?;
 
@@ -768,10 +692,12 @@ where
 
         // Start the HTTPS listener (blocks this task).
         let addr = parse_addr(tls_addr)?;
-        run_worker_pool(self, addr, redirect_info, move |server, listener| {
-            let tls_acceptor = tls_acceptor.clone();
-            async move { server.serve_https(listener, tls_acceptor).await }
-        })
+        bind_and_serve(
+            self,
+            addr,
+            redirect_info,
+            move |server, listener| async move { server.serve_https(listener, tls_acceptor).await },
+        )
         .await?;
 
         Ok(())

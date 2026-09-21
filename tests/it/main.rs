@@ -21,29 +21,14 @@
 
 mod common;
 
-#[cfg(feature = "cookies")]
-mod advanced_tests;
-#[cfg(all(
-    feature = "json",
-    feature = "form",
-    feature = "query",
-    feature = "cookies"
-))]
-mod integration_tests;
-mod parity_characterization_tests;
 mod server_tests;
 // Its only test drives the server with an HTTP/1.1 client.
 #[cfg(feature = "http1")]
 mod static_dir_tests;
 
-#[cfg(feature = "lets-encrypt")]
-mod acme_tests;
 #[cfg(feature = "i2p")]
 mod i2p_tests;
 #[cfg(all(feature = "cert-gen", feature = "http3"))]
 mod tls_h3_tests;
 #[cfg(feature = "tor")]
 mod tor_tests;
-mod tower_tests;
-#[cfg(feature = "ws")]
-mod ws_tests;

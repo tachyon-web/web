@@ -7,13 +7,13 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[cfg(feature = "tls")]
-use crate::http::response::Body;
-#[cfg(feature = "tls")]
 use crate::server::accept::ConnectionLimit;
 #[cfg(all(feature = "tls", feature = "http1"))]
 use crate::server::tuning::tune_http1;
 #[cfg(all(feature = "tls", feature = "http2"))]
 use crate::server::tuning::tune_http2;
+#[cfg(feature = "tls")]
+use axum::body::Body;
 #[cfg(feature = "tls")]
 use hyper::service::service_fn;
 #[cfg(feature = "tls")]
@@ -26,11 +26,11 @@ use hyper::{Request, Response};
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
-pub const REDIRECT_MAX_CONNECTIONS: usize = 2048;
+pub(super) const REDIRECT_MAX_CONNECTIONS: usize = 2048;
 /// Parameters for the plaintext port-80 redirect/ACME-challenge listener spawned alongside a
 /// TLS listener — see [`serve_http_redirect_and_challenges`].
 ///
-/// Always defined (not `#[cfg(feature = "tls")]`) because [`run_worker_pool`]'s signature
+/// Always defined because the shared bind path accepts redirect configuration with or without TLS.
 /// takes `Option<RedirectInfo>` unconditionally — only *constructing* a `Some` (and consuming
 /// it in [`run_worker_thread`]) requires the `tls` feature.
 #[derive(Clone)]
@@ -156,7 +156,7 @@ pub(super) fn resolve_redirect_host<'a>(
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
-pub async fn serve_http_redirect_and_challenges(
+pub(super) async fn serve_http_redirect_and_challenges(
     listener: TcpListener,
     https_port: u16,
     allowed_hosts: Option<Arc<[String]>>,
@@ -206,7 +206,7 @@ pub async fn serve_http_redirect_and_challenges(
                                 let resp = Response::builder()
                                     .status(200)
                                     .header("content-type", "text/plain")
-                                    .body(Body::full(bytes::Bytes::from(key_auth)))
+                                    .body(Body::from(bytes::Bytes::from(key_auth)))
                                     .unwrap_or_else(|_| Response::new(Body::empty()));
                                 return Ok::<_, std::convert::Infallible>(resp);
                             }

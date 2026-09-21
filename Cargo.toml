@@ -16,10 +16,10 @@ categories = ["web-programming", "development-tools::debugging", "development-to
 [dependencies]
 # Async & Concurrency
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util", "fs"] }
-tokio-util = { version = "0.7", features = ["io"] }
 pin-project-lite = "0.2"
 
 # HTTP & Web
+axum = { version = "0.8", default-features = false, features = ["tokio"] }
 hyper = { version = "1", default-features = false, features = ["server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
@@ -39,28 +39,12 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
-serde_urlencoded = { version = "0.7", optional = true }
 
 # Utilities & Performance
 bytes = "1"
-futures-core = { version = "0.3", default-features = false }
 tracing = "0.1"
-matchit = "0.9"
-cookie = { version = "0.18", features = ["percent-encode"], optional = true }
-rustc-hash = "2"
-smallvec = { version = "1", features = ["union"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tower-http = { version = "0.7", default-features = false, features = ["fs"] }
-
-# Optional WebSocket support (see the `ws` feature).
-tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
-
-# Optional `multipart/form-data` support (see the `multipart` feature).
-multer = { version = "3", default-features = false, optional = true }
-
-# WebSocket deflate support.
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"], optional = true }
 
 # Optional native .onion hidden-service support (see the `tor` feature).
 arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
@@ -84,6 +68,7 @@ futures = "0.3"
 hyper = { version = "1", features = ["client", "http2"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tower-http = { version = "0.7", default-features = false, features = ["fs"] }
 
 [features]
 default = [
@@ -92,22 +77,21 @@ default = [
 ]
 
 # Axum-parity features
-http1 = ["hyper/http1", "hyper-util/http1"]
-http2 = ["hyper/http2", "hyper-util/http2"]
-json = ["dep:serde_json"]
-cookies = ["dep:cookie"]
-matched-path = []
-original-uri = []
-tower-log = ["tower/log"]
-ws = ["dep:tungstenite", "dep:futures-util", "dep:flate2"]
-form = ["dep:serde_urlencoded"]
-query = []
-multipart = ["dep:multer"]
+http1 = ["axum/http1", "hyper/http1", "hyper-util/http1"]
+http2 = ["axum/http2", "hyper/http2", "hyper-util/http2"]
+json = ["axum/json", "dep:serde_json"]
+matched-path = ["axum/matched-path"]
+original-uri = ["axum/original-uri"]
+tower-log = ["axum/tower-log", "tower/log"]
+ws = ["axum/ws"]
+form = ["axum/form"]
+query = ["axum/query"]
+multipart = ["axum/multipart"]
 
 # No-op axum-parity features.
 tokio = []
-tracing = []
-macros = []
+tracing = ["axum/tracing"]
+macros = ["axum/macros"]
 
 # Tachyon-only additions
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]
@@ -121,21 +105,11 @@ lets-encrypt = [
     "dep:instant-acme", "dep:webpki", "dep:serde_json", "dep:hyper-rustls", "tls", "cert-gen",
     "hyper-util/client-legacy",
 ]
-sse = ["dep:serde_json"]
 tor = [
     "dep:arti-client", "dep:tor-hsservice", "dep:tor-proto", "dep:tor-cell",
     "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",
 ]
 i2p = ["dep:tachyon-i2p", "tachyon-i2p/aws-lc"]
-
-# Response compression.
-compression-gzip = ["tower-http/compression-gzip"]
-compression-deflate = ["tower-http/compression-deflate"]
-compression-br = ["tower-http/compression-br"]
-compression-zstd = ["tower-http/compression-zstd"]
-compression-full = [
-    "compression-gzip", "compression-deflate", "compression-br", "compression-zstd",
-]
 
 [workspace]
 members = [
@@ -200,10 +174,6 @@ required-features = ["tor", "i2p"]
 [[example]]
 name = "hello_world"
 required-features = ["json", "query"]
-
-[[example]]
-name = "sync_handlers"
-required-features = ["json"]
 
 [package.metadata.docs.rs]
 all-features = true

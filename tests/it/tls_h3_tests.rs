@@ -1,9 +1,9 @@
 use crate::common::{free_loopback_addr, wait_until_listening};
 use reqwest::{Client, Version};
 use std::time::Duration;
-use tachyon_web::http::response::Html;
+use tachyon_web::response::Html;
 use tachyon_web::tls::generate_self_signed_cert;
-use tachyon_web::{Router, Server, get};
+use tachyon_web::{Router, Server, routing::get};
 
 #[derive(Clone, Default)]
 struct AppState {}

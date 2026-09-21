@@ -2,11 +2,11 @@
 //! `.onion` and I2P `.b32.i2p` streams) — factored out so the HTTP/1.1-vs-HTTP/2 protocol
 //! negotiation logic exists exactly once instead of being duplicated per transport.
 
-use crate::http::response::Body;
 #[cfg(feature = "http1")]
 use crate::server::tuning::tune_http1;
 #[cfg(feature = "http2")]
 use crate::server::tuning::tune_http2;
+use axum::body::Body;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Placeholder peer address used where the underlying transport has no real socket address to
 /// report (Tor/I2P both exist specifically to hide the client's real address).
 ///
-/// Every request over Tor/I2P reports the *same* [`ConnectInfo`](crate::routing::extract::ConnectInfo)
+/// Every request over Tor/I2P reports the *same* [`ConnectInfo`](axum::extract::ConnectInfo)
 /// (`0.0.0.0:0`), so per-IP logic keyed on it degrades in two ways worth knowing about before
 /// relying on it: any per-peer rate limiter collapses to a single shared bucket for all
 /// anonymous traffic, and a "trust anything that isn't a global address" check (a common way
@@ -141,7 +141,7 @@ mod tests {
         let (mut client_io, server_io) = tokio::io::duplex(8 * 1024);
 
         let svc = service_fn(|_req: Request<hyper::body::Incoming>| async {
-            Ok::<_, std::io::Error>(Response::new(Body::full(Bytes::from_static(
+            Ok::<_, std::io::Error>(Response::new(Body::from(Bytes::from_static(
                 b"hello from conn",
             ))))
         });

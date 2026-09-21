@@ -41,12 +41,7 @@ jobs:
         run: cargo clippy --locked -p tachyon-web --all-targets
       - uses: dtolnay/rust-toolchain@1.92
       - name: msrv (1.92)
-        run: cargo +1.92 check --locked -p tachyon-web --features ws,sse,tower-log,tls,cert-gen,lets-encrypt,http3,compression-full
-      - uses: dtolnay/rust-toolchain@nightly
-      - name: axum API parity
-        run: python3 scripts/api_diff.py parity
-      - name: public API doc footers
-        run: python3 scripts/api_diff.py docs --check
+        run: cargo +1.92 check --locked -p tachyon-web --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
 
   build:
     name: "${{ matrix.name }}"
@@ -62,11 +57,11 @@ jobs:
           - name: http2 only (h2c, no HTTP/1.1 fallback)
             flags: --no-default-features --features http2
           - name: extractors (no default features)
-            flags: --no-default-features --features http1,json,form,query,cookies,matched-path,original-uri
-          - name: transports + interop (ws, sse, tower-log, tls, acme, http/3)
-            flags: --features ws,sse,tower-log,tls,cert-gen,lets-encrypt,http3
+            flags: --no-default-features --features http1,json,form,query,matched-path,original-uri
+          - name: transports + interop (ws, tower-log, tls, acme, http/3)
+            flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
           - name: full (no tor/i2p)
-            flags: --features ws,sse,tower-log,tls,cert-gen,lets-encrypt,http3,compression-full
+            flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

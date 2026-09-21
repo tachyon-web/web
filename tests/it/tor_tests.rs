@@ -87,7 +87,7 @@ fn onion_config_builder_methods_chain_in_any_order() {
 #[ignore = "needs live Tor network egress; run explicitly with `-- --ignored`"]
 async fn onion_service_round_trip_over_a_real_tor_circuit() {
     use arti_client::{TorClient, TorClientConfig};
-    use tachyon_web::{Server, get};
+    use tachyon_web::{Server, routing::get};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn hello() -> &'static str {

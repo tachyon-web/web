@@ -2,8 +2,6 @@
 
 use super::OnionConfig;
 use super::config::parse_nickname;
-#[cfg(feature = "tls")]
-use crate::http::response::Body;
 use crate::server::Server;
 use crate::server::accept::ConnectionLimit;
 #[cfg(feature = "tls")]
@@ -12,6 +10,8 @@ use crate::server::conn::{NO_PEER_ADDR as ONION_PEER_ADDR, serve_connection};
 use crate::server::http::hyper_handler;
 use arti_client::config::{CfgPath, TorClientConfigBuilder};
 use arti_client::{TorClient, TorClientConfig};
+#[cfg(feature = "tls")]
+use axum::body::Body;
 use futures_util::StreamExt as _;
 #[cfg(feature = "tls")]
 use hyper::{Request, Response};

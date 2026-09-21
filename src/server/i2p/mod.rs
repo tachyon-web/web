@@ -86,7 +86,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::{Router, Server, routing::get};
 //!
 //! async fn hello() -> &'static str { "Hello from an eepsite!" }
 //!
@@ -105,7 +105,7 @@
 //! # Custom data directory and an `on_ready` hook
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::{Router, Server, routing::get};
 //! use tachyon_web::server::i2p::I2pConfig;
 //!
 //! async fn hello() -> &'static str { "Hello, eepsite world!" }

@@ -2,7 +2,8 @@
 
 use std::net::SocketAddr;
 use tachyon_web::http::StatusCode;
-use tachyon_web::{Router, ServeDir, response::IntoResponse, routing::get};
+use tachyon_web::{Router, response::IntoResponse, routing::get};
+use tower_http::services::ServeDir;
 
 async fn not_found_fallback() -> impl IntoResponse {
     (
@@ -30,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let app = Router::new()
         .route("/api/health", get(|| async { "OK" }))
-        .serve_dir("/static", serve_dir)
+        .nest_service("/static", serve_dir)
         .fallback(not_found_fallback)
         .with_state(());
 

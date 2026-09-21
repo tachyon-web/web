@@ -5,8 +5,8 @@
 [![License](https://img.shields.io/badge/license-0BSD-8da0cb.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](#minimum-supported-rust-version)
 
-A multi-protocol web framework for Rust, built on [`hyper`](https://crates.io/crates/hyper) and
-[`s2n-quic`](https://crates.io/crates/s2n-quic): Axum's router and extractor API, and HTTP/1.1,
+A multi-protocol Axum server for Rust, built on [`hyper`](https://crates.io/crates/hyper) and
+[`s2n-quic`](https://crates.io/crates/s2n-quic): Axum itself, plus HTTP/1.1,
 h2c, HTTP/2, HTTP/3, Let's Encrypt, Tor and I2P all
 in one crate rather than five.
 
@@ -31,8 +31,8 @@ For side projects, internal tools, and prototypes, try it and report what broke.
 ## Quick start
 
 ```rust,no_run
-use tachyon_web::{Router, Server, get};
-use tachyon_web::http::response::Html;
+use tachyon_web::{Router, Server, routing::get};
+use tachyon_web::response::Html;
 use tokio::net::TcpListener;
 
 async fn hello_world() -> Html<&'static str> {
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
-Path/query/JSON extraction, middleware, shared state, static files, sync handlers and
+Path/query/JSON extraction, middleware, shared state, static files and
 serving over Tor/I2P each have an example in [`examples/`](examples/), run with
 `cargo run --example <name>`. Some need extra features; the example file says which.
 
@@ -59,7 +59,7 @@ serving over Tor/I2P each have an example in [`examples/`](examples/), run with
 Throwaway self-signed certificate, for development:
 
 ```rust,no_run
-use tachyon_web::{Router, Server, get, tls};
+use tachyon_web::{Router, Server, routing::get, tls};
 
 async fn hello() -> &'static str { "secure hello" }
 
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 the HTTP-01 challenge, disk caching, and renewal 30 days before expiry:
 
 ```rust,no_run
-use tachyon_web::{Router, Server, get};
+use tachyon_web::{Router, Server, routing::get};
 
 async fn hello() -> &'static str { "Hello, secure world!" }
 
@@ -132,14 +132,8 @@ Flags shared with Axum keep Axum's name and default:
 | `original-uri` | on | capturing each request's original URI, and the `OriginalUri` extractor |
 | `form` | on | the `Form` extractor |
 | `query` | on | the `Query` extractor |
-| `cookies` | | request `Cookie` parsing and the `Cookies` extractor/`IntoResponseParts` jar (matching `axum-extra`'s `CookieJar`), and the `cookie` dependency |
 | `tower-log` | on | `tower`'s own `log` feature |
 | `ws` | | WebSocket support (RFC 6455) |
-| `compression-gzip` | | `gzip` response compression |
-| `compression-deflate` | | `deflate` response compression |
-| `compression-br` | | Brotli response compression |
-| `compression-zstd` | | Zstandard response compression |
-| `compression-full` | | all four codings above |
 
 Tachyon's own additions default off, the way Axum treats its extras:
 
@@ -149,7 +143,6 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `cert-gen` | | self-signed certificate generation (`tls::generate_self_signed_cert`); needs `tls` |
 | `http3` | | HTTP/3 over QUIC via `s2n-quic`; needs `tls` |
 | `lets-encrypt` | | automatic Let's Encrypt certificate management; needs `tls`, `cert-gen` |
-| `sse` | | Server-Sent Events (`response::sse::{Event, Sse, KeepAlive}`) |
 | `fips` | | enforce FIPS-mode cryptography at startup; refuses to start otherwise; needs `tls` |
 | `tor` | | Tor v3 `.onion` support (`Server::serve_tor`/`serve_onion`) via `arti-client` |
 | `i2p` | | I2P `.b32.i2p` support (`Server::serve_i2p`/`serve_i2p_config`) via an embedded `libi2pd`. Links `unsafe` FFI — see [Tor and I2P](#tor-and-i2p) |
@@ -166,8 +159,8 @@ service meshes that terminate TLS upstream will.
 
 ## Acknowledgements
 
-[Axum](https://github.com/tokio-rs/axum) is why the API looks the way it does — `Router`,
-extractors, `IntoResponse`. Where this README says "matches Axum", it means someone checked.
+[Axum](https://github.com/tokio-rs/axum) provides `Router`, extractors, responses, and
+middleware directly; Tachyon focuses on hardened transport and deployment integrations.
 [Actix Web](https://github.com/actix/actix-web) inspired treating a per-request allocation as
 a cost worth counting. [Salvo](https://github.com/salvo-rs/salvo) is the reason
 TLS, HTTP/3, and certificate management are built in rather than assembled by every user.

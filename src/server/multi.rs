@@ -1,6 +1,6 @@
 //! Fluent multi-transport server builder — see the [module docs](super#publishing-over-more-than-one-transport-at-once).
 //!
-//! [`MultiServer`] is the preferred way to publish one [`Router`](crate::routing::Router) over
+//! [`MultiServer`] is the preferred way to publish one [`Router`](axum::Router) over
 //! more than one transport at once. It owns exactly the boilerplate a hand-rolled
 //! `tokio::spawn` + `tokio::select!` around individual `serve_*` calls would otherwise require:
 //! one task per configured transport, all driven concurrently, with the whole group torn down

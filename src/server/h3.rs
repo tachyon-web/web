@@ -272,7 +272,7 @@ where
             }
         };
 
-        let req = Request::from_parts(parts, crate::http::response::Body::full(body_bytes));
+        let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
         let full_resp = self.dispatch(req, peer).await;
 
         let (resp_parts, body) = full_resp.into_parts();
@@ -307,8 +307,11 @@ where
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use crate::routing::{Router, get, post};
     use crate::server::Server;
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
     use bytes::{Buf, Bytes};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::Arc;

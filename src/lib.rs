@@ -3,15 +3,14 @@
 //! A multi-protocol web framework: HTTP/1.1, h2c, HTTP/2, HTTP/3, Tor and I2P, with
 //! built-in Let's Encrypt certificate management.
 //!
-//! The router/extractor API mirrors `axum`, so most `axum` handlers compile unmodified.
-//! The exception is Tower middleware, which Tachyon deliberately does not use; the `tower`
-//! feature provides an interop layer for the cases that need it.
+//! Routing, extraction, responses, middleware, and Tower integration are provided directly by
+//! `axum`. Tachyon adds hardened multi-protocol serving without wrapping Axum's application API.
 //!
 //! ## Plain HTTP
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
-//! use tachyon_web::http::response::Html;
+//! use tachyon_web::{Router, Server, routing::get};
+//! use tachyon_web::response::Html;
 //! use tokio::net::TcpListener;
 //!
 //! async fn hello_world() -> Html<&'static str> {
@@ -36,7 +35,7 @@
 //! days before expiry, and hot-swaps the result into the running TLS stack.
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::{Router, Server, routing::get};
 //!
 //! async fn hello() -> &'static str { "Hello, secure world!" }
 //!
@@ -66,7 +65,7 @@
 //! For development or when you manage certificates externally:
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::{Router, Server, routing::get};
 //!
 //! async fn hello() -> &'static str { "secure hello" }
 //!
@@ -93,26 +92,6 @@
 //! }
 //! ```
 //!
-//! ## Response compression
-//!
-//! Compression is a standard Tower layer and therefore applies equally to HTTP/1.1, HTTP/2,
-//! HTTP/3, Tor, and I2P.
-//!
-//! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
-//! use tachyon_web::CompressionLayer;
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//! let app: Router = Router::new()
-//!     .route("/", get(|| async { "hello" }))
-//!     .layer(CompressionLayer::new());
-//! let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-//!
-//! Server::new(app).serve_http(listener).await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
 //! ## Native Tor `.onion` hidden services
 //!
 //! With the `tor` feature, [`Server::serve_tor`] publishes the app directly as a v3 Tor hidden
@@ -120,7 +99,7 @@
 //! with no external `tor` daemon or reverse proxy required:
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::{Router, Server, routing::get};
 //!
 //! async fn hello() -> &'static str { "Hello from an onion service!" }
 //!
@@ -142,7 +121,7 @@
 //! with no external `i2pd`/Java-I2P process required:
 //!
 //! ```rust,no_run
-//! use tachyon_web::{Router, Server, get};
+//! use tachyon_web::{Router, Server, routing::get};
 //!
 //! async fn hello() -> &'static str { "Hello from an eepsite!" }
 //!
@@ -176,7 +155,6 @@
     feature = "original-uri",
     feature = "http1",
     feature = "http2",
-    feature = "cookies",
     feature = "tower-log",
     feature = "ws",
     feature = "form",
@@ -186,10 +164,8 @@
     feature = "http3",
     feature = "fips",
     feature = "lets-encrypt",
-    feature = "sse",
     feature = "tor",
     feature = "i2p",
-    feature = "compression-full",
 ))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
@@ -199,76 +175,10 @@ compile_error!(
     "tachyon-web requires at least one of the \"http1\" or \"http2\" features to serve anything"
 );
 
-pub mod http;
-pub mod routing;
 pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
-#[cfg(feature = "ws")]
-mod ws;
-
-/// Re-export of [`bytes::Bytes`], matching `axum::body::Bytes`.
-pub use bytes::Bytes;
-#[cfg(any(
-    feature = "compression-gzip",
-    feature = "compression-deflate",
-    feature = "compression-br",
-    feature = "compression-zstd",
-))]
-pub use http::compression::{Compression, CompressionLayer};
-pub use http::error::{BoxError, Error, Result};
-pub use http::response;
-pub use http::response::{
-    AppendHeaders, ErrorResponse, Html, IntoResponse, IntoResponseParts, NoContent, Redirect,
-    ResponseParts, TryIntoHeaderError, to_bytes,
-};
-/// Re-export of the `http_body::Body` trait, matching `axum::body::HttpBody`.
-pub use hyper::body::Body as HttpBody;
-pub use routing::error_handling;
-pub use routing::extract;
-#[cfg(feature = "cookies")]
-pub use routing::extract::Cookies;
-#[cfg(feature = "form")]
-pub use routing::extract::Form;
-#[cfg(feature = "json")]
-pub use routing::extract::Json;
-#[cfg(feature = "original-uri")]
-pub use routing::extract::OriginalUri;
-#[cfg(feature = "query")]
-pub use routing::extract::Query;
-pub use routing::extract::{
-    ConnectInfo, Extension, FromRef, FromRequest, FromRequestParts, Host, Path, RawQuery,
-    RequestExt, RequestPartsExt, State,
-};
-pub use routing::handler::{BoxedFuture, BoxedHandler, Handler};
-pub use routing::middleware;
-pub use routing::middleware::Next;
-pub use routing::static_dir::ServeDir;
-pub use routing::tower_compat::ServiceExt;
-pub use routing::{
-    MethodFilter, MethodRouter, Router, RouterError, any, any_service, connect, connect_service,
-    delete, delete_service, get, get_service, head, head_service, on, on_service, options,
-    options_service, patch, patch_service, post, post_service, put, put_service, trace,
-    trace_service,
-};
+pub use axum::*;
 #[cfg(feature = "tls")]
 pub use server::{HttpsServer, RustlsConfig, bind_rustls};
-pub use server::{MultiServer, Server, serve};
-
-/// The body type and body-consuming helpers, at the path `axum::body` uses for them.
-pub mod body {
-    pub use crate::HttpBody;
-    pub use crate::http::response::{Body, BodyDataStream, to_bytes};
-    pub use bytes::Bytes;
-}
-
-/// [`Handler`] and its `Service`-facing wrappers, at the path `axum::handler` uses.
-pub mod handler {
-    pub use crate::routing::handler::Handler;
-    pub use crate::routing::tower_compat::{HandlerService, HandlerWithoutStateExt, Layered};
-
-    /// `Future` types returned by the wrapper types above, matching `axum::handler::future`.
-    pub mod future {
-        pub use crate::routing::tower_compat::{IntoServiceFuture, LayeredFuture};
-    }
-}
+pub use server::{MultiServer, Server};

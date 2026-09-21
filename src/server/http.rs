@@ -1,4 +1,3 @@
-use crate::http::response::Body;
 #[cfg(feature = "tls")]
 use crate::server::TLS_HANDSHAKE_TIMEOUT;
 use crate::server::accept::ConnectionLimit;
@@ -7,6 +6,8 @@ use crate::server::tuning::tune_http1;
 #[cfg(feature = "http2")]
 use crate::server::tuning::tune_http2;
 use crate::server::{REQUEST_TIMEOUT, Server};
+use axum::body::Body;
+use axum::response::IntoResponse as _;
 use bytes::Bytes;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use hyper::service::service_fn;
@@ -33,37 +34,55 @@ pin_project_lite::pin_project! {
         #[pin]
         inner: hyper::body::Incoming,
         deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+        remaining: usize,
+        failed: bool,
     }
 }
 
 impl HyperBody for DeadlineBody {
     type Data = Bytes;
-    type Error = crate::http::error::Error;
+    type Error = axum::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
+        if *this.failed {
+            return Poll::Ready(None);
+        }
         let deadline = this
             .deadline
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(REQUEST_TIMEOUT)));
         if deadline.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Some(Err(crate::http::error::Error::status(
-                hyper::StatusCode::REQUEST_TIMEOUT,
-                "Timed out reading request body",
-            ))));
+            *this.failed = true;
+            return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out reading request body",
+            )))));
         }
         match this.inner.poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let Some(remaining) = this.remaining.checked_sub(data.len()) else {
+                        *this.failed = true;
+                        return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "request body exceeds configured limit",
+                        )))));
+                    };
+                    *this.remaining = remaining;
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(axum::Error::new(e)))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.failed || self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -349,13 +368,15 @@ where
 /// can send complete headers declaring a body and then dribble it forever, pinning a
 /// connection permit for as long as it likes — `serve()` used to map `Incoming` straight into
 /// a `Body`, and so had no body-read timeout at all.
-pub(super) fn body_with_deadline(incoming: hyper::body::Incoming) -> Body {
+pub(super) fn body_with_deadline(incoming: hyper::body::Incoming, max_body_size: usize) -> Body {
     if HyperBody::is_end_stream(&incoming) {
         Body::empty()
     } else {
-        Body::stream(DeadlineBody {
+        Body::new(DeadlineBody {
             inner: incoming,
             deadline: None,
+            remaining: max_body_size,
+            failed: false,
         })
     }
 }
@@ -369,7 +390,14 @@ where
     S: Clone + Send + Sync + 'static,
 {
     let (parts, incoming_body) = req.into_parts();
-    let body = body_with_deadline(incoming_body);
+    if incoming_body
+        .size_hint()
+        .upper()
+        .is_some_and(|size| u64::try_from(state.max_body_size).is_ok_and(|limit| size > limit))
+    {
+        return Ok((hyper::StatusCode::PAYLOAD_TOO_LARGE, Body::empty()).into_response());
+    }
+    let body = body_with_deadline(incoming_body, state.max_body_size);
 
     Ok(state.dispatch(Request::from_parts(parts, body), peer).await)
 }

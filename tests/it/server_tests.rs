@@ -6,9 +6,9 @@ use crate::common::{free_loopback_addr, wait_until_listening};
 use bytes::Bytes;
 #[cfg(feature = "http1")]
 use std::time::Duration;
-use tachyon_web::{Router, Server};
 #[cfg(feature = "http1")]
-use tachyon_web::{get, post};
+use tachyon_web::routing::{get, post};
+use tachyon_web::{Router, Server};
 #[cfg(feature = "http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "http1")]
@@ -138,6 +138,28 @@ async fn test_server_ignores_unread_body_for_bodyless_handler() {
     assert!(resp_str.contains("200"), "response was: {resp_str}");
 
     server_handle.abort();
+}
+
+#[cfg(feature = "http1")]
+#[tokio::test]
+async fn test_server_enforces_transport_body_limit() {
+    let router = Router::new().route("/", post(|_body: Bytes| async { "ok" }));
+    let server = Server::new(router).max_body_size(10);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = server.serve_http(listener).await;
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/"))
+        .body(vec![0_u8; 11])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    handle.abort();
 }
 
 #[cfg(feature = "http1")]

@@ -187,7 +187,7 @@ impl HttpsServer {
     ///
     /// # Errors
     /// Returns an error if compiling the router or running the server fails.
-    pub async fn serve(self, router: crate::routing::Router<()>) -> Result<(), std::io::Error> {
+    pub async fn serve(self, router: axum::Router<()>) -> Result<(), std::io::Error> {
         let server = Server::new(router);
         #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
         let mut rustls_config = (*self.config.server_config).clone();

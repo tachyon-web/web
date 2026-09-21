@@ -1,9 +1,9 @@
-//! Test suite for the `server` module split across `worker_pool.rs` / `redirect.rs` / `tls_config.rs`.
+//! Tests for shared server configuration and helpers.
 
 use super::*;
-use crate::routing::Router;
 #[cfg(feature = "tls")]
 use crate::server::redirect::{host_without_port, resolve_redirect_host};
+use axum::Router;
 
 /// `Server::clone` is hand-written (the field list is feature-gated, so `derive` can't be
 /// used); this catches a field being dropped when a new one is added.
@@ -13,8 +13,7 @@ fn clone_preserves_every_field() {
     #[cfg_attr(not(any(feature = "tls", feature = "http3")), allow(unused_mut))]
     let mut server = Server::new(Router::new())
         .max_body_size(4096)
-        .max_connections(7)
-        .max_websocket_connections(9);
+        .max_connections(7);
     #[cfg(feature = "http3")]
     {
         server = server.max_h3_concurrent_streams(11);
@@ -27,23 +26,8 @@ fn clone_preserves_every_field() {
     let cloned = server.clone();
     assert_eq!(cloned.max_body_size, 4096);
     assert_eq!(cloned.max_connections, 7);
-    assert_eq!(cloned.max_websocket_connections, 9);
     #[cfg(feature = "http3")]
     assert_eq!(cloned.max_h3_concurrent_streams, 11);
-    #[cfg(feature = "ws")]
-    {
-        assert_eq!(cloned.websocket_permits.available_permits(), 9);
-        let _held = server
-            .websocket_permits
-            .clone()
-            .try_acquire_owned()
-            .expect("permit available");
-        assert_eq!(
-            cloned.websocket_permits.available_permits(),
-            8,
-            "clones must draw on one shared budget"
-        );
-    }
     #[cfg(feature = "tls")]
     assert!(cloned.tls_policy.is_some());
 }

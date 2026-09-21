@@ -1,19 +1,17 @@
-//! Address binding shared by the convenience `start_*` methods.
-
 use std::future::Future;
+
 use tokio::net::TcpListener;
 
-use crate::server::redirect::RedirectInfo;
+use super::redirect::RedirectInfo;
 #[cfg(feature = "tls")]
-use crate::server::redirect::serve_http_redirect_and_challenges;
-use crate::server::{Server, enforce_fips_compliance};
+use super::redirect::serve_http_redirect_and_challenges;
+use super::{Server, enforce_fips_compliance};
 
-/// Binds one listener and serves it on the caller's Tokio runtime.
-pub(super) async fn run_worker_pool<S, F, Fut>(
+pub(super) async fn bind_and_serve<S, F, Fut>(
     server: Server<S>,
     addr: std::net::SocketAddr,
-    redirect_info: Option<RedirectInfo>,
-    serve_fn: F,
+    redirect: Option<RedirectInfo>,
+    serve: F,
 ) -> Result<(), std::io::Error>
 where
     S: Clone + Send + Sync + 'static,
@@ -23,10 +21,10 @@ where
     enforce_fips_compliance()?;
 
     #[cfg(not(feature = "tls"))]
-    let _ = redirect_info;
+    let _ = redirect;
 
     #[cfg(feature = "tls")]
-    if let Some(info) = redirect_info {
+    if let Some(info) = redirect {
         let listener = TcpListener::bind(info.addr).await?;
         drop(tokio::spawn(async move {
             serve_http_redirect_and_challenges(listener, info.https_port, info.allowed_hosts).await;
@@ -34,5 +32,5 @@ where
     }
 
     let listener = TcpListener::bind(addr).await?;
-    serve_fn(server, listener).await
+    serve(server, listener).await
 }
