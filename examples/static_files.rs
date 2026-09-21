@@ -26,10 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )?;
     }
 
-    let serve_dir = ServeDir::new("public")
-        .index("index.html")
-        .preload()
-        .await?;
+    let serve_dir = ServeDir::new("public").append_index_html_on_directories(true);
 
     let app = Router::new()
         .route("/api/health", get(|| async { "OK" }))

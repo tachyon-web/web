@@ -426,10 +426,7 @@ async fn test_serve_file_missing_returns_err() {
 async fn test_static_dir_path_traversal_blocked() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("safe.txt"), b"safe").unwrap();
-    let serve = tachyon_web::ServeDir::new(dir.path())
-        .preload()
-        .await
-        .unwrap();
+    let serve = tachyon_web::ServeDir::new(dir.path());
     let app = Router::new().serve_dir("/files", serve);
     let server = spawn_server(app).await;
     let res = server.get("/files/../../etc/passwd").send().await.unwrap();
@@ -618,7 +615,7 @@ mod extractor_unit {
         let fpath = dir.path().join("hello space.txt");
         std::fs::write(&fpath, b"hello space content").unwrap();
 
-        let serve = ServeDir::new(dir.path()).preload().await.unwrap();
+        let serve = ServeDir::new(dir.path());
         let router = Router::new().serve_dir("/files", serve);
         let server = spawn_server(router).await;
 

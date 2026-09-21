@@ -3,7 +3,7 @@
 //!
 //! [`crate::serve()`] drives a real accept loop directly against whatever `Listener` it's given —
 //! [`Listener::accept`] runs on every iteration, exactly as it would with axum. This is a
-//! separate accept path from [`crate::server::Server`]'s own `SO_REUSEPORT` worker pool, which
+//! separate accept path from [`crate::server::Server`]'s own accept loop, which
 //! binds its own sockets from a `SocketAddr` rather than accepting through a pre-built listener
 //! object at all; see [`crate::server::serve`]'s module docs for when to reach for which.
 

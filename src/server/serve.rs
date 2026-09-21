@@ -1,15 +1,7 @@
 //! `axum::serve`'s generic `serve`/`Serve`/`WithGracefulShutdown`/`IncomingStream`.
 //!
-//! Backed by a real per-listener accept loop — matching axum's own model exactly, rather than
-//! delegating to [`crate::server::Server`]'s `SO_REUSEPORT` worker pool.
-//!
-//! [`Server::serve_http`](crate::server::Server::serve_http)/`.start_http_addr()`/etc. keep the
-//! worker-pool architecture entirely — this module only covers the free-standing
-//! [`serve()`](fn@serve) entry point, so it can match axum's generic-`MakeService` signature
-//! (and, transitively, [`IncomingStream`]'s shape) byte for byte. That does mean this specific
-//! entry point no longer gets the worker pool's multi-core accept scaling: reach for
-//! [`Server::serve_http`](crate::server::Server::serve_http)/`.start_http_addr()` instead if
-//! that matters more to you than the axum-drop-in signature.
+//! Backed by a per-listener accept loop matching axum's model. This module covers the
+//! free-standing [`serve()`](fn@serve) entry point and its generic `MakeService` signature.
 //!
 //! # Where this deliberately diverges from axum
 //!
@@ -96,7 +88,7 @@ where
     L: Listener,
 {
     /// Runs until either the accept loop errors or `signal` resolves — and, unlike
-    /// [`crate::server::Server`]'s worker pool, actually stops accepting new connections and
+    /// [`crate::server::Server`]'s convenience methods, stops accepting new connections and
     /// gracefully drains every in-flight one (via `.graceful_shutdown()`) before returning.
     /// Matches `axum::serve::Serve::with_graceful_shutdown`.
     pub fn with_graceful_shutdown<F>(self, signal: F) -> WithGracefulShutdown<L, M, S, F>

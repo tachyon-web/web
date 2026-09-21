@@ -95,23 +95,20 @@
 //!
 //! ## Response compression
 //!
-//! With any `compression-*` feature, [`Server::compression`] negotiates `zstd`, `br`, `gzip`
-//! or `deflate` per request and applies it to every transport above at once — see
-//! [`http::compression`] for what is and isn't compressed, and
-//! [`Router::compression`] to scope it to one router.
+//! Compression is a standard Tower layer and therefore applies equally to HTTP/1.1, HTTP/2,
+//! HTTP/3, Tor, and I2P.
 //!
 //! ```rust,no_run
 //! use tachyon_web::{Router, Server, get};
-//! use tachyon_web::http::compression::Compression;
+//! use tachyon_web::CompressionLayer;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//! let app: Router = Router::new().route("/", get(|| async { "hello" }));
+//! let app: Router = Router::new()
+//!     .route("/", get(|| async { "hello" }))
+//!     .layer(CompressionLayer::new());
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
 //!
-//! Server::new(app)
-//!     .compression(Compression::new())
-//!     .serve_http(listener)
-//!     .await?;
+//! Server::new(app).serve_http(listener).await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -212,7 +209,13 @@ mod ws;
 
 /// Re-export of [`bytes::Bytes`], matching `axum::body::Bytes`.
 pub use bytes::Bytes;
-pub use http::compression::{Compression, CompressionLevel, Encoding};
+#[cfg(any(
+    feature = "compression-gzip",
+    feature = "compression-deflate",
+    feature = "compression-br",
+    feature = "compression-zstd",
+))]
+pub use http::compression::{Compression, CompressionLayer};
 pub use http::error::{BoxError, Error, Result};
 pub use http::response;
 pub use http::response::{

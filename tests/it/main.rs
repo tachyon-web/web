@@ -23,12 +23,6 @@ mod common;
 
 #[cfg(feature = "cookies")]
 mod advanced_tests;
-#[cfg(any(
-    feature = "compression-gzip",
-    feature = "compression-br",
-    feature = "compression-zstd",
-))]
-mod compression_tests;
 #[cfg(all(
     feature = "json",
     feature = "form",

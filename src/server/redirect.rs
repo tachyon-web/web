@@ -148,7 +148,7 @@ pub(super) fn resolve_redirect_host<'a>(
 /// `308` rather than `301` because it preserves the request method, so redirected `POST`s stay
 /// `POST`s.
 ///
-/// Concurrency is capped at [`REDIRECT_MAX_CONNECTIONS`] per worker. This listener is bound to
+/// Concurrency is capped at [`REDIRECT_MAX_CONNECTIONS`]. This listener is bound to
 /// port 80 and therefore reachable by anyone, but it answers only redirects and ACME
 /// challenges — it never reaches the router — so it uses its own fixed ceiling rather than
 /// [`crate::server::Server::max_connections`], which sizes the listener that actually runs application

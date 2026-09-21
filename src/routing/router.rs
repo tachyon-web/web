@@ -1,7 +1,7 @@
 //! [`Router`]: the main route-table builder API, plus [`RouterError`].
 
 use bytes::Bytes;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 use std::sync::Arc;
 
 use crate::http::response::Body;
@@ -304,10 +304,8 @@ where
 
     /// Serve an entire directory as static files — the simplest, Nginx-like API.
     ///
-    /// Serves directly from disk on every request; it does not call
-    /// [`static_dir::ServeDir::preload`], so `CacheConfig::enabled`'s default of
-    /// `true` has no effect here. Use [`serve_dir`](Self::serve_dir) with a
-    /// manually-preloaded `ServeDir` if you want the in-memory RAM cache.
+    /// Files are streamed from disk by `tower-http`, including range and conditional request
+    /// handling.
     ///
     /// Do not point `dir_path` at a directory that can ever contain files an
     /// untrusted user chose the bytes of (e.g. an upload folder mixed into the
@@ -326,63 +324,50 @@ where
     /// ```
     #[must_use]
     pub fn serve_static(self, dir_path: impl AsRef<std::path::Path>) -> Self {
-        let sd = static_dir::ServeDir::new(&dir_path).index("index.html");
+        let sd = static_dir::ServeDir::new(dir_path).append_index_html_on_directories(true);
         self.serve_dir("/", sd)
     }
 
     /// Serve an entire static directory under a URL prefix with full configuration control.
     ///
-    /// Registers `prefix/*path` for files, plus the bare `prefix` and `prefix/` so a
-    /// directory request reaches the [`index`](static_dir::ServeDir::index) — a `matchit`
-    /// `{*path}` never matches an empty remainder, so the wildcard alone can't serve either.
-    ///
     /// Use `serve_static()` for the common case of serving a dir at `/`. See
-    /// [`static_dir::ServeDir`]'s docs for the upload-safety warning before
-    /// serving a directory that can contain user-supplied files.
+    /// [`tower_http::services::ServeDir`]'s docs before serving a directory that can contain
+    /// user-supplied files.
     #[must_use]
-    pub fn serve_dir(mut self, prefix: &str, serve_dir: static_dir::ServeDir) -> Self {
+    pub fn serve_dir(self, prefix: &str, serve_dir: static_dir::ServeDir) -> Self {
         let prefix = prefix.trim_end_matches('/');
-        let exact_route = if prefix.is_empty() { "/" } else { prefix };
-        let wildcard_route = format!("{prefix}/*path");
-
-        self = self.route(exact_route, serve_dir.clone().into_method_router_at(prefix));
-        // At the root `exact_route` is already `/`; registering it again would be a duplicate.
-        if !prefix.is_empty() {
-            self = self.route(
-                &format!("{prefix}/"),
-                serve_dir.clone().into_method_router_at(prefix),
-            );
-        }
-        self = self.route(&wildcard_route, serve_dir.into_method_router_at(prefix));
-        self
+        let exact = if prefix.is_empty() { "/" } else { prefix };
+        let handler = tower_compat::ServiceHandler {
+            service: serve_dir,
+            strip_prefix: Some(Arc::from(prefix)),
+        };
+        let router = self.route(exact, all_methods(handler.clone()));
+        let router = if prefix.is_empty() {
+            router
+        } else {
+            router.route(&format!("{prefix}/"), all_methods(handler.clone()))
+        };
+        router.route(
+            &format!("{prefix}/*__tachyon_static_rest"),
+            all_methods(handler),
+        )
     }
 
     /// Natively serve a specific file on a specific route.
     ///
-    /// The file is read **once at startup** into a `Bytes` buffer. Every subsequent
-    /// request is served from that buffer with **zero I/O and zero allocations**,
-    /// rivalling `include_bytes!` without inflating the binary.
-    ///
     /// # Errors
-    /// Returns an `Err` if the file cannot be read at startup.
+    /// Returns an `Err` if the path does not name a regular file at startup.
     pub fn serve_file(self, path: &str, file_path: &str) -> Result<Self, std::io::Error> {
-        let content = std::fs::read(file_path)?;
-        let content_bytes = Bytes::from(content);
-        let mime_type = static_dir::guess_mime_type(std::path::Path::new(file_path));
-
+        let metadata = std::fs::metadata(file_path)?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "static file path is not a regular file",
+            ));
+        }
         Ok(self.route(
             path,
-            get(move |_req: Request<Body>| {
-                let body_content = content_bytes.clone();
-                async move {
-                    let mut resp = Response::new(Body::full(body_content));
-                    let mime_val = hyper::header::HeaderValue::from_static(mime_type);
-                    let _ = resp
-                        .headers_mut()
-                        .insert(hyper::header::CONTENT_TYPE, mime_val);
-                    resp
-                }
-            }),
+            crate::routing::get_service(static_dir::ServeFile::new(file_path)),
         ))
     }
 
@@ -392,27 +377,9 @@ where
     /// change frequently where startup preloading is undesirable.
     #[must_use]
     pub fn serve_file_dynamic(self, path: &str, file_path: &str) -> Self {
-        let file_path_str = file_path.to_string();
-        let mime_type = static_dir::guess_mime_type(std::path::Path::new(file_path));
-
         self.route(
             path,
-            get(move |_req: Request<Body>| {
-                let fp = file_path_str.clone();
-                async move {
-                    let Ok(content) = tokio::fs::read(&fp).await else {
-                        let mut resp = Response::new(Body::empty());
-                        *resp.status_mut() = StatusCode::NOT_FOUND;
-                        return resp;
-                    };
-                    let mut resp = Response::new(Body::full(Bytes::from(content)));
-                    let mime_val = hyper::header::HeaderValue::from_static(mime_type);
-                    let _ = resp
-                        .headers_mut()
-                        .insert(hyper::header::CONTENT_TYPE, mime_val);
-                    resp
-                }
-            }),
+            crate::routing::get_service(static_dir::ServeFile::new(file_path)),
         )
     }
 
@@ -696,54 +663,6 @@ where
     #[must_use]
     pub const fn without_v07_checks(self) -> Self {
         self
-    }
-
-    /// Compresses responses from this router's routes, negotiating the coding against each
-    /// request's `Accept-Encoding`.
-    ///
-    /// Scoped to the routes registered **so far** — like [`layer`](Self::layer), it wraps
-    /// the current route table rather than a later one, so call it after the routes it
-    /// should cover. To compress everything a server produces regardless of which router
-    /// answered, use [`Server::compression`](crate::Server::compression) instead.
-    ///
-    /// See [`http::compression`](crate::http::compression) for what is and is not
-    /// compressed.
-    ///
-    /// ```rust
-    /// use tachyon_web::{Router, get};
-    /// use tachyon_web::http::compression::Compression;
-    ///
-    /// let app: Router = Router::new()
-    ///     .route("/api/report", get(|| async { "a large JSON report" }))
-    ///     .compression(Compression::new());
-    /// ```
-    #[must_use]
-    pub fn compression(self, compression: crate::http::compression::Compression) -> Self {
-        // One `Arc` for the whole router rather than a `Compression` clone per request: the
-        // config is read-only once built, so every request can share the same one.
-        let compression = std::sync::Arc::new(compression);
-        self.layer(middleware::from_fn(
-            move |req: crate::http::Request, next: middleware::Next| {
-                let compression = std::sync::Arc::clone(&compression);
-                async move {
-                    // Taken before `next.run` consumes the request; the response it returns is
-                    // what gets negotiated against. Cloning the `HeaderValue` rather than
-                    // copying out a `String` keeps this to a refcount bump on its bytes.
-                    let accept_encoding =
-                        req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
-                    let response = next.run(req).await;
-                    match accept_encoding
-                        .as_ref()
-                        .and_then(|value| value.to_str().ok())
-                    {
-                        Some(accept_encoding) => {
-                            compression.apply_to(accept_encoding, response).await
-                        }
-                        None => response,
-                    }
-                }
-            },
-        ))
     }
 
     /// Route an incoming request directly, compiling the router on the fly.

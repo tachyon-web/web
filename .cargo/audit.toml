@@ -1,12 +1,4 @@
 # cargo-audit configuration.
-#
-# Every entry below is an advisory that is real but that this crate cannot act on: the
-# affected code is reached only through a transitive dependency with no patched release
-# available. Each one is listed with why it is not exploitable here and what would let us
-# drop the exemption — an ignore without that reasoning is just a silenced alarm.
-#
-# Re-check this list whenever `Cargo.lock` changes. Anything that becomes fixable upstream
-# should be fixed and removed from here, not left to rot.
 
 [advisories]
 ignore = [

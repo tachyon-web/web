@@ -6,8 +6,8 @@
 [![Rust](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](#minimum-supported-rust-version)
 
 A multi-protocol web framework for Rust, built on [`hyper`](https://crates.io/crates/hyper) and
-[`s2n-quic`](https://crates.io/crates/s2n-quic): Axum's router and extractor API, per-core
-`SO_REUSEPORT` workers, and HTTP/1.1, h2c, HTTP/2, HTTP/3, Let's Encrypt, Tor and I2P all
+[`s2n-quic`](https://crates.io/crates/s2n-quic): Axum's router and extractor API, and HTTP/1.1,
+h2c, HTTP/2, HTTP/3, Let's Encrypt, Tor and I2P all
 in one crate rather than five.
 
 ## ⚠️ Read this before depending on it
@@ -168,9 +168,8 @@ service meshes that terminate TLS upstream will.
 
 [Axum](https://github.com/tokio-rs/axum) is why the API looks the way it does — `Router`,
 extractors, `IntoResponse`. Where this README says "matches Axum", it means someone checked.
-[Actix Web](https://github.com/actix/actix-web) is where the performance approach comes from:
-per-core `SO_REUSEPORT` workers, thread-local buffer reuse, and treating a per-request
-allocation as a cost worth counting. [Salvo](https://github.com/salvo-rs/salvo) is the reason
+[Actix Web](https://github.com/actix/actix-web) inspired treating a per-request allocation as
+a cost worth counting. [Salvo](https://github.com/salvo-rs/salvo) is the reason
 TLS, HTTP/3, and certificate management are built in rather than assembled by every user.
 
 ## License

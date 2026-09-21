@@ -71,6 +71,7 @@ impl Error {
     /// built `Error::Internal(msg)` — these have no defined client-facing status, so they
     /// render as a generic `500` via [`IntoResponse for Error`](#impl-IntoResponse-for-Error)
     /// same as any other opaque error.
+    #[cfg(any(feature = "ws", feature = "sse", test))]
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             inner: Box::new(Message(message.into())),
@@ -110,14 +111,17 @@ impl std::error::Error for StatusError {}
 
 /// A plain string wrapped as a [`std::error::Error`], for [`Error::internal`].
 #[derive(Debug)]
+#[cfg(any(feature = "ws", feature = "sse", test))]
 struct Message(String);
 
+#[cfg(any(feature = "ws", feature = "sse", test))]
 impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
+#[cfg(any(feature = "ws", feature = "sse", test))]
 impl std::error::Error for Message {}
 
 impl std::fmt::Display for Error {

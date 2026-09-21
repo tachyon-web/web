@@ -51,7 +51,7 @@ where
 /// Like [`serve_connection`], but drives the connection to a graceful close (finish in-flight
 /// requests, refuse new ones on the same connection) as soon as `shutdown` resolves, instead of
 /// running until the peer disconnects. Used by [`crate::server::serve`]'s
-/// `.with_graceful_shutdown()`, which — unlike [`crate::server::Server`]'s own worker-pool
+/// `.with_graceful_shutdown()`, which — unlike [`crate::server::Server`]'s own convenience
 /// accept loop — drives this connection directly and so can cooperate with a real per-connection
 /// shutdown signal.
 pub(super) async fn serve_connection_graceful<IO, Svc, Sig>(

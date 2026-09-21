@@ -99,7 +99,6 @@ pub(crate) use tls_config::alpn_protocols;
 use tls_config::assert_fips_server_config;
 #[cfg(any(feature = "lets-encrypt", feature = "cert-gen"))]
 use tls_config::tls_config_builder;
-use worker_pool::IS_LOCAL_WORKER;
 use worker_pool::run_worker_pool;
 
 /// Default read timeout for both plaintext and TLS connections.
@@ -165,24 +164,11 @@ pub struct Server<S> {
     /// Maximum permitted request body size in bytes (default: 2 MiB, matching
     /// Axum's `DefaultBodyLimit` default).
     pub max_body_size: usize,
-    /// Maximum number of concurrent active TCP connections **per worker thread**.
+    /// Maximum number of concurrent active connections per transport.
     ///
-    /// Tachyon runs one worker (with its own `SO_REUSEPORT` listener and connection
-    /// semaphore) per CPU core, so the effective process-wide ceiling is
-    /// `max_connections × number of cores`, not a single global cap. Size this
-    /// accordingly if you're relying on it for downstream resource planning (e.g.
-    /// a connection-pooled database sized to the server's max concurrency).
-    ///
-    /// This per-core sharding applies to [`serve_http`] and [`serve_https`]
-    /// (and anything built on them, like [`serve_all_acme`]). HTTP/3
-    /// ([`serve_h3`]) runs a single QUIC endpoint with its own connection
-    /// semaphore, not sharded across the worker pool — for H3 traffic the
-    /// effective ceiling is `max_connections` alone. The same is true of the
-    /// anonymity transports (`serve_tor`/`serve_onion`/`serve_i2p` and their
-    /// `_with_client`/`_with_router` variants, behind the `tor`/`i2p`
-    /// features): each runs one accept loop with its own semaphore, so
-    /// `max_connections` is the whole ceiling for that transport rather than a
-    /// per-core share.
+    /// Each transport owns one listener and one connection semaphore, so this is a
+    /// process-wide ceiling for that transport. Size it for downstream resources such as
+    /// database pools as well as for the server itself.
     ///
     /// [`serve_http`]: Server::serve_http
     /// [`serve_https`]: Server::serve_https
@@ -193,8 +179,7 @@ pub struct Server<S> {
     /// enforces [`DEFAULT_MAX_CONNECTIONS`] as a fixed ceiling instead — axum leaves that
     /// entry point uncapped, but an unbounded accept loop is not a default worth matching.
     ///
-    /// Default: 25,600 — matching `actix-server`'s own per-worker
-    /// `max_concurrent_connections`.
+    /// Default: 25,600.
     pub max_connections: usize,
     /// Maximum number of concurrent established WebSocket connections, process-wide.
     ///
@@ -203,8 +188,7 @@ pub struct Server<S> {
     /// that permit while the WebSocket lives on in its own task. Without this ceiling a peer
     /// can hold open an unbounded number of them.
     ///
-    /// Process-wide rather than per-worker — one semaphore shared by every worker clone and
-    /// every transport.
+    /// One semaphore is shared by every clone and transport.
     ///
     /// Size it by memory, not connection count: tungstenite defaults to a 128 KiB read plus
     /// 128 KiB write buffer per socket, so the default is worth several GiB at saturation.
@@ -214,8 +198,7 @@ pub struct Server<S> {
     ///
     /// Default: 25,600.
     pub max_websocket_connections: usize,
-    /// Backs [`max_websocket_connections`](Self::max_websocket_connections). Shared by clone,
-    /// not rebuilt per worker — that's what makes the limit process-wide.
+    /// Backs [`max_websocket_connections`](Self::max_websocket_connections).
     #[cfg(feature = "ws")]
     pub(crate) websocket_permits: Arc<tokio::sync::Semaphore>,
     /// Maximum number of HTTP/3 streams handled concurrently **per QUIC connection** — see
@@ -240,9 +223,6 @@ pub struct Server<S> {
     /// [`TlsPolicy::new`](crate::tls::TlsPolicy::new).
     #[cfg(feature = "tls")]
     pub(crate) tls_policy: Option<crate::tls::TlsPolicy>,
-    /// Response compression, applied to every transport — see [`Server::compression`].
-    /// `None` (the default) sends every response uncoded.
-    pub(crate) compression: Option<crate::http::compression::Compression>,
 }
 
 impl<S> Clone for Server<S>
@@ -261,7 +241,6 @@ where
             max_h3_concurrent_streams: self.max_h3_concurrent_streams,
             #[cfg(feature = "tls")]
             tls_policy: self.tls_policy.clone(),
-            compression: self.compression.clone(),
         }
     }
 }
@@ -288,7 +267,6 @@ impl Server<()> {
             max_h3_concurrent_streams: DEFAULT_MAX_H3_CONCURRENT_STREAMS,
             #[cfg(feature = "tls")]
             tls_policy: None,
-            compression: None,
         }
     }
 }
@@ -320,50 +298,7 @@ where
         #[cfg(feature = "ws")]
         let _ = extensions.insert(crate::ws::WebSocketLimit(self.websocket_permits.clone()));
 
-        let Some(compression) = self.compression.as_ref() else {
-            return self.router.handle_request(req).await;
-        };
-        // Taken before the request is consumed, because negotiation happens once the
-        // handler has run and the request is gone by then. Cloning the `HeaderValue` rather
-        // than copying out a `String` keeps this to a refcount bump on its backing bytes.
-        let accept_encoding = req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
-        let response = self.router.handle_request(req).await;
-        match accept_encoding
-            .as_ref()
-            .and_then(|value| value.to_str().ok())
-        {
-            Some(accept_encoding) => compression.apply_to(accept_encoding, response).await,
-            None => response,
-        }
-    }
-
-    /// Compresses responses on every transport this `Server` runs, negotiating the coding
-    /// against each request's `Accept-Encoding`.
-    ///
-    /// Applied once, at the point every transport funnels through, so HTTP/1.1, HTTP/2,
-    /// HTTP/3, `.onion` and `.i2p` traffic all get identical treatment — including
-    /// responses from [`ServeDir`](crate::ServeDir), fallbacks, and error paths that never
-    /// reach a handler.
-    ///
-    /// See [`http::compression`](crate::http::compression) for what is and is not
-    /// compressed, and [`Router::compression`](crate::Router::compression) to scope it to
-    /// one router instead.
-    ///
-    /// ```rust,no_run
-    /// # use tachyon_web::{Router, Server};
-    /// use tachyon_web::http::compression::{Compression, CompressionLevel, Encoding};
-    ///
-    /// # let app: Router = Router::new();
-    /// let server = Server::new(app).compression(
-    ///     Compression::new()
-    ///         .preference([Encoding::Zstd, Encoding::Gzip])
-    ///         .quality(CompressionLevel::Fastest),
-    /// );
-    /// ```
-    #[must_use]
-    pub fn compression(mut self, compression: crate::http::compression::Compression) -> Self {
-        self.compression = Some(compression);
-        self
+        self.router.handle_request(req).await
     }
 
     /// Overrides the maximum request body size (in bytes).
@@ -384,9 +319,7 @@ where
         self
     }
 
-    /// Overrides the maximum number of concurrent connections **per worker thread**
-    /// (default: 25,600 — see [`Server::max_connections`] for why this isn't a
-    /// single process-wide cap).
+    /// Overrides the maximum number of concurrent connections per transport.
     #[must_use]
     pub const fn max_connections(mut self, limit: usize) -> Self {
         self.max_connections = limit;
@@ -568,11 +501,6 @@ where
         addr: std::net::SocketAddr,
         config: rustls::ServerConfig,
     ) -> Result<(), std::io::Error> {
-        // One acceptor shared by every worker rather than a `ServerConfig` deep-cloned per
-        // core: `TlsAcceptor` is `Arc`-backed, so cloning it is a refcount bump, and the
-        // workers then share one TLS session cache — separate caches would mean a resuming
-        // client that `SO_REUSEPORT` steers to a different worker falls back to a full
-        // handshake.
         let acceptor = TlsAcceptor::from(Arc::new(config));
         run_worker_pool(self, addr, None, move |server, listener| {
             let acceptor = acceptor.clone();

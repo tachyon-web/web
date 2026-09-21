@@ -6,7 +6,7 @@ use crate::server::accept::ConnectionLimit;
 use crate::server::tuning::tune_http1;
 #[cfg(feature = "http2")]
 use crate::server::tuning::tune_http2;
-use crate::server::{IS_LOCAL_WORKER, REQUEST_TIMEOUT, Server};
+use crate::server::{REQUEST_TIMEOUT, Server};
 use bytes::Bytes;
 use hyper::body::{Body as HyperBody, Frame, SizeHint};
 use hyper::service::service_fn;
@@ -131,21 +131,13 @@ async fn accept_tuned(
     }
 }
 
-/// Spawns a per-connection task on the current worker.
-///
-/// `run_worker_pool` runs one `current_thread` runtime plus `LocalSet` per core, where
-/// `spawn_local` avoids a cross-thread handoff. On a plain multi-thread runtime there's no
-/// `LocalSet`, so this falls back to `tokio::spawn`.
+/// Spawns a per-connection task on the current Tokio runtime.
 pub(super) fn spawn_connection<F>(fut: F)
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if IS_LOCAL_WORKER.get() {
-        drop(tokio::task::spawn_local(fut));
-    } else {
-        drop(tokio::spawn(fut));
-    }
+    drop(tokio::spawn(fut));
 }
 
 #[cfg(feature = "http2")]

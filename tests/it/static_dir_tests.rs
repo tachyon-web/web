@@ -11,11 +11,7 @@ async fn test_static_dir_serving() {
     fs::write(dir.path().join("index.html"), "<h1>Home</h1>").expect("write html");
     fs::write(dir.path().join("style.css"), "body { color: red; }").expect("write css");
 
-    let static_service = ServeDir::new(dir.path())
-        .index("index.html")
-        .preload()
-        .await
-        .expect("preload");
+    let static_service = ServeDir::new(dir.path()).append_index_html_on_directories(true);
 
     // Serve at / — root → index.html, /style.css → style.css
     let app: Router<()> = Router::new().serve_dir("/", static_service);

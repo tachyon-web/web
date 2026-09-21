@@ -465,7 +465,7 @@ async fn test_serve_dir_under_a_prefix_serves_index_and_files() {
     std::fs::create_dir(dir.path().join("deep")).unwrap();
     std::fs::write(dir.path().join("deep/index.html"), b"<h1>deep</h1>").unwrap();
 
-    let sd = static_dir::ServeDir::new(dir.path()).index("index.html");
+    let sd = static_dir::ServeDir::new(dir.path()).append_index_html_on_directories(true);
     let app = Router::new()
         .serve_dir("/assets", sd)
         .with_state::<()>(())
