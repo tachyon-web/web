@@ -51,6 +51,15 @@ mod cert_gen {
 #[cfg(feature = "cert-gen")]
 pub use cert_gen::{SelfSignedCert, generate_self_signed_cert};
 
+#[cfg(feature = "cert-gen")]
+pub(crate) fn certificate_dns_names(
+    cert: &rustls::pki_types::CertificateDer<'static>,
+) -> Vec<String> {
+    webpki::EndEntityCert::try_from(cert)
+        .map(|cert| cert.valid_dns_names().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
 /// PEM parsing, on `rustls-pki-types`' own [`PemObject`] implementation.
 ///
 /// [`PemObject`]: rustls::pki_types::pem::PemObject

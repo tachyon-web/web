@@ -271,10 +271,11 @@ where
         self
     }
 
-    /// Overrides the maximum number of concurrent connections per transport.
+    /// Overrides the maximum number of concurrent connections per transport. Values below one
+    /// are clamped to one so a configuration mistake cannot permanently stop acceptance.
     #[must_use]
     pub const fn max_connections(mut self, limit: usize) -> Self {
-        self.max_connections = limit;
+        self.max_connections = if limit == 0 { 1 } else { limit };
         self
     }
 
@@ -283,12 +284,12 @@ where
     /// [`Server::max_h3_concurrent_streams`](Self#structfield.max_h3_concurrent_streams) for how
     /// this differs from [`max_connections`](Self::max_connections).
     ///
-    /// Once a connection is at its limit, accepting its next stream simply waits for an
-    /// in-flight one to finish rather than accepting it and starving the rest.
+    /// Once a connection is at its limit, additional streams are refused. Values below one are
+    /// clamped to one so a configuration mistake cannot permanently stop stream processing.
     #[cfg(feature = "http3")]
     #[must_use]
     pub const fn max_h3_concurrent_streams(mut self, limit: usize) -> Self {
-        self.max_h3_concurrent_streams = limit;
+        self.max_h3_concurrent_streams = if limit == 0 { 1 } else { limit };
         self
     }
 
@@ -651,8 +652,17 @@ where
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
         enforce_fips_compliance()?;
+        let addr = parse_addr(tls_addr)?;
 
         let cert_chain: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_pem.as_bytes());
+        let mut allowed_hosts = cert_chain
+            .first()
+            .map(crate::tls::certificate_dns_names)
+            .unwrap_or_default();
+        if !addr.ip().is_unspecified() {
+            allowed_hosts.push(addr.ip().to_string());
+        }
+        let allowed_hosts: Arc<[String]> = allowed_hosts.into();
 
         let key_der: PrivateKeyDer<'static> = crate::tls::pem::private_key(key_pem.as_bytes())
             .map_err(|e| crate::tls::pem::key_io_error(&e))?;
@@ -682,10 +692,7 @@ where
                 parse_addr(cleartext_addr).map(|addr| RedirectInfo {
                     addr,
                     https_port,
-                    // No domain list is available here (only the cert/key PEM) — falls back
-                    // to echoing the request's `Host` unchecked, as before. Prefer
-                    // `serve_all_acme` when the domain list is known.
-                    allowed_hosts: None,
+                    allowed_hosts: Some(allowed_hosts.clone()),
                 })
             })
             .transpose()?;
@@ -695,7 +702,6 @@ where
         h3::spawn_h3(&self, tls_config, tls_addr)?;
 
         // Start the HTTPS listener (blocks this task).
-        let addr = parse_addr(tls_addr)?;
         bind_and_serve(
             self,
             addr,

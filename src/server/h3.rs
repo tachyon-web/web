@@ -187,11 +187,6 @@ where
             Bytes,
         >,
     ) -> Result<Bytes, StatusCode> {
-        let method = &parts.method;
-        if method == hyper::Method::GET || method == hyper::Method::HEAD {
-            return Ok(Bytes::new());
-        }
-
         let content_length = parts
             .headers
             .get(hyper::header::CONTENT_LENGTH)

@@ -2,9 +2,9 @@
 #![allow(clippy::unwrap_used)]
 
 use serde::Serialize;
-use tachyon_web::http::response::{IntoResponse, Json};
 use tachyon_web::routing::{Router, get};
 use tachyon_web::tls::generate_self_signed_cert;
+use tachyon_web::{Json, response::IntoResponse};
 
 #[derive(Serialize)]
 struct Message {
@@ -41,7 +41,7 @@ async fn main() {
     println!("Tachyon TLS server listening on {}", addr);
 
     tachyon_web::bind_rustls(addr, config)
-        .serve(app.into_make_service())
+        .serve(app)
         .await
         .unwrap();
 }

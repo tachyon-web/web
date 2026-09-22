@@ -3,9 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use tachyon_web::http::response::{IntoResponse, Json};
-use tachyon_web::routing::extract::{Path, Query};
+use tachyon_web::extract::{Path, Query};
 use tachyon_web::routing::{Router, get, post};
+use tachyon_web::{Json, response::IntoResponse};
 
 #[derive(Deserialize)]
 struct IdParam {
@@ -133,9 +133,7 @@ async fn get_user_posts(Path(p): Path<IdParam>) -> impl IntoResponse {
     Json(posts)
 }
 
-async fn create_user(
-    tachyon_web::routing::extract::Json(req): tachyon_web::routing::extract::Json<CreateUser>,
-) -> impl IntoResponse {
+async fn create_user(Json(req): Json<CreateUser>) -> impl IntoResponse {
     Json(CreateUserResp {
         id: 99_999,
         role: req.role.unwrap_or_else(|| "user".to_string()),
@@ -145,10 +143,7 @@ async fn create_user(
     })
 }
 
-async fn patch_user(
-    Path(p): Path<IdParam>,
-    tachyon_web::routing::extract::Json(body): tachyon_web::routing::extract::Json<PatchUser>,
-) -> impl IntoResponse {
+async fn patch_user(Path(p): Path<IdParam>, Json(body): Json<PatchUser>) -> impl IntoResponse {
     let changed =
         body.name.is_some() as u8 + body.email.is_some() as u8 + body.active.is_some() as u8;
     Json(PatchUserResp {

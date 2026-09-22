@@ -43,12 +43,11 @@ pub(super) struct RedirectInfo {
     #[cfg(feature = "tls")]
     pub https_port: u16,
     /// The known-good hostnames this deployment serves, when available (e.g. the ACME
-    /// `domains` list in [`Server::serve_all_acme`]). When `Some`, an inbound `Host` header
-    /// that doesn't match any entry is replaced with the first domain rather than echoed back
-    /// into the `Location` header — otherwise a request naming an arbitrary `Host` would get a
-    /// same-status redirect to an attacker-chosen origin. `None` (e.g. [`Server::start_all`],
-    /// which only knows a certificate, not the domain list) falls back to echoing the request's
-    /// `Host` unchecked, matching this listener's long-standing behaviour there.
+    /// `domains` list in [`Server::serve_all_acme`]). An inbound `Host` header that doesn't
+    /// match any entry is replaced with the first domain rather than echoed into `Location`.
+    /// `None` means no hostname is trusted and redirects are rejected with `400`; this is used
+    /// by APIs that receive only certificate bytes and therefore cannot establish an explicit
+    /// host allow-list.
     #[cfg(feature = "tls")]
     pub allowed_hosts: Option<Arc<[String]>>,
 }
@@ -85,57 +84,24 @@ pub(super) fn host_without_port(host: &str) -> &str {
     let end = bracket_end.saturating_add(2);
     host.get(..end).unwrap_or(host)
 }
-/// Whether `host` is syntactically a hostname or IP literal, and so safe to paste into the
-/// authority position of a `Location` URL.
-///
-/// The authority is the only part of that URL taken from the request, and without this check a
-/// `Host` of `evil.com/x` yields `https://evil.com/x/<path>` — the attacker chooses the origin
-/// *and* the path. Labels follow RFC 1123 §2.1 (alphanumerics and interior hyphens, ≤63
-/// bytes, ≤253 total); bracketed IPv6 literals are checked by parsing them.
-#[cfg(feature = "tls")]
-fn is_host_shaped(host: &str) -> bool {
-    if let Some(rest) = host.strip_prefix('[') {
-        return rest
-            .strip_suffix(']')
-            .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok());
-    }
-    !host.is_empty()
-        && host.len() <= 253
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
-}
-
 /// Resolves the host to put in the `Location` header of a plaintext→HTTPS redirect.
 ///
 /// When `allowed_hosts` is `Some` (i.e. the caller knows its real domain list — see
 /// [`RedirectInfo::allowed_hosts`]), an inbound `Host` that doesn't match any entry is replaced
 /// with the first allowed domain rather than echoed back: otherwise a request naming an
 /// arbitrary `Host` would get a same-status redirect to an attacker-chosen origin (an open
-/// redirect). `None` preserves the historical echo-unchecked behaviour for callers that don't
-/// have a domain list to validate against (e.g. [`Server::start_all`]).
+/// redirect). `None` rejects the redirect because no request-provided authority is trustworthy.
 ///
 /// Returns `None` when there is no host that can safely be redirected to: the caller supplied
-/// an allow-list that is *empty*, or no list at all and the inbound `Host` is not even
-/// syntactically a host. Falling back to the inbound `Host` in either case would reopen
-/// exactly the hole this function exists to close.
+/// an allow-list is absent or empty. Falling back to the inbound `Host` in either case would
+/// reopen exactly the hole this function exists to close.
 #[cfg(feature = "tls")]
 pub(super) fn resolve_redirect_host<'a>(
     host_header: &'a str,
     allowed_hosts: Option<&'a [String]>,
 ) -> Option<&'a str> {
     let candidate = host_without_port(host_header);
-    let Some(allowed) = allowed_hosts else {
-        // Unchecked echo is this path's documented behaviour, but echoing something that
-        // isn't a host at all lets the peer write the URL's path and query too.
-        return is_host_shaped(candidate).then_some(candidate);
-    };
+    let allowed = allowed_hosts?;
     allowed
         .iter()
         .find(|d| d.eq_ignore_ascii_case(candidate))
@@ -197,10 +163,11 @@ pub(super) async fn serve_http_redirect_and_challenges(
                         async move {
                             // Serve ACME HTTP-01 challenge response.
                             #[cfg(feature = "lets-encrypt")]
-                            if let Some(token) = req
-                                .uri()
-                                .path()
-                                .strip_prefix("/.well-known/acme-challenge/")
+                            if req.method() == hyper::Method::GET
+                                && let Some(token) = req
+                                    .uri()
+                                    .path()
+                                    .strip_prefix("/.well-known/acme-challenge/")
                                 && let Some(key_auth) = crate::tls::acme::get_challenge(token)
                             {
                                 let resp = Response::builder()
@@ -233,11 +200,22 @@ pub(super) async fn serve_http_redirect_and_challenges(
                             let location =
                                 format!("https://{redirect_host}{port_suffix}{path_and_query}");
 
-                            let resp = Response::builder()
-                                .status(308)
-                                .header("location", &location)
-                                .body(Body::empty())
-                                .unwrap_or_else(|_| Response::new(Body::empty()));
+                            let resp = hyper::header::HeaderValue::from_bytes(location.as_bytes())
+                                .map_or_else(
+                                    |_| {
+                                        let mut resp = Response::new(Body::empty());
+                                        *resp.status_mut() = hyper::StatusCode::BAD_REQUEST;
+                                        resp
+                                    },
+                                    |location| {
+                                        let mut resp = Response::new(Body::empty());
+                                        *resp.status_mut() = hyper::StatusCode::PERMANENT_REDIRECT;
+                                        let _ = resp
+                                            .headers_mut()
+                                            .insert(hyper::header::LOCATION, location);
+                                        resp
+                                    },
+                                );
                             Ok::<_, std::convert::Infallible>(resp)
                         }
                     }),

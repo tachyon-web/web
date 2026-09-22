@@ -2,9 +2,9 @@
 #![allow(clippy::unwrap_used)]
 
 use serde::Serialize;
-use tachyon_web::http::response::{IntoResponse, Json};
 use tachyon_web::routing::{Router, get};
 use tachyon_web::tls::generate_self_signed_cert;
+use tachyon_web::{Json, response::IntoResponse};
 
 #[derive(Serialize)]
 struct Message {

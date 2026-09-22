@@ -49,37 +49,8 @@ fn host_without_port_preserves_ipv6_brackets() {
 
 #[cfg(feature = "tls")]
 #[test]
-fn resolve_redirect_host_echoes_unchecked_when_no_allow_list_is_known() {
-    // `start_all`/`start_all_inner` only have a cert, not a domain list — matches the
-    // long-standing behaviour there.
-    assert_eq!(
-        resolve_redirect_host("attacker.example:80", None),
-        Some("attacker.example")
-    );
-}
-
-#[cfg(feature = "tls")]
-#[test]
-fn resolve_redirect_host_rejects_a_host_that_is_not_host_shaped() {
-    // With no allow-list the `Host` is echoed, so anything that isn't a bare authority lets
-    // the peer control the `Location` path/query as well as its origin.
-    for hostile in [
-        "evil.example/path",
-        "evil.example?x=1",
-        "evil.example#frag",
-        "user@evil.example",
-        "",
-        "..",
-    ] {
-        assert_eq!(resolve_redirect_host(hostile, None), None, "{hostile}");
-    }
-    // Ordinary authorities still pass, including IPv6 literals and IPv4.
-    assert_eq!(resolve_redirect_host("[::1]:8443", None), Some("[::1]"));
-    assert_eq!(resolve_redirect_host("10.0.0.1:80", None), Some("10.0.0.1"));
-    assert_eq!(
-        resolve_redirect_host("sub.example-1.com", None),
-        Some("sub.example-1.com")
-    );
+fn resolve_redirect_host_rejects_requests_without_an_allow_list() {
+    assert_eq!(resolve_redirect_host("attacker.example:80", None), None);
 }
 
 #[cfg(feature = "tls")]
@@ -138,6 +109,19 @@ fn is_resource_exhaustion_matches_only_known_codes() {
     assert!(!is_resource_exhaustion(&std::io::Error::other(
         "not an os error"
     )));
+}
+
+#[test]
+fn zero_concurrency_limits_are_clamped() {
+    let server = Server::new(Router::new()).max_connections(0);
+    assert_eq!(server.max_connections, 1);
+    #[cfg(feature = "http3")]
+    assert_eq!(
+        server
+            .max_h3_concurrent_streams(0)
+            .max_h3_concurrent_streams,
+        1
+    );
 }
 
 #[cfg(feature = "tls")]

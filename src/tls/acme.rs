@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -37,19 +38,79 @@ use webpki::EndEntityCert;
 /// worth closing.
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut file = fs::File::create(path)?;
-    file.write_all(contents)
+
+    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private file has no parent",
+        )
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "private file has no name")
+    })?;
+
+    for _ in 0..16 {
+        let suffix = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id(),
+            suffix
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = options.mode(0o600);
+        }
+
+        let mut file = match options.open(&temp_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let result = (|| {
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        return result;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a private temporary file",
+    ))
+}
+
+#[cfg(all(test, unix))]
+mod private_file_tests {
+    use super::write_private_file;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    #[test]
+    fn private_file_replaces_links_atomically_with_owner_only_permissions() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let target = dir.path().join("target");
+        let secret = dir.path().join("secret");
+        std::fs::write(&target, b"untouched").expect("write target");
+        std::os::unix::fs::symlink(&target, &secret).expect("create symlink");
+
+        write_private_file(&secret, b"private").expect("write private file");
+
+        assert_eq!(std::fs::read(&target).expect("read target"), b"untouched");
+        assert_eq!(std::fs::read(&secret).expect("read secret"), b"private");
+        let metadata = std::fs::symlink_metadata(&secret).expect("inspect private file");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
 }
 
 /// Active HTTP-01 challenges, `token → key_authorization`. Read-mostly: contended only
