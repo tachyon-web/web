@@ -159,7 +159,10 @@ Flags shared with Axum keep Axum's name and default:
 | `form` | on | the `Form` extractor |
 | `query` | on | the `Query` extractor |
 | `tower-log` | on | `tower`'s own `log` feature |
+| `tracing` | on | Axum's own `tracing` feature (distinct from Tachyon's `telemetry`, below) |
 | `ws` | | WebSocket support (RFC 6455) |
+| `multipart` | | the `Multipart` extractor |
+| `macros` | | Axum's `#[debug_handler]` and friends |
 
 Tachyon's own additions default off, the way Axum treats its extras:
 
@@ -177,6 +180,11 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `i2p` | | I2P `.b32.i2p` support (`Server::serve_i2p`/`serve_i2p_config`) via an embedded `libi2pd`. Links `unsafe` FFI — see [Tor and I2P](#tor-and-i2p) |
 
 At least one of `http1`/`http2` must stay enabled; disabling both is a `compile_error!`.
+
+## Minimum supported Rust version
+
+Rust **1.92**. Raising it is a breaking change, announced in the release notes; while the crate
+is `0.0.x` that still means a patch release can carry one.
 
 ## Acknowledgements
 

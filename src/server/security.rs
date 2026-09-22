@@ -48,6 +48,13 @@ impl IpNetwork {
     }
 
     fn contains(self, candidate: IpAddr) -> bool {
+        // A proxy reaching a dual-stack listener is reported as `::ffff:a.b.c.d`, so an
+        // IPv4 network configured for it would otherwise never match and its forwarding
+        // headers would be stripped as if it were untrusted.
+        let candidate = match candidate {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(candidate, IpAddr::V4),
+            IpAddr::V4(_) => candidate,
+        };
         match (self.address, candidate) {
             (IpAddr::V4(network), IpAddr::V4(candidate)) => {
                 let prefix = u32::from(self.prefix);
@@ -172,9 +179,18 @@ impl SecurityPolicy {
         self
     }
 
+    /// Seeds the allow-list from a source the caller derived rather than stated — a
+    /// certificate's SANs, or the ACME `domains` list — leaving an explicitly configured one
+    /// untouched.
+    ///
+    /// An empty `hosts` leaves enforcement *off*. Deriving nothing means the caller learned
+    /// nothing about which names this deployment answers to (a certificate with only IP SANs,
+    /// say), which is not the same statement as [`allowed_hosts`](Self::allowed_hosts) with an
+    /// empty list — and turning it into one would silently `421` every request the server ever
+    /// receives.
     #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
     pub(super) fn with_default_allowed_hosts(mut self, hosts: Arc<[String]>) -> Self {
-        if self.flags & ENFORCE_AUTHORITY == 0 {
+        if self.flags & ENFORCE_AUTHORITY == 0 && !hosts.is_empty() {
             self.allowed_hosts = hosts;
             self.flags |= ENFORCE_AUTHORITY;
         }
@@ -321,7 +337,7 @@ pub(super) fn authority_host(authority: &str) -> Option<&str> {
 /// The two spellings both reach [`SecurityPolicy::inspect`] — `Authority::host` keeps the
 /// brackets, a `Host` header never has them — so both must come through here or one address
 /// gets different answers over HTTP/1.1 and HTTP/2.
-fn bare_host(authority: &str) -> Option<&str> {
+pub(super) fn bare_host(authority: &str) -> Option<&str> {
     let host = authority_host(authority)?;
     Some(
         host.strip_prefix('[')
@@ -345,6 +361,38 @@ mod tests {
         let network = "10.2.0.0/16".parse::<IpNetwork>().expect("valid CIDR");
         assert!(network.contains("10.2.4.8".parse().expect("valid IP")));
         assert!(!network.contains("10.3.4.8".parse().expect("valid IP")));
+    }
+
+    /// A proxy reaching a dual-stack listener is reported as `::ffff:a.b.c.d`. Without
+    /// unmapping, an IPv4 `trusted_proxies` entry never matches it and the deployment silently
+    /// strips the forwarding headers of the one peer it was configured to believe.
+    #[test]
+    fn ipv4_network_trusts_a_proxy_arriving_over_a_dual_stack_socket() {
+        let network = "10.2.0.0/16".parse::<IpNetwork>().expect("valid CIDR");
+        assert!(network.contains("::ffff:10.2.4.8".parse().expect("valid IP")));
+        assert!(!network.contains("::ffff:10.3.4.8".parse().expect("valid IP")));
+    }
+
+    /// Deriving no hostnames (a certificate with only IP SANs, say) means "nothing was
+    /// learned", not "deny everything" — the latter would `421` every request forever.
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    #[test]
+    fn an_empty_derived_allow_list_leaves_authority_enforcement_off() {
+        let policy = SecurityPolicy::new().with_default_allowed_hosts(Arc::from([]));
+        let mut request = Request::builder()
+            .uri("/")
+            .header("host", "anything.example")
+            .body(Body::empty())
+            .expect("valid request");
+        assert!(
+            policy
+                .inspect(
+                    &mut request,
+                    "203.0.113.1:1".parse().expect("valid peer"),
+                    false,
+                )
+                .is_none()
+        );
     }
 
     #[test]

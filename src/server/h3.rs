@@ -135,8 +135,17 @@ where
             return;
         };
 
-        let h3_conn = tachyon_quic::Connection::new(conn);
-        let Ok(mut h3_server) = tachyon_quic::h3::server::Connection::new(h3_conn).await else {
+        // Bounded for the same reason every other transport bounds its handshake: this runs
+        // while holding one of `max_connections` permits, and a peer that completes the QUIC
+        // handshake but never opens its HTTP/3 control stream — keeping the connection alive
+        // past QUIC's idle timeout with PINGs — would otherwise pin that permit indefinitely
+        // without ever speaking HTTP.
+        let setup = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            tachyon_quic::h3::server::Connection::new(tachyon_quic::Connection::new(conn)),
+        );
+        let Ok(Ok(mut h3_server)) = setup.await else {
+            crate::telemetry_debug!("[h3] connection setup failed or timed out");
             return;
         };
 
@@ -433,8 +442,8 @@ mod tests {
     }
 
     /// Full loopback HTTP/3 round trip: a real `s2n-quic`/`h3` client speaking QUIC to a real
-    /// `Server::serve_h3`. Exercises `handle_h3_connection`'s accept loop, `read_h3_body`'s
-    /// GET early-return and its `recv_data`/Content-Length-driven accumulation for POST, and
+    /// `Server::serve_h3`. Exercises `handle_h3_connection`'s setup and accept loop,
+    /// `read_h3_body` for both a bodyless GET and a Content-Length-driven POST, and
     /// `handle_h3_request`'s full response path (`send_response`, the `frame()`/`send_data()`
     /// loop, and `finish()`).
     #[tokio::test]
@@ -446,7 +455,8 @@ mod tests {
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
-        // GET / — covers the GET/HEAD early-return in `read_h3_body`.
+        // GET / — a finished stream with no DATA frames, so `read_h3_body`'s recv loop ends
+        // on the first `Ok(None)`.
         let get_req = hyper::Request::builder()
             .method("GET")
             .uri("https://localhost/")

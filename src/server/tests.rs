@@ -2,7 +2,7 @@
 
 use super::*;
 #[cfg(feature = "tls")]
-use crate::server::redirect::{host_without_port, resolve_redirect_host};
+use crate::server::redirect::resolve_redirect_host;
 use axum::Router;
 
 /// `Server::clone` is hand-written (the field list is feature-gated, so `derive` can't be
@@ -37,19 +37,34 @@ fn clone_preserves_every_field() {
     }
 }
 
-#[cfg(feature = "tls")]
 #[test]
-fn host_without_port_strips_a_plain_hostname() {
-    assert_eq!(host_without_port("example.com:8443"), "example.com");
-    assert_eq!(host_without_port("example.com"), "example.com");
+fn authority_host_strips_the_port_and_keeps_ipv6_brackets() {
+    use crate::server::security::authority_host;
+    assert_eq!(authority_host("example.com:8443"), Some("example.com"));
+    assert_eq!(authority_host("example.com"), Some("example.com"));
+    assert_eq!(authority_host("[::1]:8443"), Some("[::1]"));
+    assert_eq!(authority_host("[2001:db8::1]:443"), Some("[2001:db8::1]"));
+    assert_eq!(
+        authority_host("[::1"),
+        None,
+        "unclosed literal is malformed"
+    );
 }
 
+/// An IPv6 allow-list entry is stored unbracketed — that is the form the host check compares
+/// against — while a `Host` header carries the brackets, so the two have to be normalized the
+/// same way here or the entry is unreachable.
+///
+/// `::1` is deliberately not first in the list: a mismatch would silently fall back to
+/// `example.com`, so only a real match can produce this result.
 #[cfg(feature = "tls")]
 #[test]
-fn host_without_port_preserves_ipv6_brackets() {
-    assert_eq!(host_without_port("[::1]:8443"), "[::1]");
-    assert_eq!(host_without_port("[::1]"), "[::1]");
-    assert_eq!(host_without_port("[2001:db8::1]:443"), "[2001:db8::1]");
+fn resolve_redirect_host_matches_a_bracketed_host_against_an_unbracketed_entry() {
+    let allowed = vec!["example.com".to_string(), "::1".to_string()];
+    assert_eq!(
+        resolve_redirect_host("[::1]:8443", Some(&allowed)),
+        Some("::1")
+    );
 }
 
 #[cfg(feature = "tls")]

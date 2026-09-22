@@ -99,9 +99,9 @@ use hyper::{Request, Response};
 use tokio_rustls::TlsAcceptor;
 
 use bind::bind_and_serve;
-use redirect::parse_addr;
 #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
-use redirect::{RedirectInfo, parse_port};
+use redirect::RedirectInfo;
+use redirect::parse_addr;
 #[cfg(any(feature = "cert-gen", feature = "lets-encrypt", feature = "http3"))]
 pub(crate) use tls_config::alpn_protocols;
 #[cfg(feature = "fips")]
@@ -253,6 +253,8 @@ where
 impl Server<()> {
     /// Creates a new `Server` with default settings and the given router.
     ///
+    /// Defaults: 2 MiB bodies, [`DEFAULT_MAX_CONNECTIONS`] connections, 1,024 concurrent
+    /// handlers, and [`SecurityPolicy::new`]'s fail-safe request policy.
     #[must_use]
     pub fn new(router: Router) -> Self {
         Self {
@@ -387,15 +389,27 @@ where
 
     /// Applies a coherent deployment preset. Compile-time `fips` and `cnsa` restrictions still
     /// take precedence and cannot be weakened by selecting a profile.
+    ///
+    /// A profile's concurrency ceilings only ever *lower* what is already configured. Applying
+    /// one after a deliberately tighter `max_connections`/`max_active_requests` would otherwise
+    /// raise that limit back up, which is the opposite of what selecting a hardening preset
+    /// asks for.
     #[must_use]
     pub fn deployment_profile(mut self, profile: DeploymentProfile) -> Self {
         match profile {
             DeploymentProfile::Hardened => {}
             DeploymentProfile::ExtremePrivacy => {
-                self = self.max_connections(2_048).max_active_requests(512);
+                let (connections, requests) = (
+                    self.max_connections.min(2_048),
+                    self.max_active_requests.min(512),
+                );
+                self = self
+                    .max_connections(connections)
+                    .max_active_requests(requests);
                 #[cfg(feature = "http3")]
                 {
-                    self = self.max_h3_concurrent_streams(16);
+                    let streams = self.max_h3_concurrent_streams.min(16);
+                    self = self.max_h3_concurrent_streams(streams);
                 }
                 #[cfg(feature = "tls")]
                 {
@@ -777,10 +791,9 @@ where
         // Bind the HTTPS listener and serve (blocks the calling task).
         let addr = parse_addr(tls_addr)?;
         let redirect_addr = parse_addr(cleartext_addr)?;
-        let https_port = parse_port(tls_addr, 443);
         let redirect_info = RedirectInfo {
             addr: redirect_addr,
-            https_port,
+            https_port: addr.port(),
             allowed_hosts: Some(allowed_hosts),
             limit: self.connection_limit.clone(),
             policy: self.security_policy.clone(),
@@ -863,13 +876,12 @@ where
 
         let tls_config = Arc::new(tls_config);
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
-        let https_port = parse_port(tls_addr, 443);
 
         let redirect_info = cleartext_addr
             .map(|cleartext_addr| {
-                parse_addr(cleartext_addr).map(|addr| RedirectInfo {
-                    addr,
-                    https_port,
+                parse_addr(cleartext_addr).map(|cleartext| RedirectInfo {
+                    addr: cleartext,
+                    https_port: addr.port(),
                     allowed_hosts: Some(allowed_hosts.clone()),
                     limit: self.connection_limit.clone(),
                     policy: self.security_policy.clone(),

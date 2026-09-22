@@ -60,8 +60,6 @@ jobs:
             flags: --no-default-features --features http1,json,form,query,matched-path,original-uri
           - name: transports + interop (ws, tower-log, tls, acme, http/3)
             flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
-          - name: full (no tor/i2p)
-            flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
           - name: tls12-legacy (opt-in TLS 1.2 fallback)
             flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tls12-legacy
     steps:

@@ -47,15 +47,6 @@ pub(super) struct RedirectInfo {
     #[cfg(feature = "tls")]
     pub allowed_hosts: Option<Arc<[String]>>,
 }
-/// Parses the port number from a bind address string (e.g., `"0.0.0.0:443"`).
-/// Falls back to `default_port` if parsing fails.
-#[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
-pub(super) fn parse_port(addr: &str, default_port: u16) -> u16 {
-    addr.split(':')
-        .next_back()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(default_port)
-}
 /// Parses a bind address string (e.g. `"0.0.0.0:443"`), wrapping the error the same way every
 /// `serve_*`/`start_*` entry point below does — shared so that wrapping can't drift between
 /// call sites.
@@ -64,18 +55,24 @@ pub(super) fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Er
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }
 
-/// Strips the trailing `:port` from an HTTP `Host` header value, preserving IPv6 literals'
-/// brackets (e.g. `"[::1]:8443"` → `"[::1]"`) so the result is still a valid host in a URL.
+/// Writes a host into a URL authority, adding the brackets RFC 3986 §3.2.2 requires around a
+/// bare IPv6 literal.
 ///
-/// Thin wrapper over [`crate::server::security::authority_host`], which owns the one copy of
-/// this parsing. The allow-list in `security` compares against the *unbracketed* form while
-/// the `Location` built below needs the bracketed one — that one-line difference is the whole
-/// distinction, and keeping it here rather than in a second parser is what stops the two from
-/// drifting. A malformed literal (no closing `]`) falls through unchanged; it simply won't
-/// match the allow-list, and `resolve_redirect_host` substitutes a known-good host.
+/// Allow-list entries are stored unbracketed, because that is the form
+/// [`SecurityPolicy`](crate::server::SecurityPolicy) compares against — so an IPv6 entry
+/// spliced straight into a `Location` would produce `https://::1:8443/`, which is not a URL.
 #[cfg(feature = "tls")]
-pub(super) fn host_without_port(host: &str) -> &str {
-    crate::server::security::authority_host(host).unwrap_or(host)
+struct UrlHost<'a>(&'a str);
+
+#[cfg(feature = "tls")]
+impl std::fmt::Display for UrlHost<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.contains(':') && !self.0.starts_with('[') {
+            write!(f, "[{}]", self.0)
+        } else {
+            f.write_str(self.0)
+        }
+    }
 }
 /// Resolves the host to put in the `Location` header of a plaintext→HTTPS redirect.
 ///
@@ -85,19 +82,24 @@ pub(super) fn host_without_port(host: &str) -> &str {
 /// arbitrary `Host` would get a same-status redirect to an attacker-chosen origin (an open
 /// redirect). `None` rejects the redirect because no request-provided authority is trustworthy.
 ///
-/// Returns `None` when there is no host that can safely be redirected to: the caller supplied
-/// an allow-list is absent or empty. Falling back to the inbound `Host` in either case would
-/// reopen exactly the hole this function exists to close.
+/// Returns `None` when there is no host that can safely be redirected to — either no
+/// allow-list was supplied, or the one that was is empty. Falling back to the inbound `Host`
+/// in either case would reopen exactly the hole this function exists to close.
+///
+/// The inbound `Host` is reduced by [`bare_host`](crate::server::security::bare_host), the
+/// same normalization the allow-list itself is matched with, so `[::1]:8443` and `::1` reach
+/// one answer here too. The result is always an allow-list entry, never request-controlled
+/// text, so [`UrlHost`] is all that stands between it and a well-formed `Location`.
 #[cfg(feature = "tls")]
 pub(super) fn resolve_redirect_host<'a>(
     host_header: &'a str,
     allowed_hosts: Option<&'a [String]>,
 ) -> Option<&'a str> {
-    let candidate = host_without_port(host_header);
+    let candidate = crate::server::security::bare_host(host_header);
     let allowed = allowed_hosts?;
     allowed
         .iter()
-        .find(|d| d.eq_ignore_ascii_case(candidate))
+        .find(|d| candidate.is_some_and(|host| d.eq_ignore_ascii_case(host)))
         .or_else(|| allowed.first())
         .map(String::as_str)
 }
@@ -180,7 +182,7 @@ pub(super) async fn serve_http_redirect_and_challenges(
                             let Some(redirect_host) =
                                 resolve_redirect_host(host, allowed_hosts.as_deref())
                             else {
-                                // Allow-list supplied but empty — nowhere safe to send them.
+                                // No allow-list, or an empty one — nowhere safe to send them.
                                 let mut resp = Response::builder()
                                     .status(400)
                                     .body(Body::empty())
@@ -192,8 +194,10 @@ pub(super) async fn serve_http_redirect_and_challenges(
                                 .uri()
                                 .path_and_query()
                                 .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-                            let location =
-                                format!("https://{redirect_host}{port_suffix}{path_and_query}");
+                            let location = format!(
+                                "https://{}{port_suffix}{path_and_query}",
+                                UrlHost(redirect_host)
+                            );
 
                             let mut resp =
                                 hyper::header::HeaderValue::from_bytes(location.as_bytes())
@@ -220,5 +224,19 @@ pub(super) async fn serve_http_redirect_and_challenges(
                 )
                 .await;
         });
+    }
+}
+
+#[cfg(all(test, feature = "tls"))]
+mod tests {
+    use super::UrlHost;
+
+    /// Allow-list entries hold IPv6 literals unbracketed, so splicing one straight into a
+    /// `Location` produced `https://::1:8443/` — not a URL any client can follow.
+    #[test]
+    fn url_host_brackets_a_bare_ipv6_literal_and_nothing_else() {
+        assert_eq!(UrlHost("::1").to_string(), "[::1]");
+        assert_eq!(UrlHost("[::1]").to_string(), "[::1]");
+        assert_eq!(UrlHost("example.com").to_string(), "example.com");
     }
 }

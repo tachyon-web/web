@@ -340,10 +340,6 @@ fn require_onion_host_for_redirect(
     Ok(())
 }
 
-/// Awaits `service`'s status stream until it reports full reachability. This tracks real Tor
-/// network activity (introduction points built, descriptor accepted by `HsDirs`) with no built-in
-/// timeout, so it can legitimately take minutes on a slow or first-run bootstrap — every state
-/// transition is logged so that wait doesn't look hung.
 /// Accepts a rendezvous stream, bounded in time.
 ///
 /// `StreamRequest::accept` writes a CONNECTED cell onto the circuit, and a peer that simply
@@ -363,6 +359,10 @@ async fn accept_onion_stream(
     .map_err(Into::into)
 }
 
+/// Awaits `service`'s status stream until it reports full reachability. This tracks real Tor
+/// network activity (introduction points built, descriptor accepted by `HsDirs`) with no built-in
+/// timeout, so it can legitimately take minutes on a slow or first-run bootstrap — every state
+/// transition is logged so that wait doesn't look hung.
 async fn wait_until_reachable(service: &tor_hsservice::RunningOnionService) {
     let mut status_events = service.status_events();
     let mut last_state = None;
