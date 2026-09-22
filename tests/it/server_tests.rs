@@ -6,8 +6,12 @@ use crate::common::{free_loopback_addr, wait_until_listening};
 use bytes::Bytes;
 #[cfg(feature = "http1")]
 use std::time::Duration;
+// `get` is used by the `cert-gen` TLS tests too, so it follows the same gate as the
+// `common` helpers above; `post` is only ever reached from an `http1` test.
+#[cfg(any(feature = "http1", feature = "cert-gen"))]
+use tachyon_web::routing::get;
 #[cfg(feature = "http1")]
-use tachyon_web::routing::{get, post};
+use tachyon_web::routing::post;
 use tachyon_web::{Router, Server};
 #[cfg(feature = "http1")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

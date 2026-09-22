@@ -838,26 +838,28 @@ impl AcmeManager {
         let account_path = self.cache_dir.join(format!("account-{env_suffix}.json"));
 
         if account_path.exists() {
-            match fs::read(&account_path) {
-                Ok(creds_bytes) => {
-                    match serde_json::from_slice::<AccountCredentials>(&creds_bytes) {
-                        Ok(creds) => {
-                            let builder = self.account_builder()?;
-                            match builder.from_credentials(creds).await {
-                                Ok(account) => {
-                                    info!("[acme] reusing cached account ({env_suffix})");
-                                    return Ok(account);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "[acme] Cached account credentials invalid, creating new: {e}"
-                                    );
-                                }
+            // Bounded and regular-file-checked like every other cache entry: a plain
+            // `fs::read` here would follow a symlink and had no size cap at all, so a stray
+            // link to a huge or unreadable-by-size file in the cache directory could be read
+            // in full before `serde_json` ever rejected it.
+            match read_bounded_string(&account_path) {
+                Ok(creds_json) => match serde_json::from_str::<AccountCredentials>(&creds_json) {
+                    Ok(creds) => {
+                        let builder = self.account_builder()?;
+                        match builder.from_credentials(creds).await {
+                            Ok(account) => {
+                                info!("[acme] reusing cached account ({env_suffix})");
+                                return Ok(account);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[acme] Cached account credentials invalid, creating new: {e}"
+                                );
                             }
                         }
-                        Err(e) => warn!("[acme] failed to parse cached account credentials: {e}"),
                     }
-                }
+                    Err(e) => warn!("[acme] failed to parse cached account credentials: {e}"),
+                },
                 Err(e) => warn!("[acme] failed to read account credentials file: {e}"),
             }
         }

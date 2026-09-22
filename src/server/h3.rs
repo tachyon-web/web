@@ -275,8 +275,13 @@ where
                     .body(())
                     .unwrap_or_else(|_| Response::new(()));
                 self.security_policy.finalize_response(&mut response, true);
-                let _ = stream.send_response(response).await;
-                let _ = stream.finish().await;
+                // Bounded like every write on the success path below. These are the cheapest
+                // responses for a peer to provoke — a `content-length` past `max_body_size`
+                // needs no body at all — so leaving them as unbounded awaits let a peer that
+                // holds its flow-control window shut pin one stream permit per rejected
+                // request, for as long as it liked.
+                let _ = write_within(stream.send_response(response)).await;
+                let _ = write_within(stream.finish()).await;
                 return;
             }
         };

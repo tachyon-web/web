@@ -128,6 +128,12 @@ pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 pub const DEFAULT_MAX_CONNECTIONS: usize = 4_096;
+/// Default for [`Server::redirect_connection_share`] — the percentage of
+/// [`DEFAULT_MAX_CONNECTIONS`] the plaintext redirect listener may occupy.
+///
+/// *Tachyon extension: no `axum` equivalent.*
+#[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+pub const DEFAULT_REDIRECT_CONNECTION_SHARE: u8 = 15;
 /// Default for [`Server::max_h3_concurrent_streams`] — see that field for how to size it.
 ///
 /// *Tachyon extension: no `axum` equivalent.*
@@ -181,6 +187,11 @@ pub struct Server<S> {
     /// Clones of this server share one semaphore, so adding HTTP, HTTPS, HTTP/3, Tor, or I2P
     /// listeners does not multiply the process-wide ceiling.
     ///
+    /// One transport draws on a bounded slice of this rather than all of it: the plaintext
+    /// port-80 redirect listener, capped by
+    /// [`redirect_connection_share`](Self::redirect_connection_share). It still takes a permit
+    /// from this pool per connection, so the ceiling here is unchanged.
+    ///
     /// Default: 4,096.
     pub(crate) max_connections: usize,
     pub(super) connection_limit: accept::ConnectionLimit,
@@ -189,6 +200,12 @@ pub struct Server<S> {
     pub(crate) max_active_requests: usize,
     pub(crate) request_limit: Arc<tokio::sync::Semaphore>,
     pub(crate) security_policy: SecurityPolicy,
+    /// Percentage of [`max_connections`](Self::max_connections) the plaintext redirect
+    /// listener may hold — private for the same reason as
+    /// [`max_connections`](Self#structfield.max_connections), and read through
+    /// [`redirect_connection_permits`](Self::redirect_connection_permits).
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    pub(crate) redirect_connection_share: u8,
     /// Maximum number of TLS handshakes executing concurrently — private for the same reason
     /// as [`max_connections`](Self#structfield.max_connections).
     #[cfg(feature = "tls")]
@@ -236,6 +253,8 @@ where
             max_active_requests: self.max_active_requests,
             request_limit: self.request_limit.clone(),
             security_policy: self.security_policy.clone(),
+            #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+            redirect_connection_share: self.redirect_connection_share,
             #[cfg(feature = "tls")]
             max_tls_handshakes: self.max_tls_handshakes,
             #[cfg(feature = "tls")]
@@ -266,6 +285,8 @@ impl Server<()> {
             max_active_requests: 1_024,
             request_limit: Arc::new(tokio::sync::Semaphore::new(1_024)),
             security_policy: SecurityPolicy::new(),
+            #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+            redirect_connection_share: DEFAULT_REDIRECT_CONNECTION_SHARE,
             #[cfg(feature = "tls")]
             max_tls_handshakes: 1024,
             #[cfg(feature = "tls")]
@@ -370,6 +391,65 @@ where
     #[must_use]
     pub const fn active_request_limit(&self) -> usize {
         self.max_active_requests
+    }
+
+    /// Caps the plaintext HTTP→HTTPS redirect listener at `percent` of
+    /// [`max_connections`](Self::max_connections), so a flood of cheap redirect connections
+    /// cannot take the permits the TLS listener needs.
+    ///
+    /// That listener is bound to port 80 and reachable by anyone, but it never reaches an
+    /// application handler — it answers ACME HTTP-01 challenges and `308`s everything else. It
+    /// therefore has no business competing with real traffic for the whole pool, which is what
+    /// it used to do: both listeners drew on one semaphore, so enough port-80 connections
+    /// starved port 443 outright.
+    ///
+    /// A redirect connection still holds a permit from the shared pool as well, so this caps
+    /// that listener's slice rather than granting a second budget on top of
+    /// [`max_connections`](Self::max_connections) — the process-wide ceiling is unchanged.
+    ///
+    /// Values above 100 are clamped to 100, and the resulting budget is never less than one
+    /// permit, so neither a percentage of zero nor a very small pool can stop redirects (and
+    /// with them ACME renewals) entirely. Order-independent: the share is resolved against
+    /// whatever [`max_connections`](Self::max_connections) ends up being.
+    ///
+    /// Default: [`DEFAULT_REDIRECT_CONNECTION_SHARE`] (15%).
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// # use axum::Router;
+    /// # use tachyon_web::Server;
+    /// # let router = Router::new();
+    /// // 4,096 connections overall, of which at most 205 may be port-80 redirects.
+    /// let server = Server::new(router).max_connections(4_096).redirect_connection_share(5);
+    /// ```
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    #[must_use]
+    pub const fn redirect_connection_share(mut self, percent: u8) -> Self {
+        self.redirect_connection_share = if percent > 100 { 100 } else { percent };
+        self
+    }
+
+    /// The configured redirect share, as a percentage — see
+    /// [`redirect_connection_share`](Self::redirect_connection_share).
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    #[must_use]
+    pub const fn redirect_connection_share_percent(&self) -> u8 {
+        self.redirect_connection_share
+    }
+
+    /// The redirect listener's slice of the pool, in permits.
+    ///
+    /// Rounded down, then floored at one: a share that rounded to zero would leave the port-80
+    /// listener unable to accept anything, taking ACME issuance and renewal down with it.
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    #[must_use]
+    pub fn redirect_connection_permits(&self) -> usize {
+        let budget = self
+            .max_connections
+            .saturating_mul(usize::from(self.redirect_connection_share))
+            .checked_div(100)
+            .unwrap_or(0);
+        budget.max(1)
     }
 
     /// The effective concurrent-TLS-handshake ceiling — see
@@ -513,6 +593,26 @@ where
         self.tls_policy.clone().unwrap_or_default()
     }
 
+    /// Applies this server's [`TlsPolicy`](crate::tls::TlsPolicy) to a `rustls::ServerConfig`
+    /// this crate did not build, and freezes it.
+    ///
+    /// Every entry point that takes an outside config goes through here, so a policy-level
+    /// setting — notably the resumption lockdown
+    /// [`DeploymentProfile::ExtremePrivacy`] turns on — cannot reach some listeners and quietly
+    /// miss others. It previously did: only `serve_https_config` applied the policy, while
+    /// `start_https_with_config*` and `start_https_and_h3_with_config` served the config as
+    /// handed to them.
+    #[cfg(feature = "tls")]
+    pub(crate) fn finalize_tls_config(
+        &self,
+        mut config: rustls::ServerConfig,
+    ) -> Arc<rustls::ServerConfig> {
+        if let Some(policy) = &self.tls_policy {
+            policy.apply_to_server_config(&mut config);
+        }
+        Arc::new(config)
+    }
+
     /// Begins publishing this app over multiple transports at once — see
     /// [`MultiServer`] and the [module docs](self#publishing-over-more-than-one-transport-at-once).
     ///
@@ -591,7 +691,7 @@ where
         addr: std::net::SocketAddr,
         config: rustls::ServerConfig,
     ) -> Result<(), std::io::Error> {
-        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let acceptor = TlsAcceptor::from(self.finalize_tls_config(config));
         bind_and_serve(self, addr, None, move |server, listener| async move {
             server.serve_https(listener, acceptor).await
         })
@@ -625,11 +725,13 @@ where
         mut config: rustls::ServerConfig,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         enforce_fips_compliance()?;
-        #[cfg(feature = "fips")]
-        assert_fips_server_config(&config)?;
 
         config.alpn_protocols = alpn_protocols(true);
-        let config = Arc::new(config);
+        // Ordered as in `start_all_inner`/`serve_all_acme`: apply the policy, then assert the
+        // config that will actually be served.
+        let config = self.finalize_tls_config(config);
+        #[cfg(feature = "fips")]
+        assert_fips_server_config(&config)?;
 
         h3::spawn_h3(&self, config.clone(), tls_addr)?;
 
@@ -741,7 +843,27 @@ where
         acme.validate_cache()?;
         let resolver = acme.resolver();
 
-        // Start the background renewal loop before attempting to serve.
+        let addr = parse_addr(tls_addr)?;
+        let redirect_addr = parse_addr(cleartext_addr)?;
+
+        // The HTTP-01 responder has to be listening *before* the ACME loop places its first
+        // order: that loop provisions immediately when the cache is empty, and the challenge it
+        // publishes is answered on this listener. Binding it afterwards meant every first-run
+        // issuance failed validation, waited out the 5-minute backoff, and burned one of the
+        // CA's per-hour failed-validation attempts before the retry could succeed. Binding here
+        // also fails fast if the cleartext port is unavailable, rather than after an order.
+        bind::spawn_redirect_listener(RedirectInfo {
+            addr: redirect_addr,
+            https_port: addr.port(),
+            allowed_hosts: Some(allowed_hosts),
+            limit: self
+                .connection_limit
+                .with_share(self.redirect_connection_permits()),
+            policy: self.security_policy.clone(),
+        })
+        .await?;
+
+        // Start the background renewal loop now that its challenges can be answered.
         acme.start();
 
         // Give the renewal loop a bounded window to load a cached cert or
@@ -788,22 +910,11 @@ where
         #[cfg(feature = "http3")]
         h3::spawn_h3(&self, tls_config, tls_addr)?;
 
-        // Bind the HTTPS listener and serve (blocks the calling task).
-        let addr = parse_addr(tls_addr)?;
-        let redirect_addr = parse_addr(cleartext_addr)?;
-        let redirect_info = RedirectInfo {
-            addr: redirect_addr,
-            https_port: addr.port(),
-            allowed_hosts: Some(allowed_hosts),
-            limit: self.connection_limit.clone(),
-            policy: self.security_policy.clone(),
-        };
-        bind_and_serve(
-            self,
-            addr,
-            Some(redirect_info),
-            move |server, listener| async move { server.serve_https(listener, tls_acceptor).await },
-        )
+        // Bind the HTTPS listener and serve (blocks the calling task). The cleartext listener
+        // is already running — see above — so no `RedirectInfo` is passed here.
+        bind_and_serve(self, addr, None, move |server, listener| async move {
+            server.serve_https(listener, tls_acceptor).await
+        })
         .await?;
 
         Ok(())
@@ -883,7 +994,9 @@ where
                     addr: cleartext,
                     https_port: addr.port(),
                     allowed_hosts: Some(allowed_hosts.clone()),
-                    limit: self.connection_limit.clone(),
+                    limit: self
+                        .connection_limit
+                        .with_share(self.redirect_connection_permits()),
                     policy: self.security_policy.clone(),
                 })
             })

@@ -331,6 +331,10 @@ where
                     if let Err(e) = builder.serve_connection(io, svc).await {
                         crate::telemetry_debug!("[https] http/2 connection error: {}", e);
                     }
+                    // Skips the HTTP/1.1 fallback below, which only exists under `http1` —
+                    // so without that feature there is nothing to skip and the `return` is
+                    // the function's own tail, which `-D warnings` rejects.
+                    #[cfg(feature = "http1")]
                     return;
                 }
 
@@ -365,13 +369,10 @@ where
     pub async fn serve_https_config(
         self,
         listener: TcpListener,
-        mut config: rustls::ServerConfig,
+        config: rustls::ServerConfig,
     ) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
-        if let Some(policy) = &self.tls_policy {
-            policy.apply_to_server_config(&mut config);
-        }
-        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let acceptor = TlsAcceptor::from(self.finalize_tls_config(config));
         self.serve_https(listener, acceptor).await
     }
 }

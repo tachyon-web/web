@@ -24,6 +24,10 @@ fn clone_preserves_every_field() {
             .tls_policy(crate::tls::TlsPolicy::new().tls13_only())
             .max_tls_handshakes(13);
     }
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    {
+        server = server.redirect_connection_share(23);
+    }
 
     let cloned = server.clone();
     assert_eq!(cloned.max_body_size, 4096);
@@ -35,6 +39,8 @@ fn clone_preserves_every_field() {
         assert!(cloned.tls_policy.is_some());
         assert_eq!(cloned.max_tls_handshakes, 13);
     }
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    assert_eq!(cloned.redirect_connection_share, 23);
 }
 
 #[test]
@@ -190,4 +196,70 @@ fn bind_rustls_and_https_server_builders() {
     assert!(https_server.serve_http3);
     let dbg = format!("{https_server:?}");
     assert!(dbg.contains("serve_http3: true"));
+}
+
+/// A `rustls::ServerConfig` handed to `serve_https_config`/`start_https_with_config*`/
+/// `start_https_and_h3_with_config` must still pick up this server's `TlsPolicy`. Only the
+/// first of those applied it, so `deployment_profile(ExtremePrivacy)` left 0-RTT, TLS 1.3
+/// tickets and the session cache enabled on the other two.
+#[cfg(feature = "cert-gen")]
+#[test]
+fn a_caller_supplied_tls_config_inherits_the_resumption_lockdown() {
+    let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+    let config = tls_config_builder(&crate::tls::TlsPolicy::new())
+        .expect("build config prefix")
+        .with_single_cert(vec![cert.cert_der], cert.key_der)
+        .expect("single cert");
+    assert!(
+        config.session_storage.can_cache(),
+        "precondition: an unmodified config resumes, so the assertions below mean something"
+    );
+
+    let finalized = Server::new(Router::new())
+        .deployment_profile(DeploymentProfile::ExtremePrivacy)
+        .finalize_tls_config(config);
+
+    assert_eq!(finalized.max_early_data_size, 0);
+    assert_eq!(finalized.send_tls13_tickets, 0);
+    assert_eq!(finalized.max_tls13_tickets, 0);
+    assert!(!finalized.session_storage.can_cache());
+}
+
+/// The redirect listener's slice of the pool: rounded down, clamped at 100%, and never zero —
+/// a zero budget would leave port 80 unable to accept, taking ACME renewal down with it.
+#[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+#[test]
+fn the_redirect_share_resolves_to_a_usable_slice_of_the_pool() {
+    let permits = |conns: usize, percent: u8| {
+        Server::new(Router::new())
+            .max_connections(conns)
+            .redirect_connection_share(percent)
+            .redirect_connection_permits()
+    };
+
+    assert_eq!(permits(4_096, 15), 614, "the 15% default, rounded down");
+    assert_eq!(permits(100, 50), 50);
+    assert_eq!(permits(10, 0), 1, "a zero share still leaves one permit");
+    assert_eq!(
+        permits(4, 15),
+        1,
+        "0.6 permits rounds down, then floors at one"
+    );
+    assert_eq!(permits(100, 200), 100, "percentages above 100 are clamped");
+
+    // Order-independence: the share is resolved against the final `max_connections`, so
+    // configuring the two in either order gives the same budget.
+    assert_eq!(
+        Server::new(Router::new())
+            .redirect_connection_share(25)
+            .max_connections(800)
+            .redirect_connection_permits(),
+        200
+    );
+
+    assert_eq!(
+        Server::new(Router::new()).redirect_connection_share_percent(),
+        DEFAULT_REDIRECT_CONNECTION_SHARE
+    );
 }

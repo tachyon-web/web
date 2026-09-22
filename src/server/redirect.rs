@@ -34,6 +34,8 @@ pub(super) struct RedirectInfo {
     pub addr: std::net::SocketAddr,
     #[cfg(feature = "tls")]
     pub https_port: u16,
+    /// A share of the server's connection pool, not the pool itself — built with
+    /// [`ConnectionLimit::with_share`] so this listener cannot starve the TLS one.
     #[cfg(feature = "tls")]
     pub limit: ConnectionLimit,
     #[cfg(feature = "tls")]
@@ -109,8 +111,11 @@ pub(super) fn resolve_redirect_host<'a>(
 /// `308` rather than `301` because it preserves the request method, so redirected `POST`s stay
 /// `POST`s.
 ///
-/// Concurrency shares the server's global connection budget. This listener is bound to port 80
-/// and therefore reachable by anyone, even though it never reaches application handlers.
+/// This listener is bound to port 80 and therefore reachable by anyone, even though it never
+/// reaches application handlers. Its `limit` is a *share* of the server's global connection
+/// budget rather than the whole of it — see
+/// [`Server::redirect_connection_share`](crate::server::Server::redirect_connection_share) —
+/// so a flood here cannot take the permits the TLS listener needs.
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]

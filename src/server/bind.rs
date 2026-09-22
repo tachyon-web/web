@@ -25,19 +25,31 @@ where
 
     #[cfg(feature = "tls")]
     if let Some(info) = redirect {
-        let listener = TcpListener::bind(info.addr).await?;
-        drop(tokio::spawn(async move {
-            serve_http_redirect_and_challenges(
-                listener,
-                info.https_port,
-                info.allowed_hosts,
-                info.limit,
-                info.policy,
-            )
-            .await;
-        }));
+        spawn_redirect_listener(info).await?;
     }
 
     let listener = TcpListener::bind(addr).await?;
     serve(server, listener).await
+}
+
+/// Binds the plaintext redirect/ACME-challenge listener and drives it on its own task.
+///
+/// Split out of [`bind_and_serve`] so `serve_all_acme` can bring this listener up *before* it
+/// starts the ACME loop. HTTP-01 validation is answered here, so an order placed while nothing
+/// is bound to the cleartext address fails and spends one of the CA's failed-validation
+/// attempts for nothing.
+#[cfg(feature = "tls")]
+pub(super) async fn spawn_redirect_listener(info: RedirectInfo) -> Result<(), std::io::Error> {
+    let listener = TcpListener::bind(info.addr).await?;
+    drop(tokio::spawn(async move {
+        serve_http_redirect_and_challenges(
+            listener,
+            info.https_port,
+            info.allowed_hosts,
+            info.limit,
+            info.policy,
+        )
+        .await;
+    }));
+    Ok(())
 }
