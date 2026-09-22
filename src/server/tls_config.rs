@@ -132,6 +132,7 @@ impl RustlsConfig {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         server_config.alpn_protocols = alpn_protocols(false);
+        policy.apply_to_server_config(&mut server_config);
 
         #[cfg(feature = "fips")]
         assert_fips_server_config(&server_config)?;

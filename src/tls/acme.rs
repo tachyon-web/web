@@ -89,6 +89,47 @@ fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Resul
     ))
 }
 
+const MAX_CACHE_FILE_SIZE: u64 = 1024 * 1024;
+
+fn read_bounded_string(path: &std::path::Path) -> std::io::Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CACHE_FILE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ACME cache entry is not a regular file or exceeds 1 MiB",
+        ));
+    }
+    fs::read_to_string(path)
+}
+
+fn validate_cache_directory(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cache path must be a real directory, not a symlink",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cache directory must not grant group or other access",
+            ));
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if metadata.uid() != fs::metadata("/proc/self")?.uid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "cache directory is not owned by the current process user",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 mod private_file_tests {
     use super::write_private_file;
@@ -243,6 +284,8 @@ pub enum AcmeError {
     CertParse(String),
     /// TLS signing key could not be loaded from the private key.
     TlsKeyLoad(String),
+    /// The certificate cache directory does not meet local security requirements.
+    InsecureCache(String),
 }
 
 impl std::fmt::Display for AcmeError {
@@ -256,6 +299,7 @@ impl std::fmt::Display for AcmeError {
             Self::MissingPrivateKey => write!(f, "No private key found in PEM data"),
             Self::CertParse(s) => write!(f, "Certificate parse error: {s}"),
             Self::TlsKeyLoad(s) => write!(f, "TLS signing key load failed: {s}"),
+            Self::InsecureCache(s) => write!(f, "Insecure ACME cache: {s}"),
         }
     }
 }
@@ -336,6 +380,7 @@ pub struct AcmeManager {
     /// Serializes provisioning runs. `tokio::sync::Mutex` because the guard is held across
     /// awaits.
     provisioning: tokio::sync::Mutex<()>,
+    cache_error: Option<String>,
 }
 
 /// Minimum time remaining before renewal is triggered.
@@ -383,11 +428,25 @@ impl AcmeManager {
         policy: &crate::tls::TlsPolicy,
     ) -> Arc<Self> {
         let cache_dir = cache_dir.into();
+        let cache_existed = cache_dir.exists();
         if let Err(e) = fs::create_dir_all(&cache_dir) {
             error!(
                 "[acme] failed to create cache directory {:?}: {e}",
                 cache_dir
             );
+        }
+        #[cfg(unix)]
+        if !cache_existed {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Err(e) = fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)) {
+                error!("[acme] failed to secure cache directory {cache_dir:?}: {e}");
+            }
+        }
+        let cache_error = validate_cache_directory(&cache_dir)
+            .err()
+            .map(|e| e.to_string());
+        if let Some(error) = &cache_error {
+            error!("[acme] refusing insecure cache directory: {error}");
         }
         Arc::new(Self {
             domains,
@@ -397,7 +456,19 @@ impl AcmeManager {
             resolver: Arc::new(AcmeResolver::new()),
             provider: policy.provider(),
             provisioning: tokio::sync::Mutex::new(()),
+            cache_error,
         })
+    }
+
+    /// Returns an error when the cache directory is unsafe for credentials or private keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcmeError::InsecureCache`] when validation during construction failed.
+    pub fn validate_cache(&self) -> Result<(), AcmeError> {
+        self.cache_error
+            .as_ref()
+            .map_or(Ok(()), |error| Err(AcmeError::InsecureCache(error.clone())))
     }
 
     /// Returns the [`AcmeResolver`] that should be passed to [`rustls::ServerConfig`].
@@ -441,6 +512,10 @@ impl AcmeManager {
 
     /// Internal background loop. Runs forever with controlled sleep intervals.
     async fn run_loop(&self) {
+        if let Err(e) = self.validate_cache() {
+            error!("[acme] certificate manager stopped: {e}");
+            return;
+        }
         let mut backoff = BACKOFF_INITIAL;
 
         loop {
@@ -590,8 +665,8 @@ impl AcmeManager {
         let cert_path = self.cache_dir.join("domain.crt");
         let key_path = self.cache_dir.join("domain.key");
 
-        let cert_pem = fs::read_to_string(cert_path)?;
-        let key_pem = fs::read_to_string(key_path)?;
+        let cert_pem = read_bounded_string(&cert_path)?;
+        let key_pem = read_bounded_string(&key_path)?;
 
         let certs: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_pem.as_bytes());
         let key = crate::tls::pem::private_key(key_pem.as_bytes())
@@ -609,7 +684,7 @@ impl AcmeManager {
     /// The private key is written with owner-only permissions (`0600` on Unix) so it
     /// is never left world- or group-readable on disk.
     fn save_certs_and_key(&self, cert_pem: &str, key_pem: &str) -> Result<(), AcmeError> {
-        fs::write(self.cache_dir.join("domain.crt"), cert_pem)?;
+        write_private_file(&self.cache_dir.join("domain.crt"), cert_pem.as_bytes())?;
         let key_path = self.cache_dir.join("domain.key");
         write_private_file(&key_path, key_pem.as_bytes())?;
         Ok(())

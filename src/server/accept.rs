@@ -41,7 +41,7 @@ pub(super) fn is_connection_error(e: &std::io::Error) -> bool {
 
 /// Bounds how many connections a transport serves concurrently.
 #[derive(Debug, Clone)]
-pub(super) struct ConnectionLimit(Arc<Semaphore>);
+pub(crate) struct ConnectionLimit(Arc<Semaphore>);
 
 impl ConnectionLimit {
     /// A limiter allowing `max_conns` connections in flight at once.

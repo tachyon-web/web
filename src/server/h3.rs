@@ -109,7 +109,7 @@ where
     ) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
-        let limit = ConnectionLimit::new(state.max_connections);
+        let limit = state.connection_limit.clone();
 
         while let Some(permit) = limit.acquire().await {
             let Some(conn) = quic_server.accept().await else {
@@ -268,7 +268,7 @@ where
         };
 
         let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
-        let full_resp = self.dispatch(req, peer).await;
+        let full_resp = self.dispatch(req, peer, true).await;
 
         let (resp_parts, body) = full_resp.into_parts();
         let resp = Response::from_parts(resp_parts, ());

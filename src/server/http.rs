@@ -204,7 +204,6 @@ where
     pub async fn serve_http(self, listener: TcpListener) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
-        let max_connections = state.max_connections;
 
         // Build once outside the loop — `clone()` inside is a few pointer copies.
         // Three cases, matching whichever of `http1`/`http2` are enabled (at least
@@ -236,7 +235,7 @@ where
             b
         };
 
-        let limit = ConnectionLimit::new(max_connections);
+        let limit = state.connection_limit.clone();
         while let Some(permit) = limit.acquire().await {
             let (stream, peer) = accept_forever(&listener, "http").await;
             let state = state.clone();
@@ -244,7 +243,7 @@ where
 
             ConnectionLimit::serve(permit, async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
-                let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer));
+                let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer, false));
                 #[cfg(all(feature = "http1", feature = "http2"))]
                 let result = builder.serve_connection_with_upgrades(io, svc).await;
                 #[cfg(all(feature = "http1", not(feature = "http2")))]
@@ -279,15 +278,18 @@ where
         #[cfg(feature = "fips")]
         crate::server::assert_fips_server_config(acceptor.config())?;
         let state = Arc::new(self);
-        let max_connections = state.max_connections;
-
-        let limit = ConnectionLimit::new(max_connections);
+        let limit = state.connection_limit.clone();
         while let Some(permit) = limit.acquire().await {
             let (tcp_stream, peer) = accept_forever(&listener, "https").await;
             let acceptor = acceptor.clone();
             let state = state.clone();
 
             ConnectionLimit::serve(permit, async move {
+                let Ok(_handshake_permit) = state.tls_handshake_limit.clone().try_acquire_owned()
+                else {
+                    tracing::debug!("[https] tls handshake shed at concurrency limit");
+                    return;
+                };
                 let tls_stream =
                     match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream))
                         .await
@@ -312,7 +314,7 @@ where
                 };
 
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer));
+                let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer, true));
 
                 #[cfg(feature = "http2")]
                 if is_h2 {
@@ -356,9 +358,12 @@ where
     pub async fn serve_https_config(
         self,
         listener: TcpListener,
-        config: rustls::ServerConfig,
+        mut config: rustls::ServerConfig,
     ) -> Result<(), std::io::Error> {
         crate::server::enforce_fips_compliance()?;
+        if let Some(policy) = &self.tls_policy {
+            policy.apply_to_server_config(&mut config);
+        }
         let acceptor = TlsAcceptor::from(Arc::new(config));
         self.serve_https(listener, acceptor).await
     }
@@ -387,6 +392,7 @@ pub(super) async fn hyper_handler<S>(
     state: Arc<Server<S>>,
     req: Request<hyper::body::Incoming>,
     peer: std::net::SocketAddr,
+    secure_transport: bool,
 ) -> Result<Response<Body>, std::io::Error>
 where
     S: Clone + Send + Sync + 'static,
@@ -401,5 +407,7 @@ where
     }
     let body = body_with_deadline(incoming_body, state.max_body_size);
 
-    Ok(state.dispatch(Request::from_parts(parts, body), peer).await)
+    Ok(state
+        .dispatch(Request::from_parts(parts, body), peer, secure_transport)
+        .await)
 }

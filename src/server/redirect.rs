@@ -19,14 +19,6 @@ use hyper::service::service_fn;
 #[cfg(feature = "tls")]
 use hyper::{Request, Response};
 
-/// Per-worker connection ceiling for the plaintext port-80 redirect listener.
-///
-/// Far below [`crate::server::Server::max_connections`] on purpose: every connection here gets a bodyless
-/// `308` or a challenge token and closes, so the queue drains fast.
-///
-/// *Tachyon extension: no `axum` equivalent.*
-#[cfg(feature = "tls")]
-pub(super) const REDIRECT_MAX_CONNECTIONS: usize = 2048;
 /// Parameters for the plaintext port-80 redirect/ACME-challenge listener spawned alongside a
 /// TLS listener — see [`serve_http_redirect_and_challenges`].
 ///
@@ -42,6 +34,8 @@ pub(super) struct RedirectInfo {
     pub addr: std::net::SocketAddr,
     #[cfg(feature = "tls")]
     pub https_port: u16,
+    #[cfg(feature = "tls")]
+    pub limit: ConnectionLimit,
     /// The known-good hostnames this deployment serves, when available (e.g. the ACME
     /// `domains` list in [`Server::serve_all_acme`]). An inbound `Host` header that doesn't
     /// match any entry is replaced with the first domain rather than echoed into `Location`.
@@ -114,11 +108,8 @@ pub(super) fn resolve_redirect_host<'a>(
 /// `308` rather than `301` because it preserves the request method, so redirected `POST`s stay
 /// `POST`s.
 ///
-/// Concurrency is capped at [`REDIRECT_MAX_CONNECTIONS`]. This listener is bound to
-/// port 80 and therefore reachable by anyone, but it answers only redirects and ACME
-/// challenges — it never reaches the router — so it uses its own fixed ceiling rather than
-/// [`crate::server::Server::max_connections`], which sizes the listener that actually runs application
-/// handlers.
+/// Concurrency shares the server's global connection budget. This listener is bound to port 80
+/// and therefore reachable by anyone, even though it never reaches application handlers.
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "tls")]
@@ -126,11 +117,12 @@ pub(super) async fn serve_http_redirect_and_challenges(
     listener: TcpListener,
     https_port: u16,
     allowed_hosts: Option<Arc<[String]>>,
+    limit: ConnectionLimit,
 ) {
     // This listener is bound to port 80 and reachable by anyone, so it gets exactly the same
     // hardening as the real one — `tune_http1!` carries the `header_read_timeout` that stops a
     // client from opening a connection, never finishing its request line, and holding one of
-    // [`REDIRECT_MAX_CONNECTIONS`] permits forever (Slowloris).
+    // the server's global permits forever (Slowloris).
     #[cfg_attr(not(feature = "http1"), allow(unused_mut))]
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
@@ -138,7 +130,6 @@ pub(super) async fn serve_http_redirect_and_challenges(
     tune_http1!(builder.http1());
     #[cfg(feature = "http2")]
     tune_http2!(builder.http2());
-    let limit = ConnectionLimit::new(REDIRECT_MAX_CONNECTIONS);
     // Fixed for this listener's lifetime, so it's formatted once here rather than per request.
     let port_suffix: Arc<str> = if https_port == 443 {
         Arc::from("")

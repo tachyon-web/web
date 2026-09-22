@@ -27,7 +27,13 @@ where
     if let Some(info) = redirect {
         let listener = TcpListener::bind(info.addr).await?;
         drop(tokio::spawn(async move {
-            serve_http_redirect_and_challenges(listener, info.https_port, info.allowed_hosts).await;
+            serve_http_redirect_and_challenges(
+                listener,
+                info.https_port,
+                info.allowed_hosts,
+                info.limit,
+            )
+            .await;
         }));
     }
 

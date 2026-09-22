@@ -244,7 +244,7 @@ where
             let redirect_http = config.redirect_http;
 
             let state = Arc::new(self);
-            let limit = ConnectionLimit::new(state.max_connections);
+            let limit = state.connection_limit.clone();
             let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
             tokio::pin!(stream_requests);
 
@@ -432,7 +432,7 @@ where
     S: Clone + Send + Sync + 'static,
     R: futures_util::Stream<Item = tor_hsservice::RendRequest> + Send,
 {
-    let limit = ConnectionLimit::new(state.max_connections);
+    let limit = state.connection_limit.clone();
     let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
     tokio::pin!(stream_requests);
 
@@ -469,8 +469,9 @@ where
     }
 
     let onion_stream = accept_onion_stream(stream_request).await?;
-    let svc =
-        hyper::service::service_fn(move |req| hyper_handler(state.clone(), req, ONION_PEER_ADDR));
+    let svc = hyper::service::service_fn(move |req| {
+        hyper_handler(state.clone(), req, ONION_PEER_ADDR, false)
+    });
     serve_connection(onion_stream, svc).await
 }
 
@@ -501,7 +502,7 @@ where
         OnionAction::ServePlaintext => {
             let onion_stream = accept_onion_stream(stream_request).await?;
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, ONION_PEER_ADDR)
+                hyper_handler(state.clone(), req, ONION_PEER_ADDR, false)
             });
             serve_connection(onion_stream, svc).await
         }
@@ -519,6 +520,11 @@ where
                 return Ok(());
             };
             let onion_stream = accept_onion_stream(stream_request).await?;
+            let _handshake_permit = state
+                .tls_handshake_limit
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| "TLS handshake concurrency limit reached")?;
             let tls_stream = tokio::time::timeout(
                 crate::server::TLS_HANDSHAKE_TIMEOUT,
                 acceptor.accept(onion_stream),
@@ -526,7 +532,7 @@ where
             .await
             .map_err(|_| "TLS handshake timed out")??;
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, ONION_PEER_ADDR)
+                hyper_handler(state.clone(), req, ONION_PEER_ADDR, true)
             });
             serve_connection(tls_stream, svc).await
         }

@@ -169,14 +169,6 @@ Tachyon's own additions default off, the way Axum treats its extras:
 
 At least one of `http1`/`http2` must stay enabled; disabling both is a `compile_error!`.
 
-### HTTP/2 over cleartext (h2c)
-
-With `http2` on, `Server::serve_http` speaks HTTP/2 over plain TCP with no TLS and no ALPN:
-the server peeks at each connection's first bytes and switches to the HTTP/2 stack if it
-sees the client preface, falling back to HTTP/1.1 otherwise. Browsers won't use it — they
-only negotiate HTTP/2 via TLS ALPN — but `curl --http2-prior-knowledge`, gRPC clients, and
-service meshes that terminate TLS upstream will.
-
 ## Acknowledgements
 
 [Axum](https://github.com/tokio-rs/axum) *is* the application layer here — `Router`,

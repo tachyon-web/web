@@ -20,7 +20,9 @@ fn clone_preserves_every_field() {
     }
     #[cfg(feature = "tls")]
     {
-        server = server.tls_policy(crate::tls::TlsPolicy::new().tls13_only());
+        server = server
+            .tls_policy(crate::tls::TlsPolicy::new().tls13_only())
+            .max_tls_handshakes(13);
     }
 
     let cloned = server.clone();
@@ -29,7 +31,10 @@ fn clone_preserves_every_field() {
     #[cfg(feature = "http3")]
     assert_eq!(cloned.max_h3_concurrent_streams, 11);
     #[cfg(feature = "tls")]
-    assert!(cloned.tls_policy.is_some());
+    {
+        assert!(cloned.tls_policy.is_some());
+        assert_eq!(cloned.max_tls_handshakes, 13);
+    }
 }
 
 #[cfg(feature = "tls")]

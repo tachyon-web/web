@@ -51,6 +51,7 @@ use std::sync::Arc;
 pub struct TlsPolicy {
     provider: Arc<CryptoProvider>,
     versions: Vec<&'static SupportedProtocolVersion>,
+    disable_resumption: bool,
 }
 
 impl std::fmt::Debug for TlsPolicy {
@@ -58,6 +59,7 @@ impl std::fmt::Debug for TlsPolicy {
         f.debug_struct("TlsPolicy")
             .field("tls13", &self.versions.contains(&&rustls::version::TLS13))
             .field("tls12", &self.versions.contains(&&rustls::version::TLS12))
+            .field("disable_resumption", &self.disable_resumption)
             .finish_non_exhaustive()
     }
 }
@@ -92,6 +94,7 @@ impl TlsPolicy {
             Self {
                 provider: default_provider(),
                 versions: both_versions(),
+                disable_resumption: false,
             }
         }
     }
@@ -108,6 +111,7 @@ impl TlsPolicy {
         Self {
             provider,
             versions: both_versions(),
+            disable_resumption: false,
         }
     }
 
@@ -127,6 +131,7 @@ impl TlsPolicy {
         Self {
             provider: fips_provider(),
             versions: both_versions(),
+            disable_resumption: false,
         }
     }
 
@@ -135,6 +140,26 @@ impl TlsPolicy {
     pub fn tls13_only(mut self) -> Self {
         self.versions = vec![&rustls::version::TLS13];
         self
+    }
+
+    /// Enables or disables the strict replay lockdown.
+    ///
+    /// When enabled, server configurations built from this policy reject TLS 0-RTT data and
+    /// disable both stateful session caching and TLS 1.3 session tickets. The default is
+    /// `false` so callers can choose the interoperability/performance tradeoff explicitly.
+    #[must_use]
+    pub const fn disable_resumption(mut self, disable: bool) -> Self {
+        self.disable_resumption = disable;
+        self
+    }
+
+    pub(crate) fn apply_to_server_config(&self, config: &mut rustls::ServerConfig) {
+        if self.disable_resumption {
+            config.max_early_data_size = 0;
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+            config.max_tls13_tickets = 0;
+        }
     }
 
     /// The underlying crypto provider.
@@ -198,6 +223,7 @@ impl TlsPolicy {
             })?;
 
         server_config.alpn_protocols = crate::server::alpn_protocols(false);
+        self.apply_to_server_config(&mut server_config);
         Ok(server_config)
     }
 }
@@ -378,6 +404,22 @@ mod tests {
             .expect("build server config from valid PEM");
 
         assert_eq!(config.alpn_protocols, crate::server::alpn_protocols(false));
+    }
+
+    #[cfg(all(feature = "cert-gen", any(feature = "tor", feature = "i2p")))]
+    #[test]
+    fn resumption_lockdown_disables_every_resumption_path() {
+        let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+        let config = TlsPolicy::new()
+            .disable_resumption(true)
+            .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
+            .expect("build server config");
+
+        assert_eq!(config.max_early_data_size, 0);
+        assert_eq!(config.send_tls13_tickets, 0);
+        assert_eq!(config.max_tls13_tickets, 0);
+        assert!(!config.session_storage.can_cache());
     }
 
     #[cfg(all(feature = "cert-gen", any(feature = "tor", feature = "i2p")))]

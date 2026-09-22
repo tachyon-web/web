@@ -63,6 +63,7 @@ mod http;
 pub mod i2p;
 mod multi;
 mod redirect;
+mod security;
 #[cfg(feature = "tls")]
 mod tls_config;
 #[macro_use]
@@ -71,12 +72,12 @@ mod tuning;
 pub mod tor;
 
 pub use multi::MultiServer;
+pub use security::{IpNetwork, SecurityPolicy};
 #[cfg(feature = "tls")]
 pub use tls_config::{HttpsServer, RustlsConfig, bind_rustls};
 
 use axum::Router;
 use std::marker::PhantomData;
-#[cfg(feature = "tls")]
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -158,11 +159,10 @@ pub struct Server<S> {
     /// Maximum permitted request body size in bytes (default: 2 MiB, matching
     /// Axum's `DefaultBodyLimit` default).
     pub max_body_size: usize,
-    /// Maximum number of concurrent active connections per transport.
+    /// Maximum number of concurrent active connections across all transports.
     ///
-    /// Each transport owns one listener and one connection semaphore, so this is a
-    /// process-wide ceiling for that transport. Size it for downstream resources such as
-    /// database pools as well as for the server itself.
+    /// Clones of this server share one semaphore, so adding HTTP, HTTPS, HTTP/3, Tor, or I2P
+    /// listeners does not multiply the process-wide ceiling.
     ///
     /// [`serve_http`]: Server::serve_http
     /// [`serve_https`]: Server::serve_https
@@ -171,6 +171,16 @@ pub struct Server<S> {
     ///
     /// Default: 25,600.
     pub max_connections: usize,
+    pub(super) connection_limit: accept::ConnectionLimit,
+    /// Maximum number of application handlers executing concurrently across all transports.
+    pub max_active_requests: usize,
+    pub(crate) request_limit: Arc<tokio::sync::Semaphore>,
+    pub(crate) security_policy: SecurityPolicy,
+    /// Maximum number of TLS handshakes executing concurrently.
+    #[cfg(feature = "tls")]
+    pub max_tls_handshakes: usize,
+    #[cfg(feature = "tls")]
+    pub(crate) tls_handshake_limit: Arc<tokio::sync::Semaphore>,
     /// Maximum number of HTTP/3 streams handled concurrently **per QUIC connection** — see
     /// [`serve_h3`](Server::serve_h3). Distinct from [`max_connections`](Self::max_connections),
     /// which caps whole connections, not streams within one: a single peer can open many
@@ -205,6 +215,14 @@ where
             state: PhantomData,
             max_body_size: self.max_body_size,
             max_connections: self.max_connections,
+            connection_limit: self.connection_limit.clone(),
+            max_active_requests: self.max_active_requests,
+            request_limit: self.request_limit.clone(),
+            security_policy: self.security_policy.clone(),
+            #[cfg(feature = "tls")]
+            max_tls_handshakes: self.max_tls_handshakes,
+            #[cfg(feature = "tls")]
+            tls_handshake_limit: self.tls_handshake_limit.clone(),
             #[cfg(feature = "http3")]
             max_h3_concurrent_streams: self.max_h3_concurrent_streams,
             #[cfg(feature = "tls")]
@@ -223,6 +241,14 @@ impl Server<()> {
             state: PhantomData,
             max_body_size: 2 * 1024 * 1024, // 2 MiB (matches Axum's `DefaultBodyLimit` default)
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            connection_limit: accept::ConnectionLimit::new(DEFAULT_MAX_CONNECTIONS),
+            max_active_requests: DEFAULT_MAX_CONNECTIONS,
+            request_limit: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            security_policy: SecurityPolicy::new(),
+            #[cfg(feature = "tls")]
+            max_tls_handshakes: 1024,
+            #[cfg(feature = "tls")]
+            tls_handshake_limit: Arc::new(tokio::sync::Semaphore::new(1024)),
             #[cfg(feature = "http3")]
             max_h3_concurrent_streams: DEFAULT_MAX_H3_CONCURRENT_STREAMS,
             #[cfg(feature = "tls")]
@@ -244,7 +270,17 @@ where
         &self,
         mut req: Request<Body>,
         peer: std::net::SocketAddr,
+        secure_transport: bool,
     ) -> Response<Body> {
+        if let Some(response) = self
+            .security_policy
+            .inspect(&mut req, peer, secure_transport)
+        {
+            return response;
+        }
+        let Ok(_permit) = self.request_limit.clone().try_acquire_owned() else {
+            return security::empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE);
+        };
         let extensions = req.extensions_mut();
         let _ = extensions.insert(axum::extract::ConnectInfo(peer));
         match self.router.clone().oneshot(req).await {
@@ -271,11 +307,39 @@ where
         self
     }
 
-    /// Overrides the maximum number of concurrent connections per transport. Values below one
-    /// are clamped to one so a configuration mistake cannot permanently stop acceptance.
+    /// Overrides the maximum number of concurrent connections shared by all transports. Values
+    /// below one are clamped to one so a configuration mistake cannot permanently stop
+    /// acceptance.
     #[must_use]
-    pub const fn max_connections(mut self, limit: usize) -> Self {
+    pub fn max_connections(mut self, limit: usize) -> Self {
         self.max_connections = if limit == 0 { 1 } else { limit };
+        self.connection_limit = accept::ConnectionLimit::new(self.max_connections);
+        self
+    }
+
+    /// Limits application handlers executing concurrently across every transport. Excess
+    /// requests are shed immediately with `503 Service Unavailable` instead of being queued.
+    #[must_use]
+    pub fn max_active_requests(mut self, limit: usize) -> Self {
+        self.max_active_requests = if limit == 0 { 1 } else { limit };
+        self.request_limit = Arc::new(tokio::sync::Semaphore::new(self.max_active_requests));
+        self
+    }
+
+    /// Sets the request-boundary security policy.
+    #[must_use]
+    pub fn security_policy(mut self, policy: SecurityPolicy) -> Self {
+        self.security_policy = policy;
+        self
+    }
+
+    /// Limits concurrent TLS handshakes. Connections beyond the limit are dropped before
+    /// performing asymmetric cryptographic work.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn max_tls_handshakes(mut self, limit: usize) -> Self {
+        self.max_tls_handshakes = if limit == 0 { 1 } else { limit };
+        self.tls_handshake_limit = Arc::new(tokio::sync::Semaphore::new(self.max_tls_handshakes));
         self
     }
 
@@ -555,7 +619,7 @@ where
     /// [`start_all`]: Server::start_all
     #[cfg(feature = "lets-encrypt")]
     pub async fn serve_all_acme(
-        self,
+        mut self,
         tls_addr: &str,
         cleartext_addr: &str,
         domains: Vec<String>,
@@ -575,8 +639,13 @@ where
         // loaded through the same crypto provider the `ServerConfig` below negotiates with —
         // under `fips` those are distinct modules.
         let allowed_hosts: Arc<[String]> = Arc::from(domains.clone());
+        self.security_policy = self
+            .security_policy
+            .clone()
+            .with_default_allowed_hosts(allowed_hosts.clone());
         let policy = self.effective_tls_policy();
         let acme = AcmeManager::with_policy(cache_dir, domains, email, staging, &policy);
+        acme.validate_cache()?;
         let resolver = acme.resolver();
 
         // Start the background renewal loop before attempting to serve.
@@ -611,6 +680,7 @@ where
         let mut tls_config = tls_config_builder(&policy)?.with_cert_resolver(resolver);
 
         tls_config.alpn_protocols = alpn_protocols(cfg!(feature = "http3"));
+        policy.apply_to_server_config(&mut tls_config);
 
         let tls_config = Arc::new(tls_config);
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
@@ -622,14 +692,16 @@ where
         let addr = parse_addr(tls_addr)?;
         let redirect_addr = parse_addr(cleartext_addr)?;
         let https_port = parse_port(tls_addr, 443);
+        let redirect_info = RedirectInfo {
+            addr: redirect_addr,
+            https_port,
+            allowed_hosts: Some(allowed_hosts),
+            limit: self.connection_limit.clone(),
+        };
         bind_and_serve(
             self,
             addr,
-            Some(RedirectInfo {
-                addr: redirect_addr,
-                https_port,
-                allowed_hosts: Some(allowed_hosts),
-            }),
+            Some(redirect_info),
             move |server, listener| async move { server.serve_https(listener, tls_acceptor).await },
         )
         .await?;
@@ -644,7 +716,7 @@ where
     #[cfg(feature = "cert-gen")]
     #[allow(clippy::too_many_lines)]
     async fn start_all_inner(
-        self,
+        mut self,
         tls_addr: &str,
         cleartext_addr: Option<&str>,
         cert_pem: String,
@@ -663,6 +735,10 @@ where
             allowed_hosts.push(addr.ip().to_string());
         }
         let allowed_hosts: Arc<[String]> = allowed_hosts.into();
+        self.security_policy = self
+            .security_policy
+            .clone()
+            .with_default_allowed_hosts(allowed_hosts.clone());
 
         let key_der: PrivateKeyDer<'static> = crate::tls::pem::private_key(key_pem.as_bytes())
             .map_err(|e| crate::tls::pem::key_io_error(&e))?;
@@ -682,6 +758,7 @@ where
             })?;
 
         tls_config.alpn_protocols = alpn_protocols(cfg!(feature = "http3"));
+        policy.apply_to_server_config(&mut tls_config);
 
         let tls_config = Arc::new(tls_config);
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
@@ -693,6 +770,7 @@ where
                     addr,
                     https_port,
                     allowed_hosts: Some(allowed_hosts.clone()),
+                    limit: self.connection_limit.clone(),
                 })
             })
             .transpose()?;

@@ -1,0 +1,307 @@
+//! Request-boundary security policy.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+
+use axum::body::Body;
+use hyper::{Request, Response, StatusCode};
+
+const FORWARDED_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-proto",
+];
+const ENFORCE_AUTHORITY: u8 = 1;
+const STRIP_UNTRUSTED_FORWARDING: u8 = 2;
+const REJECT_CONNECT: u8 = 4;
+const ALLOW_H2C: u8 = 8;
+
+/// An IP network used to identify a trusted reverse proxy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpNetwork {
+    address: IpAddr,
+    prefix: u8,
+}
+
+impl IpNetwork {
+    /// Creates a network, rejecting a prefix that is too long for its address family.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `prefix` exceeds 32 for IPv4 or 128 for IPv6.
+    pub fn new(address: IpAddr, prefix: u8) -> Result<Self, std::io::Error> {
+        let width = if address.is_ipv4() { 32 } else { 128 };
+        if prefix > width {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "network prefix exceeds address width",
+            ));
+        }
+        Ok(Self { address, prefix })
+    }
+
+    fn contains(self, candidate: IpAddr) -> bool {
+        match (self.address, candidate) {
+            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
+                let prefix = u32::from(self.prefix);
+                let shift = 32u32.saturating_sub(prefix);
+                let mask = u32::MAX.checked_shl(shift).unwrap_or(0);
+                u32::from(network) & mask == u32::from(candidate) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
+                let prefix = u32::from(self.prefix);
+                let shift = 128u32.saturating_sub(prefix);
+                let mask = u128::MAX.checked_shl(shift).unwrap_or(0);
+                u128::from(network) & mask == u128::from(candidate) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl std::str::FromStr for IpNetwork {
+    type Err = std::io::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix) = value.split_once('/').ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "network must use CIDR notation",
+            )
+        })?;
+        let address = address.parse::<IpAddr>().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IP: {e}"))
+        })?;
+        let prefix = prefix.parse::<u8>().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid network prefix: {e}"),
+            )
+        })?;
+        Self::new(address, prefix)
+    }
+}
+
+/// Security controls applied before a request reaches the Axum router.
+#[derive(Clone, Debug)]
+pub struct SecurityPolicy {
+    allowed_hosts: Arc<[String]>,
+    trusted_proxies: Arc<[IpNetwork]>,
+    flags: u8,
+}
+
+impl SecurityPolicy {
+    /// Creates the default fail-safe request policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            allowed_hosts: Arc::from([]),
+            trusted_proxies: Arc::from([]),
+            flags: STRIP_UNTRUSTED_FORWARDING | REJECT_CONNECT,
+        }
+    }
+
+    /// Restricts requests to these case-insensitive DNS names or IP literals.
+    ///
+    /// An empty explicit list rejects every authority. Authority enforcement is disabled only
+    /// when this builder is never called.
+    #[must_use]
+    pub fn allowed_hosts(mut self, hosts: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect::<Vec<_>>().into();
+        self.flags |= ENFORCE_AUTHORITY;
+        self
+    }
+
+    /// Sets the networks allowed to supply forwarding headers.
+    #[must_use]
+    pub fn trusted_proxies(mut self, proxies: impl IntoIterator<Item = IpNetwork>) -> Self {
+        self.trusted_proxies = proxies.into_iter().collect::<Vec<_>>().into();
+        self
+    }
+
+    /// Controls removal of forwarding headers received directly from untrusted peers.
+    #[must_use]
+    pub const fn strip_untrusted_forwarding_headers(mut self, strip: bool) -> Self {
+        if strip {
+            self.flags |= STRIP_UNTRUSTED_FORWARDING;
+        } else {
+            self.flags &= !STRIP_UNTRUSTED_FORWARDING;
+        }
+        self
+    }
+
+    /// Allows or rejects the HTTP `CONNECT` method. It is rejected by default.
+    #[must_use]
+    pub const fn allow_connect(mut self, allow: bool) -> Self {
+        if allow {
+            self.flags &= !REJECT_CONNECT;
+        } else {
+            self.flags |= REJECT_CONNECT;
+        }
+        self
+    }
+
+    /// Enables HTTP/2 over plaintext connections. Disabled by default; HTTP/2 over TLS is
+    /// unaffected.
+    #[must_use]
+    pub const fn allow_h2c(mut self, allow: bool) -> Self {
+        if allow {
+            self.flags |= ALLOW_H2C;
+        } else {
+            self.flags &= !ALLOW_H2C;
+        }
+        self
+    }
+
+    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    pub(super) fn with_default_allowed_hosts(mut self, hosts: Arc<[String]>) -> Self {
+        if self.flags & ENFORCE_AUTHORITY == 0 {
+            self.allowed_hosts = hosts;
+            self.flags |= ENFORCE_AUTHORITY;
+        }
+        self
+    }
+
+    pub(super) fn inspect(
+        &self,
+        req: &mut Request<Body>,
+        peer: std::net::SocketAddr,
+        secure_transport: bool,
+    ) -> Option<Response<Body>> {
+        if self.flags & ALLOW_H2C == 0
+            && !secure_transport
+            && req.version() == hyper::Version::HTTP_2
+        {
+            return Some(empty_response(StatusCode::UPGRADE_REQUIRED));
+        }
+        if req.headers().contains_key(hyper::header::TRANSFER_ENCODING)
+            && req.headers().contains_key(hyper::header::CONTENT_LENGTH)
+        {
+            return Some(empty_response(StatusCode::BAD_REQUEST));
+        }
+        let mut lengths = req.headers().get_all(hyper::header::CONTENT_LENGTH).iter();
+        if let Some(first) = lengths.next()
+            && lengths.any(|value| value != first)
+        {
+            return Some(empty_response(StatusCode::BAD_REQUEST));
+        }
+        if self.flags & REJECT_CONNECT != 0 && req.method() == hyper::Method::CONNECT {
+            return Some(empty_response(StatusCode::METHOD_NOT_ALLOWED));
+        }
+
+        if self.flags & ENFORCE_AUTHORITY != 0 {
+            let authority = req
+                .uri()
+                .authority()
+                .map(hyper::http::uri::Authority::host)
+                .or_else(|| {
+                    req.headers()
+                        .get(hyper::header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(host_without_port)
+                });
+            if !authority.is_some_and(|host| {
+                self.allowed_hosts
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(host))
+            }) {
+                return Some(empty_response(StatusCode::MISDIRECTED_REQUEST));
+            }
+        }
+
+        let trusted = self
+            .trusted_proxies
+            .iter()
+            .any(|network| network.contains(peer.ip()));
+        if self.flags & STRIP_UNTRUSTED_FORWARDING != 0 && !trusted {
+            for header in FORWARDED_HEADERS {
+                req.headers_mut().remove(header);
+            }
+        }
+        None
+    }
+}
+
+impl Default for SecurityPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn host_without_port(host: &str) -> Option<&str> {
+    if let Some(rest) = host.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return rest.get(..end);
+    }
+    Some(host.split_once(':').map_or(host, |(name, _)| name))
+}
+
+pub(super) fn empty_response(status: StatusCode) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = status;
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cidr_contains_only_its_network() {
+        let network = "10.2.0.0/16".parse::<IpNetwork>().expect("valid CIDR");
+        assert!(network.contains("10.2.4.8".parse().expect("valid IP")));
+        assert!(!network.contains("10.3.4.8".parse().expect("valid IP")));
+    }
+
+    #[test]
+    fn policy_rejects_unknown_authorities_and_strips_spoofed_forwarding() {
+        let policy = SecurityPolicy::new().allowed_hosts(["example.com"]);
+        let mut request = Request::builder()
+            .uri("/")
+            .header("host", "example.com:443")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(Body::empty())
+            .expect("valid request");
+        assert!(
+            policy
+                .inspect(
+                    &mut request,
+                    "203.0.113.1:1".parse().expect("valid peer"),
+                    false,
+                )
+                .is_none()
+        );
+        assert!(!request.headers().contains_key("x-forwarded-for"));
+
+        request.headers_mut().insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_static("evil.example"),
+        );
+        assert_eq!(
+            policy
+                .inspect(
+                    &mut request,
+                    "203.0.113.1:1".parse().expect("valid peer"),
+                    false,
+                )
+                .expect("request rejected")
+                .status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+
+        let deny_all = SecurityPolicy::new().allowed_hosts(Vec::<String>::new());
+        assert_eq!(
+            deny_all
+                .inspect(
+                    &mut request,
+                    "203.0.113.1:1".parse().expect("valid peer"),
+                    true,
+                )
+                .expect("empty allow-list rejects every host")
+                .status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+}

@@ -128,7 +128,7 @@ where
         };
 
         let state = Arc::new(self);
-        let limit = ConnectionLimit::new(state.max_connections);
+        let limit = state.connection_limit.clone();
         while let Some(permit) = limit.acquire().await {
             let stream = accept_i2p_forever(&mut destination).await;
             let state = state.clone();
@@ -176,8 +176,9 @@ async fn handle_i2p_stream_plaintext<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    let svc =
-        hyper::service::service_fn(move |req| hyper_handler(state.clone(), req, I2P_PEER_ADDR));
+    let svc = hyper::service::service_fn(move |req| {
+        hyper_handler(state.clone(), req, I2P_PEER_ADDR, false)
+    });
     serve_connection(stream, svc).await
 }
 
@@ -197,11 +198,16 @@ where
     match tls_acceptor {
         None => {
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, I2P_PEER_ADDR)
+                hyper_handler(state.clone(), req, I2P_PEER_ADDR, false)
             });
             serve_connection(stream, svc).await
         }
         Some(acceptor) => {
+            let _handshake_permit = state
+                .tls_handshake_limit
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| "TLS handshake concurrency limit reached")?;
             let tls_stream = tokio::time::timeout(
                 crate::server::TLS_HANDSHAKE_TIMEOUT,
                 acceptor.accept(stream),
@@ -209,7 +215,7 @@ where
             .await
             .map_err(|_| "TLS handshake timed out")??;
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, I2P_PEER_ADDR)
+                hyper_handler(state.clone(), req, I2P_PEER_ADDR, true)
             });
             serve_connection(tls_stream, svc).await
         }
