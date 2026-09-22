@@ -62,6 +62,8 @@ jobs:
             flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
           - name: full (no tor/i2p)
             flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
+          - name: tls12-legacy (opt-in TLS 1.2 fallback)
+            flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tls12-legacy
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -104,5 +106,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install CMake (i2pd-sys builds its vendored C++ router)
+        run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,cnsa --all-targets
       - run: cargo test --locked -p tachyon-web --no-default-features --features http1,cnsa --lib
+      # CNSA is only ever exercised above without an anonymity transport, and `transports`
+      # only ever with `telemetry`. Both of those cfg combinations have broken the build
+      # before while every other job stayed green, so they get their own check here.
+      - run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,http2,cnsa,tor,i2p --all-targets
+      - run: cargo clippy --locked -p tachyon-web --all-targets --features tls,cert-gen,http3,tor,i2p
+      # `tls` without `cert-gen`: the self-signed arms drop out and anything only they used
+      # becomes dead. Never built before, and it was broken.
+      - run: cargo check --locked -p tachyon-web --features tls,tor
+      - run: cargo check --locked -p tachyon-web --features tls,i2p

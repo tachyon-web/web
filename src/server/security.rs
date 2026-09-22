@@ -209,6 +209,7 @@ impl SecurityPolicy {
         }
 
         if self.flags & ENFORCE_AUTHORITY != 0 {
+            // Both spellings go through `bare_host` — see its docs for why that matters.
             let authority = req
                 .uri()
                 .authority()
@@ -217,8 +218,8 @@ impl SecurityPolicy {
                     req.headers()
                         .get(hyper::header::HOST)
                         .and_then(|value| value.to_str().ok())
-                        .and_then(host_without_port)
-                });
+                })
+                .and_then(bare_host);
             if !authority.is_some_and(|host| {
                 self.allowed_hosts
                     .iter()
@@ -244,6 +245,13 @@ impl SecurityPolicy {
     ///
     /// Application values win, but singleton security fields are collapsed to exactly one
     /// value so an accidental duplicate cannot produce ambiguous wire semantics.
+    ///
+    /// Only headers whose correct value is a property of the *transport* are set here.
+    /// `Permissions-Policy` is deliberately not among them: which browser features a page
+    /// legitimately needs is a property of the application, so a transport-layer default
+    /// would either be wrong for any app that uses one of the features it denies, or so
+    /// permissive it is worth nothing. The same reasoning applies to `Content-Security-Policy`.
+    /// Set those in your own middleware; nothing here touches or overwrites them.
     pub(super) fn finalize_response<B>(&self, response: &mut Response<B>, secure_transport: bool) {
         if self.flags & HARDEN_RESPONSES == 0 {
             return;
@@ -259,13 +267,6 @@ impl SecurityPolicy {
             headers,
             hyper::header::REFERRER_POLICY,
             hyper::header::HeaderValue::from_static("no-referrer"),
-        );
-        canonicalize_singleton(
-            headers,
-            hyper::header::HeaderName::from_static("permissions-policy"),
-            hyper::header::HeaderValue::from_static(
-                "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
-            ),
         );
         if secure_transport {
             canonicalize_singleton(
@@ -299,12 +300,34 @@ impl Default for SecurityPolicy {
     }
 }
 
-fn host_without_port(host: &str) -> Option<&str> {
-    if let Some(rest) = host.strip_prefix('[') {
-        let end = rest.find(']')?;
-        return rest.get(..end);
-    }
-    Some(host.split_once(':').map_or(host, |(name, _)| name))
+/// Splits the host out of an authority — a `Host` header value or a URI authority — dropping
+/// any trailing `:port` and **preserving** an IPv6 literal's brackets, so the result is still
+/// valid spliced into a URL. [`crate::server::redirect`] builds `Location` values from this.
+///
+/// `None` only for a bracketed literal with no closing `]`, which is malformed.
+pub(super) fn authority_host(authority: &str) -> Option<&str> {
+    let Some(rest) = authority.strip_prefix('[') else {
+        return Some(authority.split(':').next().unwrap_or(authority));
+    };
+    // `bracket_end` indexes into `rest` (one past the leading `[`), so the matching `]` sits at
+    // `bracket_end + 1` in `authority` and an exclusive end bound of `bracket_end + 2` keeps it.
+    let bracket_end = rest.find(']')?;
+    authority.get(..bracket_end.saturating_add(2))
+}
+
+/// [`authority_host`] reduced to the form a host allow-list compares against: an IPv6
+/// literal's brackets removed, so `[::1]` and `::1` are one host.
+///
+/// The two spellings both reach [`SecurityPolicy::inspect`] — `Authority::host` keeps the
+/// brackets, a `Host` header never has them — so both must come through here or one address
+/// gets different answers over HTTP/1.1 and HTTP/2.
+fn bare_host(authority: &str) -> Option<&str> {
+    let host = authority_host(authority)?;
+    Some(
+        host.strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(host),
+    )
 }
 
 pub(super) fn empty_response(status: StatusCode) -> Response<Body> {
@@ -372,6 +395,63 @@ mod tests {
                 .status(),
             StatusCode::MISDIRECTED_REQUEST
         );
+    }
+
+    /// `Authority::host` keeps an IPv6 literal's brackets, a `Host` header does not. Both
+    /// forms must land on the same allow-list decision, or the same deployment answers
+    /// HTTP/1.1 and HTTP/2 differently for one address.
+    #[test]
+    fn ipv6_literal_matches_whether_it_arrives_as_authority_or_host_header() {
+        let policy = SecurityPolicy::new().allowed_hosts(["::1"]);
+        let peer: std::net::SocketAddr = "203.0.113.1:1".parse().expect("valid peer");
+
+        let mut via_authority = Request::builder()
+            .uri("http://[::1]:8443/")
+            .body(Body::empty())
+            .expect("valid request");
+        assert!(policy.inspect(&mut via_authority, peer, false).is_none());
+
+        let mut via_host = Request::builder()
+            .uri("/")
+            .header("host", "[::1]:8443")
+            .body(Body::empty())
+            .expect("valid request");
+        assert!(policy.inspect(&mut via_host, peer, false).is_none());
+
+        let mut wrong = Request::builder()
+            .uri("http://[::2]:8443/")
+            .body(Body::empty())
+            .expect("valid request");
+        assert_eq!(
+            policy
+                .inspect(&mut wrong, peer, false)
+                .expect("rejected")
+                .status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    /// `Permissions-Policy` is the application's call, not the transport's. Hardening must
+    /// neither invent one nor touch one a handler set.
+    #[test]
+    fn hardening_leaves_permissions_policy_entirely_to_the_application() {
+        let policy = SecurityPolicy::new();
+        let name = hyper::header::HeaderName::from_static("permissions-policy");
+
+        let mut untouched = empty_response(StatusCode::OK);
+        policy.finalize_response(&mut untouched, true);
+        assert!(
+            !untouched.headers().contains_key(&name),
+            "hardening must not synthesize a Permissions-Policy"
+        );
+
+        let mut application_set = empty_response(StatusCode::OK);
+        let _ = application_set.headers_mut().insert(
+            name.clone(),
+            hyper::header::HeaderValue::from_static("geolocation=(self)"),
+        );
+        policy.finalize_response(&mut application_set, true);
+        assert_eq!(application_set.headers()[&name], "geolocation=(self)");
     }
 
     #[test]

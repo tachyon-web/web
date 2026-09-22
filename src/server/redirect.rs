@@ -66,19 +66,16 @@ pub(super) fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Er
 
 /// Strips the trailing `:port` from an HTTP `Host` header value, preserving IPv6 literals'
 /// brackets (e.g. `"[::1]:8443"` → `"[::1]"`) so the result is still a valid host in a URL.
+///
+/// Thin wrapper over [`crate::server::security::authority_host`], which owns the one copy of
+/// this parsing. The allow-list in `security` compares against the *unbracketed* form while
+/// the `Location` built below needs the bracketed one — that one-line difference is the whole
+/// distinction, and keeping it here rather than in a second parser is what stops the two from
+/// drifting. A malformed literal (no closing `]`) falls through unchanged; it simply won't
+/// match the allow-list, and `resolve_redirect_host` substitutes a known-good host.
 #[cfg(feature = "tls")]
 pub(super) fn host_without_port(host: &str) -> &str {
-    let Some(rest) = host.strip_prefix('[') else {
-        return host.split(':').next().unwrap_or(host);
-    };
-    // `bracket_end` is an index into `rest` (one past the leading `[`); the matching `]` in
-    // `host` therefore sits at `bracket_end + 1`, so slicing up to (and including) that needs
-    // `..=bracket_end + 1`, i.e. an end bound of `bracket_end + 2`.
-    let Some(bracket_end) = rest.find(']') else {
-        return host;
-    };
-    let end = bracket_end.saturating_add(2);
-    host.get(..end).unwrap_or(host)
+    crate::server::security::authority_host(host).unwrap_or(host)
 }
 /// Resolves the host to put in the `Location` header of a plaintext→HTTPS redirect.
 ///

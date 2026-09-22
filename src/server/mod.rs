@@ -65,7 +65,7 @@ mod multi;
 mod redirect;
 mod security;
 #[cfg(feature = "tls")]
-mod tls_config;
+pub(crate) mod tls_config;
 #[macro_use]
 mod tuning;
 #[cfg(feature = "tor")]
@@ -169,26 +169,30 @@ pub struct Server<S> {
     /// Maximum permitted request body size in bytes (default: 2 MiB, matching
     /// Axum's `DefaultBodyLimit` default).
     pub max_body_size: usize,
-    /// Maximum number of concurrent active connections across all transports.
+    /// Maximum number of concurrent active connections across all transports — read it
+    /// back with [`max_connections`](Self::max_connections) and set it with the builder
+    /// method of the same name.
+    ///
+    /// Private because the value alone enforces nothing: the semaphore beside it is what
+    /// the accept loops actually acquire from, and the two are only kept in step by the
+    /// builder. A directly assignable field would let a caller "lower" a limit that stayed
+    /// exactly where it was.
     ///
     /// Clones of this server share one semaphore, so adding HTTP, HTTPS, HTTP/3, Tor, or I2P
     /// listeners does not multiply the process-wide ceiling.
     ///
-    /// [`serve_http`]: Server::serve_http
-    /// [`serve_https`]: Server::serve_https
-    /// [`serve_all_acme`]: Server::serve_all_acme
-    /// [`serve_h3`]: Server::serve_h3
-    ///
     /// Default: 4,096.
-    pub max_connections: usize,
+    pub(crate) max_connections: usize,
     pub(super) connection_limit: accept::ConnectionLimit,
-    /// Maximum number of application handlers executing concurrently across all transports.
-    pub max_active_requests: usize,
+    /// Maximum number of application handlers executing concurrently across all transports —
+    /// private for the same reason as [`max_connections`](Self#structfield.max_connections).
+    pub(crate) max_active_requests: usize,
     pub(crate) request_limit: Arc<tokio::sync::Semaphore>,
     pub(crate) security_policy: SecurityPolicy,
-    /// Maximum number of TLS handshakes executing concurrently.
+    /// Maximum number of TLS handshakes executing concurrently — private for the same reason
+    /// as [`max_connections`](Self#structfield.max_connections).
     #[cfg(feature = "tls")]
-    pub max_tls_handshakes: usize,
+    pub(crate) max_tls_handshakes: usize,
     #[cfg(feature = "tls")]
     pub(crate) tls_handshake_limit: Arc<tokio::sync::Semaphore>,
     /// Maximum number of HTTP/3 streams handled concurrently **per QUIC connection** — see
@@ -201,11 +205,12 @@ pub struct Server<S> {
     /// request bodies are read to completion — up to [`max_body_size`](Self::max_body_size) —
     /// *before* the handler runs (see `read_h3_body` in `server/h3.rs`). That makes this the
     /// dominant term in one QUIC connection's worst-case memory: roughly
-    /// `max_h3_concurrent_streams × max_body_size`, e.g. 256 × 2 MiB = 512 MiB at the
-    /// defaults, before `max_connections` multiplies it across connections. Size this and
-    /// `max_body_size` together if H3 traffic is expected.
+    /// `max_h3_concurrent_streams × max_body_size`, e.g. 32 × 2 MiB = 64 MiB at the
+    /// defaults, before `max_connections` multiplies it across connections (4,096 × 64 MiB
+    /// is well past any real machine, so size at least one of the three for the memory you
+    /// actually have). Size this and `max_body_size` together if H3 traffic is expected.
     ///
-    /// Default: 32.
+    /// Default: [`DEFAULT_MAX_H3_CONCURRENT_STREAMS`] (32).
     #[cfg(feature = "http3")]
     pub max_h3_concurrent_streams: usize,
     /// Crypto/TLS policy shared across every listener this `Server` runs — see
@@ -351,6 +356,28 @@ where
         self
     }
 
+    /// The effective connection ceiling shared by every transport — see
+    /// [`max_connections`](Self::max_connections).
+    #[must_use]
+    pub const fn connection_limit(&self) -> usize {
+        self.max_connections
+    }
+
+    /// The effective concurrent-handler ceiling — see
+    /// [`max_active_requests`](Self::max_active_requests).
+    #[must_use]
+    pub const fn active_request_limit(&self) -> usize {
+        self.max_active_requests
+    }
+
+    /// The effective concurrent-TLS-handshake ceiling — see
+    /// [`max_tls_handshakes`](Self::max_tls_handshakes).
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub const fn tls_handshake_limit(&self) -> usize {
+        self.max_tls_handshakes
+    }
+
     /// Sets the request-boundary security policy.
     #[must_use]
     pub fn security_policy(mut self, policy: SecurityPolicy) -> Self {
@@ -395,7 +422,7 @@ where
     }
 
     /// Overrides the maximum number of HTTP/3 streams handled concurrently **per QUIC
-    /// connection** (default: 256) — see
+    /// connection** (default: [`DEFAULT_MAX_H3_CONCURRENT_STREAMS`], 32) — see
     /// [`Server::max_h3_concurrent_streams`](Self#structfield.max_h3_concurrent_streams) for how
     /// this differs from [`max_connections`](Self::max_connections).
     ///
@@ -733,6 +760,13 @@ where
 
         tls_config.alpn_protocols = alpn_protocols(cfg!(feature = "http3"));
         policy.apply_to_server_config(&mut tls_config);
+        // Defence in depth. `TlsPolicy` is meant to be incapable of producing a
+        // non-approved config under `fips`, so this should never fire — which is exactly why
+        // it is worth asserting rather than assumed: it turns "we believe the policy is
+        // sound" into "the config actually offered is checked", and it is the only thing
+        // that would catch a rustls upgrade changing what counts as approved.
+        #[cfg(feature = "fips")]
+        assert_fips_server_config(&tls_config)?;
 
         let tls_config = Arc::new(tls_config);
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
@@ -804,9 +838,9 @@ where
         }
 
         // Shares the same crypto/TLS policy as the onion/i2p listeners — see
-        // `Server::tls_policy`. Call `.tls_policy(TlsPolicy::new().tls13_only())` (or a
-        // fully custom `TlsPolicy`) for stricter version pinning than the default (TLS 1.3
-        // and 1.2 both offered).
+        // `Server::tls_policy`. The default is TLS 1.3 only; pass a custom `TlsPolicy` to
+        // narrow the suites or groups further, or enable `tls12-legacy` to add a TLS 1.2
+        // fallback.
         let policy = self.effective_tls_policy();
         let mut tls_config = tls_config_builder(&policy)?
             .with_single_cert(cert_chain, key_der)
@@ -819,6 +853,13 @@ where
 
         tls_config.alpn_protocols = alpn_protocols(cfg!(feature = "http3"));
         policy.apply_to_server_config(&mut tls_config);
+        // Defence in depth. `TlsPolicy` is meant to be incapable of producing a
+        // non-approved config under `fips`, so this should never fire — which is exactly why
+        // it is worth asserting rather than assumed: it turns "we believe the policy is
+        // sound" into "the config actually offered is checked", and it is the only thing
+        // that would catch a rustls upgrade changing what counts as approved.
+        #[cfg(feature = "fips")]
+        assert_fips_server_config(&tls_config)?;
 
         let tls_config = Arc::new(tls_config);
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());

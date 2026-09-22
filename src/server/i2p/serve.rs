@@ -90,7 +90,10 @@ where
         #[cfg(all(feature = "tls", feature = "fips"))]
         if let AnonTls::Custom(server_config) = &config.tls {
             #[cfg(feature = "cnsa")]
-            return Err("CNSA mode rejects caller-supplied I2P TLS configurations".into());
+            {
+                let _ = server_config;
+                return Err("CNSA mode rejects caller-supplied I2P TLS configurations".into());
+            }
             #[cfg(not(feature = "cnsa"))]
             crate::server::assert_fips_server_config(server_config)?;
         }

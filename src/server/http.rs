@@ -410,7 +410,14 @@ where
         .upper()
         .is_some_and(|size| u64::try_from(state.max_body_size).is_ok_and(|limit| size > limit))
     {
-        return Ok((hyper::StatusCode::PAYLOAD_TOO_LARGE, Body::empty()).into_response());
+        // Still goes through the policy: this early return is a response like any other, and
+        // skipping it would leave the one reply a peer can trigger cheapest as the only one
+        // without `nosniff`/HSTS and with whatever `Server` header the stack added.
+        let mut response = (hyper::StatusCode::PAYLOAD_TOO_LARGE, Body::empty()).into_response();
+        state
+            .security_policy
+            .finalize_response(&mut response, secure_transport);
+        return Ok(response);
     }
     let body = body_with_deadline(incoming_body, state.max_body_size);
 

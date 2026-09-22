@@ -203,7 +203,10 @@ where
         #[cfg(all(feature = "tls", feature = "fips"))]
         if let AnonTls::Custom(server_config) = &config.tls {
             #[cfg(feature = "cnsa")]
-            return Err("CNSA mode rejects caller-supplied onion TLS configurations".into());
+            {
+                let _ = server_config;
+                return Err("CNSA mode rejects caller-supplied onion TLS configurations".into());
+            }
             #[cfg(not(feature = "cnsa"))]
             crate::server::assert_fips_server_config(server_config)?;
         }
@@ -221,9 +224,6 @@ where
             .onion_address()
             .map(|addr| addr.display_unredacted().to_string());
         crate::telemetry_info!(
-            onion_host = onion_host.as_deref().unwrap_or("<pending>"),
-            vanguards = config.vanguards,
-            tls = config.tls_enabled(),
             "[tor] onion service published at {}; vanguards={}, tls={}",
             onion_host.as_deref().unwrap_or("<pending>"),
             if config.vanguards { "on" } else { "off" },
@@ -298,6 +298,9 @@ where
         tls: &AnonTls,
         onion_host: Option<&str>,
     ) -> Result<Option<TlsAcceptor>, Box<dyn std::error::Error + Send + Sync>> {
+        // Only the `SelfSigned` arm below names a certificate, and that arm needs `cert-gen`.
+        #[cfg(not(feature = "cert-gen"))]
+        let _ = onion_host;
         match tls {
             AnonTls::None => Ok(None),
             #[cfg(feature = "cert-gen")]
@@ -513,7 +516,14 @@ where
             let onion_stream = accept_onion_stream(stream_request).await?;
             let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
                 let onion_host = onion_host.clone();
-                async move { Ok::<_, std::io::Error>(redirect_response(&req, &onion_host)) }
+                let state = state.clone();
+                async move {
+                    let mut response = redirect_response(&req, &onion_host);
+                    state
+                        .security_policy
+                        .finalize_response(&mut response, false);
+                    Ok::<_, std::io::Error>(response)
+                }
             });
             serve_connection(onion_stream, svc).await
         }

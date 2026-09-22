@@ -68,10 +68,16 @@ going to production is the serve call: `axum::serve(listener, app)` becomes
 flow-control-exhaustion mitigations) shared across every transport below, instead of
 hand-rolling it per protocol.
 
-See [`examples/`](examples/) for path/query/JSON extraction
-([`hello_world.rs`](examples/hello_world.rs)) and serving the same app over Tor and I2P at once
-([`onion_i2p_server.rs`](examples/onion_i2p_server.rs)), run with `cargo run --example <name>`.
-Some need extra features; the example file says which.
+Run any example with `cargo run --example <name>`; each file's header comment lists the
+features it needs and the commands to exercise it.
+
+| Example | Shows |
+|---|---|
+| [`hello_world.rs`](examples/hello_world.rs) | path/query/JSON extraction, custom status codes |
+| [`hardened_server.rs`](examples/hardened_server.rs) | host allow-listing, reverse-proxy trust, response hardening, DoS limits — with `curl` commands for each rejection |
+| [`self_signed_https.rs`](examples/self_signed_https.rs) | HTTPS + HTTP/3 + a redirect listener on unprivileged ports, and a `TlsPolicy` |
+| [`lets_encrypt.rs`](examples/lets_encrypt.rs) | production certificates issued and renewed in-process |
+| [`onion_i2p_server.rs`](examples/onion_i2p_server.rs) | the same app served over Tor and I2P at once |
 
 ## HTTPS
 
@@ -159,7 +165,8 @@ Tachyon's own additions default off, the way Axum treats its extras:
 
 | Flag | Default | Enables |
 |---|---|---|
-| `tls` | | TLS via `rustls` + `aws-lc-rs` |
+| `tls` | | TLS 1.3 via `rustls` + `aws-lc-rs` |
+| `tls12-legacy` | | additionally offer TLS 1.2 as a fallback. Without it no listener negotiates anything below TLS 1.3, and no `TlsPolicy` carries a TLS 1.2 cipher suite. Enable only to serve clients that have no TLS 1.3; needs `tls` |
 | `cert-gen` | | self-signed certificate generation (`tls::generate_self_signed_cert`); needs `tls` |
 | `http3` | | HTTP/3 over QUIC via [`tachyon-quic`](https://crates.io/crates/tachyon-quic) (built on `s2n-quic`); needs `tls` |
 | `lets-encrypt` | | automatic Let's Encrypt certificate management; needs `tls`, `cert-gen` |

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::server::Server;
 
 #[cfg(feature = "cnsa")]
-pub(super) fn assert_cnsa_identity(
+pub(crate) fn assert_cnsa_identity(
     certs: &[rustls::pki_types::CertificateDer<'static>],
     key: &rustls::pki_types::PrivateKeyDer<'static>,
 ) -> Result<(), std::io::Error> {
@@ -56,7 +56,9 @@ pub(super) fn assert_cnsa_identity(
 /// caller could hand any of those a ChaCha20-only or X25519-only config and it would be served
 /// as-is even in a build that otherwise enforces FIPS. `rustls::ServerConfig::fips()` is the
 /// same predicate rustls itself uses: the negotiated provider is FIPS-approved *and*
-/// `require_ems` is set (FIPS 140-3 IG D.Q).
+/// `require_ems` is set (FIPS 140-3 IG D.Q). The EMS half only has anything to bite on in a
+/// `tls12-legacy` build — extended master secret is a TLS 1.2 extension, and the default
+/// TLS-1.3-only policy has no 1.2 handshake for it to apply to.
 #[cfg(all(feature = "tls", feature = "fips"))]
 pub(super) fn assert_fips_server_config(
     config: &rustls::ServerConfig,

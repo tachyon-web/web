@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -808,17 +809,22 @@ impl AcmeManager {
     /// [`Account::builder`]'s bundled default, which resolves to rustls's process-wide
     /// default provider and doesn't honor a `fips`/custom provider passed to
     /// [`with_policy`](Self::with_policy).
+    ///
+    /// Roots come from `webpki-roots`, not the platform trust store: the only hosts this
+    /// client ever contacts are the two Let's Encrypt directory URLs in
+    /// [`provision_cert`](Self::provision_cert), so a pinned set is the tighter choice and
+    /// keeps a local trust-store edit from widening what this connection will accept.
     fn account_builder(&self) -> Result<AccountBuilder, AcmeError> {
         let connector = HttpsConnectorBuilder::new()
-            .with_provider_and_native_roots(self.provider.clone())
-            .map_err(AcmeError::Io)?
+            .with_provider_and_webpki_roots(self.provider.clone())
+            .map_err(|e| AcmeError::Io(std::io::Error::other(e)))?
             .https_only()
             .enable_http1()
             .enable_http2()
             .build();
         let client: HyperClient<_, BodyWrapper<bytes::Bytes>> =
             HyperClient::builder(TokioExecutor::new()).build(connector);
-        Ok(Account::builder_with_http(Box::new(client)))
+        Ok(Account::builder_with_http(Box::new(AcmeHttpClient(client))))
     }
 
     /// Loads existing ACME account credentials from `<cache_dir>/account-{staging|prod}.json`
@@ -881,6 +887,35 @@ impl AcmeManager {
         }
 
         Ok(account)
+    }
+}
+
+/// Adapts a `hyper_util` client to [`instant_acme::HttpClient`].
+///
+/// `instant-acme` ships this same impl, but only behind its `hyper-rustls` feature — and that
+/// feature's dependency spec pins `hyper-rustls` to `native-tokio` + `tls12`, which Cargo's
+/// feature unification would then force onto this crate's own `hyper-rustls` as well. Writing
+/// the twenty lines here is what lets [`AcmeManager::account_builder`] keep a webpki-roots,
+/// TLS-1.3-capable client instead of inheriting that pin.
+struct AcmeHttpClient<C>(HyperClient<C, BodyWrapper<bytes::Bytes>>);
+
+impl<C> instant_acme::HttpClient for AcmeHttpClient<C>
+where
+    C: hyper_util::client::legacy::connect::Connect + Clone + Send + Sync + 'static,
+{
+    fn request(
+        &self,
+        req: hyper::Request<BodyWrapper<bytes::Bytes>>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<instant_acme::BytesResponse, instant_acme::Error>> + Send>,
+    > {
+        let response = self.0.request(req);
+        Box::pin(async move {
+            response
+                .await
+                .map(instant_acme::BytesResponse::from)
+                .map_err(|e| instant_acme::Error::Other(Box::new(e)))
+        })
     }
 }
 
