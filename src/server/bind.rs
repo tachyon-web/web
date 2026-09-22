@@ -32,6 +32,7 @@ where
                 info.https_port,
                 info.allowed_hosts,
                 info.limit,
+                info.policy,
             )
             .await;
         }));

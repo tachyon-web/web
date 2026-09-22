@@ -2,7 +2,11 @@
 
 #[cfg(feature = "cert-gen")]
 mod cert_gen {
-    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P384_SHA384};
+    #[cfg(not(feature = "cnsa"))]
+    use rcgen::PKCS_ECDSA_P384_SHA384;
+    #[cfg(feature = "cnsa")]
+    use rcgen::PKCS_ML_DSA_87;
+    use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     /// A self-signed TLS certificate with both PEM and DER representations.
@@ -20,7 +24,10 @@ mod cert_gen {
         pub key_der: PrivateKeyDer<'static>,
     }
 
-    /// Generates an ephemeral self-signed ECDSA P-384 certificate for the given domains.
+    /// Generates an ephemeral self-signed certificate for the given domains.
+    ///
+    /// Ordinary builds use ECDSA P-384. A `cnsa` build instead unconditionally uses ML-DSA-87;
+    /// there is no algorithm parameter through which a caller can downgrade it.
     /// Useful for bootstrapping development servers or testing TLS connections without a real CA.
     ///
     /// # Errors
@@ -30,7 +37,11 @@ mod cert_gen {
     /// *Tachyon extension: no `axum` equivalent.*
     pub fn generate_self_signed_cert(domains: Vec<String>) -> Result<SelfSignedCert, rcgen::Error> {
         let params = CertificateParams::new(domains)?;
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384)?;
+        #[cfg(not(feature = "cnsa"))]
+        let algorithm = &PKCS_ECDSA_P384_SHA384;
+        #[cfg(feature = "cnsa")]
+        let algorithm = &PKCS_ML_DSA_87;
+        let key_pair = KeyPair::generate_for(algorithm)?;
         let cert = params.self_signed(&key_pair)?;
 
         let cert_pem = cert.pem();
@@ -50,6 +61,25 @@ mod cert_gen {
 
 #[cfg(feature = "cert-gen")]
 pub use cert_gen::{SelfSignedCert, generate_self_signed_cert};
+
+#[cfg(all(test, feature = "cert-gen", feature = "cnsa"))]
+mod cnsa_tests {
+    #[test]
+    fn generated_certificate_uses_ml_dsa_87() {
+        let cert = super::generate_self_signed_cert(vec!["localhost".to_string()])
+            .expect("generate CNSA certificate");
+        let marker = [
+            0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
+        ];
+        assert!(
+            cert.cert_der
+                .as_ref()
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "certificate does not contain the ML-DSA-87 algorithm identifier"
+        );
+    }
+}
 
 #[cfg(feature = "cert-gen")]
 pub(crate) fn certificate_dns_names(

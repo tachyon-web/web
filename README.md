@@ -163,7 +163,9 @@ Tachyon's own additions default off, the way Axum treats its extras:
 | `cert-gen` | | self-signed certificate generation (`tls::generate_self_signed_cert`); needs `tls` |
 | `http3` | | HTTP/3 over QUIC via [`tachyon-quic`](https://crates.io/crates/tachyon-quic) (built on `s2n-quic`); needs `tls` |
 | `lets-encrypt` | | automatic Let's Encrypt certificate management; needs `tls`, `cert-gen` |
-| `fips` | | enforce FIPS-mode cryptography at startup; refuses to start otherwise; needs `tls` |
+| `fips` | | use AWS-LC's FIPS 140-3 Level 1 software module in approved mode and enforce the restricted TLS policy; needs `tls` |
+| `cnsa` | | strict controlled-client CNSA 2.0 profile: FIPS mode, TLS 1.3, AES-256-GCM-SHA384, ML-KEM-1024, ML-DSA-87 self-signed certificates, and no resumption; mutually exclusive with `lets-encrypt` |
+| `telemetry` | | opt in to transport-layer `tracing` events; off by default so the layer emits no logs |
 | `tor` | | Tor v3 `.onion` support (`Server::serve_tor`/`serve_onion`) via `arti-client` |
 | `i2p` | | I2P `.b32.i2p` support (`Server::serve_i2p`/`serve_i2p_config`) via an embedded `libi2pd`. Links `unsafe` FFI — see [Tor and I2P](#tor-and-i2p) |
 

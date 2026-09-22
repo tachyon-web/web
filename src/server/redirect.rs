@@ -36,6 +36,8 @@ pub(super) struct RedirectInfo {
     pub https_port: u16,
     #[cfg(feature = "tls")]
     pub limit: ConnectionLimit,
+    #[cfg(feature = "tls")]
+    pub policy: crate::server::SecurityPolicy,
     /// The known-good hostnames this deployment serves, when available (e.g. the ACME
     /// `domains` list in [`Server::serve_all_acme`]). An inbound `Host` header that doesn't
     /// match any entry is replaced with the first domain rather than echoed into `Location`.
@@ -118,6 +120,7 @@ pub(super) async fn serve_http_redirect_and_challenges(
     https_port: u16,
     allowed_hosts: Option<Arc<[String]>>,
     limit: ConnectionLimit,
+    policy: crate::server::SecurityPolicy,
 ) {
     // This listener is bound to port 80 and reachable by anyone, so it gets exactly the same
     // hardening as the real one — `tune_http1!` carries the `header_read_timeout` that stops a
@@ -143,6 +146,7 @@ pub(super) async fn serve_http_redirect_and_challenges(
         let builder = builder.clone();
         let allowed_hosts = allowed_hosts.clone();
         let port_suffix = port_suffix.clone();
+        let policy = policy.clone();
 
         ConnectionLimit::serve(permit, async move {
             let _ = builder
@@ -151,6 +155,7 @@ pub(super) async fn serve_http_redirect_and_challenges(
                     service_fn(move |req: Request<hyper::body::Incoming>| {
                         let allowed_hosts = allowed_hosts.clone();
                         let port_suffix = port_suffix.clone();
+                        let policy = policy.clone();
                         async move {
                             // Serve ACME HTTP-01 challenge response.
                             #[cfg(feature = "lets-encrypt")]
@@ -161,11 +166,12 @@ pub(super) async fn serve_http_redirect_and_challenges(
                                     .strip_prefix("/.well-known/acme-challenge/")
                                 && let Some(key_auth) = crate::tls::acme::get_challenge(token)
                             {
-                                let resp = Response::builder()
+                                let mut resp = Response::builder()
                                     .status(200)
                                     .header("content-type", "text/plain")
                                     .body(Body::from(bytes::Bytes::from(key_auth)))
                                     .unwrap_or_else(|_| Response::new(Body::empty()));
+                                policy.finalize_response(&mut resp, false);
                                 return Ok::<_, std::convert::Infallible>(resp);
                             }
 
@@ -178,10 +184,11 @@ pub(super) async fn serve_http_redirect_and_challenges(
                                 resolve_redirect_host(host, allowed_hosts.as_deref())
                             else {
                                 // Allow-list supplied but empty — nowhere safe to send them.
-                                let resp = Response::builder()
+                                let mut resp = Response::builder()
                                     .status(400)
                                     .body(Body::empty())
                                     .unwrap_or_else(|_| Response::new(Body::empty()));
+                                policy.finalize_response(&mut resp, false);
                                 return Ok::<_, std::convert::Infallible>(resp);
                             };
                             let path_and_query = req
@@ -191,22 +198,25 @@ pub(super) async fn serve_http_redirect_and_challenges(
                             let location =
                                 format!("https://{redirect_host}{port_suffix}{path_and_query}");
 
-                            let resp = hyper::header::HeaderValue::from_bytes(location.as_bytes())
-                                .map_or_else(
-                                    |_| {
-                                        let mut resp = Response::new(Body::empty());
-                                        *resp.status_mut() = hyper::StatusCode::BAD_REQUEST;
-                                        resp
-                                    },
-                                    |location| {
-                                        let mut resp = Response::new(Body::empty());
-                                        *resp.status_mut() = hyper::StatusCode::PERMANENT_REDIRECT;
-                                        let _ = resp
-                                            .headers_mut()
-                                            .insert(hyper::header::LOCATION, location);
-                                        resp
-                                    },
-                                );
+                            let mut resp =
+                                hyper::header::HeaderValue::from_bytes(location.as_bytes())
+                                    .map_or_else(
+                                        |_| {
+                                            let mut resp = Response::new(Body::empty());
+                                            *resp.status_mut() = hyper::StatusCode::BAD_REQUEST;
+                                            resp
+                                        },
+                                        |location| {
+                                            let mut resp = Response::new(Body::empty());
+                                            *resp.status_mut() =
+                                                hyper::StatusCode::PERMANENT_REDIRECT;
+                                            let _ = resp
+                                                .headers_mut()
+                                                .insert(hyper::header::LOCATION, location);
+                                            resp
+                                        },
+                                    );
+                            policy.finalize_response(&mut resp, false);
                             Ok::<_, std::convert::Infallible>(resp)
                         }
                     }),

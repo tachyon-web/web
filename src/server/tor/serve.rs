@@ -113,7 +113,7 @@ where
         };
 
         if let Some(addr) = service.onion_address() {
-            tracing::info!(
+            crate::telemetry_info!(
                 "[tor] onion service published at {}",
                 addr.display_unredacted()
             );
@@ -202,6 +202,9 @@ where
         crate::server::enforce_fips_compliance()?;
         #[cfg(all(feature = "tls", feature = "fips"))]
         if let AnonTls::Custom(server_config) = &config.tls {
+            #[cfg(feature = "cnsa")]
+            return Err("CNSA mode rejects caller-supplied onion TLS configurations".into());
+            #[cfg(not(feature = "cnsa"))]
             crate::server::assert_fips_server_config(server_config)?;
         }
 
@@ -217,7 +220,7 @@ where
         let onion_host = service
             .onion_address()
             .map(|addr| addr.display_unredacted().to_string());
-        tracing::info!(
+        crate::telemetry_info!(
             onion_host = onion_host.as_deref().unwrap_or("<pending>"),
             vanguards = config.vanguards,
             tls = config.tls_enabled(),
@@ -265,7 +268,7 @@ where
                     )
                     .await
                     {
-                        tracing::debug!("[tor] connection error: {e}");
+                        crate::telemetry_debug!("[tor] connection error: {e}");
                     }
                 });
             }
@@ -362,21 +365,21 @@ async fn wait_until_reachable(service: &tor_hsservice::RunningOnionService) {
     let mut last_state = None;
     loop {
         let Some(status) = status_events.next().await else {
-            tracing::warn!(
+            crate::telemetry_warn!(
                 "[tor] onion service status stream ended before reporting full reachability"
             );
             return;
         };
         let state = status.state();
         if last_state != Some(state) {
-            tracing::info!("[tor] onion service status: {state:?}");
+            crate::telemetry_info!("[tor] onion service status: {state:?}");
             last_state = Some(state);
         }
         if state.is_fully_reachable() {
             break;
         }
     }
-    tracing::info!("[tor] onion service is fully reachable");
+    crate::telemetry_info!("[tor] onion service is fully reachable");
 }
 
 /// What to do with an incoming onion-service rendezvous request, given the virtual port it
@@ -443,7 +446,7 @@ where
         let state = state.clone();
         ConnectionLimit::serve(permit, async move {
             if let Err(e) = handle_plaintext_only_stream(state, stream_request).await {
-                tracing::debug!("[tor] connection error: {e}");
+                crate::telemetry_debug!("[tor] connection error: {e}");
             }
         });
     }

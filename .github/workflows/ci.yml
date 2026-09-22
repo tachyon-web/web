@@ -91,6 +91,18 @@ jobs:
           prefix-key: v1-rust
       - name: Install cmake (i2pd-sys builds its vendored C++ router)
         run: sudo apt-get update && sudo apt-get install -y cmake
-      - run: cargo doc --locked -p tachyon-web --all-features --no-deps
+      - run: cargo doc --locked -p tachyon-web --features json,matched-path,original-uri,http1,http2,tower-log,ws,form,query,tracing,telemetry,tls,cert-gen,http3,lets-encrypt,tor,i2p --no-deps
       - name: doctests
-        run: cargo test --locked -p tachyon-web --all-features --doc
+        run: cargo test --locked -p tachyon-web --features json,matched-path,original-uri,http1,http2,tower-log,ws,form,query,tracing,telemetry,tls,cert-gen,http3,lets-encrypt,tor,i2p --doc
+
+  cnsa:
+    name: strict CNSA 2.0 profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,cnsa --all-targets
+      - run: cargo test --locked -p tachyon-web --no-default-features --features http1,cnsa --lib

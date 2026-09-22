@@ -148,6 +148,52 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+macro_rules! telemetry_debug {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "telemetry")]
+        tracing::debug!($($arg)*);
+        #[cfg(not(feature = "telemetry"))]
+        let _ = format_args!($($arg)*);
+    }};
+}
+#[cfg(any(feature = "lets-encrypt", feature = "tor", feature = "i2p"))]
+macro_rules! telemetry_info {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "telemetry")]
+        tracing::info!($($arg)*);
+        #[cfg(not(feature = "telemetry"))]
+        let _ = format_args!($($arg)*);
+    }};
+}
+#[cfg(any(feature = "lets-encrypt", feature = "tor"))]
+macro_rules! telemetry_warn {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "telemetry")]
+        tracing::warn!($($arg)*);
+        #[cfg(not(feature = "telemetry"))]
+        let _ = format_args!($($arg)*);
+    }};
+}
+macro_rules! telemetry_error {
+    ($($arg:tt)*) => {{
+        #[cfg(feature = "telemetry")]
+        tracing::error!($($arg)*);
+        #[cfg(not(feature = "telemetry"))]
+        let _ = format_args!($($arg)*);
+    }};
+}
+#[cfg(any(feature = "lets-encrypt", feature = "tor", feature = "i2p"))]
+pub(crate) use telemetry_info;
+#[cfg(any(feature = "lets-encrypt", feature = "tor"))]
+pub(crate) use telemetry_warn;
+pub(crate) use {telemetry_debug, telemetry_error};
+
+#[cfg(all(feature = "cnsa", feature = "lets-encrypt"))]
+compile_error!(
+    "the `cnsa` and `lets-encrypt` features are mutually exclusive: CNSA 2.0 requires an \
+     ML-DSA-87 certificate, which public ACME services do not issue"
+);
+
 #[cfg(all(
     doctest,
     feature = "json",
@@ -163,6 +209,7 @@
     feature = "cert-gen",
     feature = "http3",
     feature = "fips",
+    not(feature = "cnsa"),
     feature = "lets-encrypt",
     feature = "tor",
     feature = "i2p",
@@ -179,6 +226,6 @@ pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub use axum::*;
+pub use server::{DeploymentProfile, MultiServer, Server};
 #[cfg(feature = "tls")]
 pub use server::{HttpsServer, RustlsConfig, bind_rustls};
-pub use server::{MultiServer, Server};

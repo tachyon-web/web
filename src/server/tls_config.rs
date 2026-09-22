@@ -6,6 +6,43 @@ use std::sync::Arc;
 
 use crate::server::Server;
 
+#[cfg(feature = "cnsa")]
+pub(super) fn assert_cnsa_identity(
+    certs: &[rustls::pki_types::CertificateDer<'static>],
+    key: &rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<(), std::io::Error> {
+    const ML_DSA_87_OID: [u8; 11] = [
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
+    ];
+    let leaf_is_ml_dsa_87 = certs.first().is_some_and(|cert| {
+        cert.as_ref()
+            .windows(ML_DSA_87_OID.len())
+            .any(|window| window == ML_DSA_87_OID)
+    });
+    if !leaf_is_ml_dsa_87 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CNSA mode requires an ML-DSA-87 leaf certificate",
+        ));
+    }
+
+    let provider = crate::tls::TlsPolicy::new().provider();
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key.clone_key())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if signing_key
+        .choose_scheme(&[rustls::SignatureScheme::ML_DSA_87])
+        .is_none()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CNSA mode requires an ML-DSA-87 private key",
+        ));
+    }
+    Ok(())
+}
+
 /// Rejects a caller-supplied `rustls::ServerConfig` that doesn't itself negotiate
 /// FIPS-140-3-approved algorithms, under the `fips` feature.
 ///
@@ -24,16 +61,41 @@ use crate::server::Server;
 pub(super) fn assert_fips_server_config(
     config: &rustls::ServerConfig,
 ) -> Result<(), std::io::Error> {
-    if config.fips() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(
-            "TLS config is not FIPS-140-3-compliant (a non-approved cipher suite or \
+    if !config.fips() {
+        return Err(std::io::Error::other(
+            "TLS config is not using the FIPS 140-3 Level 1 software module in approved mode \
+             (a non-approved cipher suite or \
              key-exchange group is offered, or TLS 1.2 extended-master-secret isn't required) \
              — build it via `TlsPolicy::fips()`/`TlsPolicy::new()` rather than \
              `rustls::ServerConfig::builder()` directly",
-        ))
+        ));
     }
+
+    #[cfg(feature = "cnsa")]
+    {
+        let provider = config.crypto_provider();
+        let suites_are_cnsa = provider.cipher_suites.len() == 1
+            && provider.cipher_suites.first().is_some_and(|suite| {
+                suite.suite() == rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+            });
+        let groups_are_cnsa = provider.kx_groups.len() == 1
+            && provider
+                .kx_groups
+                .first()
+                .is_some_and(|group| group.name() == rustls::NamedGroup::MLKEM1024);
+        let resumption_is_disabled = config.send_tls13_tickets == 0
+            && config.max_tls13_tickets == 0
+            && config.max_early_data_size == 0
+            && !config.session_storage.can_cache();
+        if !suites_are_cnsa || !groups_are_cnsa || !resumption_is_disabled {
+            return Err(std::io::Error::other(
+                "TLS config violates the compile-time CNSA profile: require TLS 1.3 \
+                 AES-256-GCM-SHA384, ML-KEM-1024, and disabled session resumption",
+            ));
+        }
+    }
+
+    Ok(())
 }
 /// Builds the ALPN protocol list for a TLS `ServerConfig`, in preference order,
 /// matching whichever of `http3`/`http2`/`http1` are actually compiled in — so
@@ -102,7 +164,8 @@ impl std::fmt::Debug for RustlsConfig {
 impl RustlsConfig {
     /// Create a new `RustlsConfig` from PEM-formatted certificate chain and private key bytes,
     /// using [`TlsPolicy::default`](crate::tls::TlsPolicy::default) — the same crypto/TLS
-    /// policy `Server::start_all`/`serve_all_acme` build from, and the FIPS-140-3-compliant
+    /// policy `Server::start_all`/`serve_all_acme` build from, and the FIPS 140-3 Level 1
+    /// approved-mode software policy
     /// one under the `fips` feature (see [`TlsPolicy`](crate::tls::TlsPolicy)'s `fips` docs).
     ///
     /// Previously this built from `rustls::ServerConfig::builder()`'s process-wide default
@@ -125,6 +188,9 @@ impl RustlsConfig {
 
         let key_der: PrivateKeyDer<'static> =
             crate::tls::pem::private_key(&key).map_err(|e| crate::tls::pem::key_io_error(&e))?;
+
+        #[cfg(feature = "cnsa")]
+        assert_cnsa_identity(&cert_chain, &key_der)?;
 
         let policy = crate::tls::TlsPolicy::default();
         let mut server_config = tls_config_builder(&policy)?
@@ -190,7 +256,12 @@ impl HttpsServer {
     /// # Errors
     /// Returns an error if compiling the router or running the server fails.
     pub async fn serve(self, router: axum::Router<()>) -> Result<(), std::io::Error> {
-        let server = Server::new(router);
+        #[cfg_attr(not(feature = "cnsa"), allow(unused_mut))]
+        let mut server = Server::new(router);
+        #[cfg(feature = "cnsa")]
+        {
+            server.cnsa_identity_verified = true;
+        }
         #[cfg_attr(not(feature = "http3"), allow(unused_mut))]
         let mut rustls_config = (*self.config.server_config).clone();
 

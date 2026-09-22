@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
+use crate::{telemetry_error as error, telemetry_info as info, telemetry_warn as warn};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
@@ -25,7 +26,6 @@ use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use tracing::{error, info, warn};
 use webpki::EndEntityCert;
 
 /// Writes `contents` to `path` with owner-only read/write access (`0600` on Unix)

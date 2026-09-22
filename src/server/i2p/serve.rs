@@ -89,6 +89,9 @@ where
         crate::server::enforce_fips_compliance()?;
         #[cfg(all(feature = "tls", feature = "fips"))]
         if let AnonTls::Custom(server_config) = &config.tls {
+            #[cfg(feature = "cnsa")]
+            return Err("CNSA mode rejects caller-supplied I2P TLS configurations".into());
+            #[cfg(not(feature = "cnsa"))]
             crate::server::assert_fips_server_config(server_config)?;
         }
         validate_nickname(&config.nickname)?;
@@ -105,7 +108,7 @@ where
             .await?;
 
         let address = destination.b32_address().to_string();
-        tracing::info!("[i2p] eepsite published at {address}");
+        crate::telemetry_info!("[i2p] eepsite published at {address}");
         if let Some(on_ready) = config.on_ready {
             on_ready(&address);
         }
@@ -140,7 +143,7 @@ where
                 #[cfg(not(feature = "tls"))]
                 let result = handle_i2p_stream_plaintext(state, stream).await;
                 if let Err(e) = result {
-                    tracing::debug!("[i2p] connection error: {e}");
+                    crate::telemetry_debug!("[i2p] connection error: {e}");
                 }
             });
         }
@@ -158,7 +161,7 @@ async fn accept_i2p_forever(destination: &mut tachyon_i2p::Destination) -> tachy
         match destination.accept().await {
             Ok(stream) => return stream,
             Err(e) => {
-                tracing::debug!("[i2p] accept error: {e}");
+                crate::telemetry_debug!("[i2p] accept error: {e}");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }

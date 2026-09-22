@@ -83,6 +83,16 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::ServiceExt as _;
 
+/// Preset for deployment controls owned by this transport layer.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeploymentProfile {
+    /// Conservative public-service limits and hardened response defaults.
+    #[default]
+    Hardened,
+    /// Hardened limits plus disabled TLS resumption and smaller anonymity/linkability surface.
+    ExtremePrivacy,
+}
+
 use axum::body::Body;
 use hyper::{Request, Response};
 #[cfg(feature = "tls")]
@@ -117,12 +127,12 @@ pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default for [`Server::max_connections`].
 ///
 /// *Tachyon extension: no `axum` equivalent.*
-pub const DEFAULT_MAX_CONNECTIONS: usize = 25_600;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 4_096;
 /// Default for [`Server::max_h3_concurrent_streams`] — see that field for how to size it.
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 #[cfg(feature = "http3")]
-pub const DEFAULT_MAX_H3_CONCURRENT_STREAMS: usize = 256;
+pub const DEFAULT_MAX_H3_CONCURRENT_STREAMS: usize = 32;
 /// How long [`Server::serve_all_acme`] waits for the first certificate to be
 /// cached or provisioned before starting the TLS listener regardless.
 #[cfg(feature = "lets-encrypt")]
@@ -169,7 +179,7 @@ pub struct Server<S> {
     /// [`serve_all_acme`]: Server::serve_all_acme
     /// [`serve_h3`]: Server::serve_h3
     ///
-    /// Default: 25,600.
+    /// Default: 4,096.
     pub max_connections: usize,
     pub(super) connection_limit: accept::ConnectionLimit,
     /// Maximum number of application handlers executing concurrently across all transports.
@@ -195,7 +205,7 @@ pub struct Server<S> {
     /// defaults, before `max_connections` multiplies it across connections. Size this and
     /// `max_body_size` together if H3 traffic is expected.
     ///
-    /// Default: 256.
+    /// Default: 32.
     #[cfg(feature = "http3")]
     pub max_h3_concurrent_streams: usize,
     /// Crypto/TLS policy shared across every listener this `Server` runs — see
@@ -203,6 +213,8 @@ pub struct Server<S> {
     /// [`TlsPolicy::new`](crate::tls::TlsPolicy::new).
     #[cfg(feature = "tls")]
     pub(crate) tls_policy: Option<crate::tls::TlsPolicy>,
+    #[cfg(feature = "cnsa")]
+    pub(crate) cnsa_identity_verified: bool,
 }
 
 impl<S> Clone for Server<S>
@@ -227,6 +239,8 @@ where
             max_h3_concurrent_streams: self.max_h3_concurrent_streams,
             #[cfg(feature = "tls")]
             tls_policy: self.tls_policy.clone(),
+            #[cfg(feature = "cnsa")]
+            cnsa_identity_verified: self.cnsa_identity_verified,
         }
     }
 }
@@ -242,8 +256,8 @@ impl Server<()> {
             max_body_size: 2 * 1024 * 1024, // 2 MiB (matches Axum's `DefaultBodyLimit` default)
             max_connections: DEFAULT_MAX_CONNECTIONS,
             connection_limit: accept::ConnectionLimit::new(DEFAULT_MAX_CONNECTIONS),
-            max_active_requests: DEFAULT_MAX_CONNECTIONS,
-            request_limit: Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            max_active_requests: 1_024,
+            request_limit: Arc::new(tokio::sync::Semaphore::new(1_024)),
             security_policy: SecurityPolicy::new(),
             #[cfg(feature = "tls")]
             max_tls_handshakes: 1024,
@@ -253,6 +267,8 @@ impl Server<()> {
             max_h3_concurrent_streams: DEFAULT_MAX_H3_CONCURRENT_STREAMS,
             #[cfg(feature = "tls")]
             tls_policy: None,
+            #[cfg(feature = "cnsa")]
+            cnsa_identity_verified: false,
         }
     }
 }
@@ -272,19 +288,28 @@ where
         peer: std::net::SocketAddr,
         secure_transport: bool,
     ) -> Response<Body> {
-        if let Some(response) = self
+        if let Some(mut response) = self
             .security_policy
             .inspect(&mut req, peer, secure_transport)
         {
+            self.security_policy
+                .finalize_response(&mut response, secure_transport);
             return response;
         }
         let Ok(_permit) = self.request_limit.clone().try_acquire_owned() else {
-            return security::empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE);
+            let mut response = security::empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE);
+            self.security_policy
+                .finalize_response(&mut response, secure_transport);
+            return response;
         };
         let extensions = req.extensions_mut();
         let _ = extensions.insert(axum::extract::ConnectInfo(peer));
         match self.router.clone().oneshot(req).await {
-            Ok(response) => response,
+            Ok(mut response) => {
+                self.security_policy
+                    .finalize_response(&mut response, secure_transport);
+                response
+            }
             Err(never) => match never {},
         }
     }
@@ -333,6 +358,32 @@ where
         self
     }
 
+    /// Applies a coherent deployment preset. Compile-time `fips` and `cnsa` restrictions still
+    /// take precedence and cannot be weakened by selecting a profile.
+    #[must_use]
+    pub fn deployment_profile(mut self, profile: DeploymentProfile) -> Self {
+        match profile {
+            DeploymentProfile::Hardened => {}
+            DeploymentProfile::ExtremePrivacy => {
+                self = self.max_connections(2_048).max_active_requests(512);
+                #[cfg(feature = "http3")]
+                {
+                    self = self.max_h3_concurrent_streams(16);
+                }
+                #[cfg(feature = "tls")]
+                {
+                    self.tls_policy = Some(
+                        self.tls_policy
+                            .take()
+                            .unwrap_or_default()
+                            .disable_resumption(true),
+                    );
+                }
+            }
+        }
+        self
+    }
+
     /// Limits concurrent TLS handshakes. Connections beyond the limit are dropped before
     /// performing asymmetric cryptographic work.
     #[cfg(feature = "tls")]
@@ -366,7 +417,7 @@ where
     /// relay connections.
     ///
     /// Not available with the `fips` feature enabled: under `fips`, every `TlsPolicy` is forced
-    /// onto the FIPS-140-3-compliant provider (see
+    /// onto the FIPS 140-3 Level 1 approved-mode software provider (see
     /// [`TlsPolicy`](crate::tls::TlsPolicy)'s `fips` docs) with no way to substitute a custom
     /// one, so this method doesn't compile in that build rather than silently ignoring the
     /// provider passed to it.
@@ -396,7 +447,8 @@ where
     /// Returns the effective [`TlsPolicy`](crate::tls::TlsPolicy) for this server: the one set
     /// via [`tls_policy`](Self::tls_policy)/[`crypto_provider`](Self::crypto_provider), or
     /// [`TlsPolicy::new`](crate::tls::TlsPolicy::new) if neither was called. With the `fips`
-    /// feature enabled, every reachable `TlsPolicy` value is already FIPS-140-3-compliant by
+    /// feature enabled, every reachable `TlsPolicy` value already uses the FIPS 140-3 Level 1
+    /// software module in approved mode by
     /// construction (see [`TlsPolicy`](crate::tls::TlsPolicy)'s `fips` docs), so there's nothing
     /// further to enforce here.
     ///
@@ -668,7 +720,7 @@ where
             .await
             .is_err()
         {
-            tracing::warn!(
+            crate::telemetry_warn!(
                 "[acme] No certificate ready after {:?}; starting TLS listener anyway — \
                  connections will fail until provisioning completes",
                 FIRST_CERT_TIMEOUT
@@ -697,6 +749,7 @@ where
             https_port,
             allowed_hosts: Some(allowed_hosts),
             limit: self.connection_limit.clone(),
+            policy: self.security_policy.clone(),
         };
         bind_and_serve(
             self,
@@ -743,6 +796,13 @@ where
         let key_der: PrivateKeyDer<'static> = crate::tls::pem::private_key(key_pem.as_bytes())
             .map_err(|e| crate::tls::pem::key_io_error(&e))?;
 
+        #[cfg(feature = "cnsa")]
+        tls_config::assert_cnsa_identity(&cert_chain, &key_der)?;
+        #[cfg(feature = "cnsa")]
+        {
+            self.cnsa_identity_verified = true;
+        }
+
         // Shares the same crypto/TLS policy as the onion/i2p listeners — see
         // `Server::tls_policy`. Call `.tls_policy(TlsPolicy::new().tls13_only())` (or a
         // fully custom `TlsPolicy`) for stricter version pinning than the default (TLS 1.3
@@ -771,6 +831,7 @@ where
                     https_port,
                     allowed_hosts: Some(allowed_hosts.clone()),
                     limit: self.connection_limit.clone(),
+                    policy: self.security_policy.clone(),
                 })
             })
             .transpose()?;

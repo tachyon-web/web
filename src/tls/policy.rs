@@ -21,8 +21,8 @@ use std::sync::Arc;
 ///
 /// # `fips`
 ///
-/// With the `fips` feature enabled, [`new`](Self::new)/[`Default::default`] always build the
-/// FIPS-140-3-compliant provider (see [`fips`](Self::fips)) — AES-256-GCM only; NIST SECP
+/// With the `fips` feature enabled, [`new`](Self::new)/[`Default::default`] always build a
+/// FIPS 140-3 Level 1 validated software provider in approved mode — AES-256-GCM only; NIST SECP
 /// curves and ML-KEM only, no X25519. There is no fallback and no override: under `fips`,
 /// `TlsPolicy::with_provider` and `Server::crypto_provider` don't compile, so a
 /// non-compliant provider can't be plugged in even by mistake — the only `CryptoProvider` a
@@ -66,6 +66,7 @@ impl std::fmt::Debug for TlsPolicy {
 
 /// Both TLS 1.3 and 1.2 — the default every constructor below starts from; narrow with
 /// [`TlsPolicy::tls13_only`].
+#[cfg(not(feature = "cnsa"))]
 fn both_versions() -> Vec<&'static SupportedProtocolVersion> {
     vec![&rustls::version::TLS13, &rustls::version::TLS12]
 }
@@ -79,13 +80,18 @@ impl TlsPolicy {
     /// AES-256-GCM and ChaCha20-Poly1305 preferred over AES-128 for both TLS 1.3 and TLS 1.2
     /// cipher suites.
     ///
-    /// With the `fips` feature: this *is* [`fips`](Self::fips) — see the [type docs](Self#fips).
+    /// With `fips`, this is the restricted FIPS policy. With `cnsa`, the stricter CNSA policy
+    /// takes precedence.
     ///
     /// Both TLS 1.3 and 1.2 are offered — see [`tls13_only`](Self::tls13_only) to pin more
     /// strictly.
     #[must_use]
     pub fn new() -> Self {
-        #[cfg(feature = "fips")]
+        #[cfg(feature = "cnsa")]
+        {
+            Self::cnsa()
+        }
+        #[cfg(all(feature = "fips", not(feature = "cnsa")))]
         {
             Self::fips()
         }
@@ -115,7 +121,7 @@ impl TlsPolicy {
         }
     }
 
-    /// The FIPS-140-3-compliant policy: AES-256-GCM cipher suites only (no ChaCha20-Poly1305
+    /// The FIPS 140-3 Level 1 approved-mode software policy: AES-256-GCM cipher suites only (no ChaCha20-Poly1305
     /// or AES-128), and only NIST SECP curves / the hybrid `SECP256R1MLKEM768` key-exchange
     /// group — no X25519 in any form, since RFC 7748 Curve25519 isn't FIPS-140-3-approved for
     /// key agreement (NIST SP 800-186 vs SP 800-56Arev3), and no standalone ML-KEM group,
@@ -125,13 +131,29 @@ impl TlsPolicy {
     /// Requires the `fips` feature, under which this is also what [`new`](Self::new) and
     /// [`Default::default`] build — see the [type docs](Self#fips) for why it's the only
     /// provider a `TlsPolicy` can hold in that build.
-    #[cfg(feature = "fips")]
+    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
     #[must_use]
     pub fn fips() -> Self {
         Self {
             provider: fips_provider(),
             versions: both_versions(),
             disable_resumption: false,
+        }
+    }
+
+    /// Strict CNSA 2.0 TLS profile for controlled, non-browser clients.
+    ///
+    /// This is TLS 1.3 with `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 as the sole key-exchange
+    /// group, and all session resumption disabled. Certificate constructors in a `cnsa` build
+    /// generate ML-DSA-87 keys. The feature implies `fips`, so AWS-LC also runs in its FIPS
+    /// 140-3 Level 1 approved software mode.
+    #[cfg(feature = "cnsa")]
+    #[must_use]
+    pub fn cnsa() -> Self {
+        Self {
+            provider: cnsa_provider(),
+            versions: vec![&rustls::version::TLS13],
+            disable_resumption: true,
         }
     }
 
@@ -149,8 +171,17 @@ impl TlsPolicy {
     /// `false` so callers can choose the interoperability/performance tradeoff explicitly.
     #[must_use]
     pub const fn disable_resumption(mut self, disable: bool) -> Self {
-        self.disable_resumption = disable;
-        self
+        #[cfg(feature = "cnsa")]
+        {
+            let _ = disable;
+            self.disable_resumption = true;
+            self
+        }
+        #[cfg(not(feature = "cnsa"))]
+        {
+            self.disable_resumption = disable;
+            self
+        }
     }
 
     pub(crate) fn apply_to_server_config(&self, config: &mut rustls::ServerConfig) {
@@ -204,6 +235,9 @@ impl TlsPolicy {
 
         let key_der: PrivateKeyDer<'static> =
             crate::tls::pem::private_key(key).map_err(|e| crate::tls::pem::key_io_error(&e))?;
+
+        #[cfg(feature = "cnsa")]
+        crate::server::tls_config::assert_cnsa_identity(&cert_chain, &key_der)?;
 
         let mut server_config = rustls::ServerConfig::builder_with_provider(self.provider())
             .with_protocol_versions(&self.versions)
@@ -277,10 +311,10 @@ fn default_provider() -> Arc<CryptoProvider> {
         .clone()
 }
 
-/// Tachyon's FIPS-140-3-compliant `CryptoProvider`: AES-256-GCM cipher suites only, and only
+/// Tachyon's FIPS 140-3 Level 1 approved-mode software `CryptoProvider`: AES-256-GCM cipher suites only, and only
 /// NIST SECP curves / ML-KEM key-exchange groups — computed once and shared. See
 /// [`TlsPolicy::fips`] for why each algorithm was chosen.
-#[cfg(feature = "fips")]
+#[cfg(all(feature = "fips", not(feature = "cnsa")))]
 fn fips_provider() -> Arc<CryptoProvider> {
     static FIPS_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
     FIPS_PROVIDER
@@ -313,11 +347,28 @@ fn fips_provider() -> Arc<CryptoProvider> {
         .clone()
 }
 
+#[cfg(feature = "cnsa")]
+fn cnsa_provider() -> Arc<CryptoProvider> {
+    static CNSA_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
+    CNSA_PROVIDER
+        .get_or_init(|| {
+            Arc::new(CryptoProvider {
+                cipher_suites: vec![
+                    rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
+                ],
+                kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM1024],
+                ..rustls::crypto::aws_lc_rs::default_provider()
+            })
+        })
+        .clone()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::TlsPolicy;
 
+    #[cfg(not(feature = "cnsa"))]
     #[test]
     fn new_offers_both_tls_versions_by_default() {
         let policy = TlsPolicy::new();
@@ -330,7 +381,7 @@ mod tests {
         assert_eq!(policy.versions(), &[&rustls::version::TLS13]);
     }
 
-    #[cfg(feature = "fips")]
+    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
     #[test]
     fn new_is_fips_by_default_under_the_fips_feature() {
         assert_eq!(
@@ -339,7 +390,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "fips")]
+    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
     #[test]
     fn fips_offers_only_aes_256_cipher_suites() {
         let provider = TlsPolicy::fips().provider();
@@ -356,7 +407,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "fips")]
+    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
     #[test]
     fn fips_offers_only_secp_and_hybrid_mlkem_kx_groups() {
         let provider = TlsPolicy::fips().provider();
@@ -373,6 +424,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "cnsa"))]
     #[test]
     fn debug_format_reports_negotiated_versions() {
         let both = format!("{:?}", TlsPolicy::new());
@@ -391,6 +443,32 @@ mod tests {
     fn install_as_process_default_is_idempotent() {
         TlsPolicy::new().install_as_process_default();
         TlsPolicy::new().tls13_only().install_as_process_default();
+    }
+
+    #[cfg(feature = "cnsa")]
+    #[test]
+    fn cnsa_is_narrow_and_disables_resumption() {
+        let policy = TlsPolicy::new().disable_resumption(false);
+        assert_eq!(policy.versions(), &[&rustls::version::TLS13]);
+        assert_eq!(policy.provider().cipher_suites.len(), 1);
+        assert_eq!(
+            policy
+                .provider()
+                .cipher_suites
+                .first()
+                .map(rustls::SupportedCipherSuite::suite),
+            Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384)
+        );
+        assert_eq!(policy.provider().kx_groups.len(), 1);
+        assert_eq!(
+            policy
+                .provider()
+                .kx_groups
+                .first()
+                .map(|group| group.name()),
+            Some(rustls::NamedGroup::MLKEM1024)
+        );
+        assert!(policy.disable_resumption);
     }
 
     #[cfg(all(feature = "cert-gen", any(feature = "tor", feature = "i2p")))]

@@ -33,7 +33,7 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 aws-lc-rs = { version = "1.17", optional = true }
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "aws-lc-rs"], optional = true }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"], optional = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "logging"], optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "tls12"], optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -41,7 +41,7 @@ serde_json = { version = "1", optional = true }
 
 # Utilities & Performance
 bytes = "1"
-tracing = "0.1"
+tracing = { version = "0.1", optional = true }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 
@@ -90,6 +90,7 @@ multipart = ["axum/multipart"]
 # No-op axum-parity features.
 tokio = []
 tracing = ["axum/tracing"]
+telemetry = ["dep:tracing"]
 macros = ["axum/macros"]
 
 # Tachyon-only additions
@@ -100,6 +101,7 @@ fips = [
     "tls", "aws-lc-rs?/fips", "rustls?/fips", "instant-acme?/fips", "rcgen?/fips",
     "tachyon-i2p?/fips", "tachyon-quic?/fips",
 ]
+cnsa = ["fips", "cert-gen", "rcgen/aws_lc_rs_unstable"]
 lets-encrypt = [
     "dep:instant-acme", "dep:serde_json", "dep:hyper-rustls", "tls", "cert-gen",
     "hyper-util/client-legacy",
@@ -175,4 +177,6 @@ name = "hello_world"
 required-features = ["json", "query"]
 
 [package.metadata.docs.rs]
-all-features = true
+# `cnsa` deliberately conflicts with `lets-encrypt`; public ACME CAs do not issue ML-DSA-87
+# certificates. Build the ordinary complete API on docs.rs and document CNSA separately.
+features = ["json", "matched-path", "original-uri", "http1", "http2", "tower-log", "ws", "form", "query", "tracing", "tls", "cert-gen", "http3", "lets-encrypt", "tor", "i2p"]

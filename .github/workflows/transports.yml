@@ -49,5 +49,5 @@ jobs:
         with:
           prefix-key: v1-rust
           key: all-features
-      - run: cargo clippy --locked -p tachyon-web --all-targets --all-features
-      - run: cargo test --locked -p tachyon-web --all-features
+      - run: cargo clippy --locked -p tachyon-web --all-targets --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tor,i2p,telemetry
+      - run: cargo test --locked -p tachyon-web --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tor,i2p,telemetry

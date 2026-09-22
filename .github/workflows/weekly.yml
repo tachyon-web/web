@@ -37,6 +37,8 @@ jobs:
       - name: Install CMake
         run: sudo apt-get update && sudo apt-get install -y cmake
       - name: cargo check
-        run: cargo check --locked -p tachyon-web --all-features --all-targets
+        run: cargo check --locked -p tachyon-web --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tor,i2p,telemetry --all-targets
       - name: clippy
-        run: cargo clippy --locked -p tachyon-web --all-features --all-targets
+        run: cargo clippy --locked -p tachyon-web --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tor,i2p,telemetry --all-targets
+      - name: CNSA profile
+        run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,cnsa --all-targets

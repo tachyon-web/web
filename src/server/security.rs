@@ -6,8 +6,12 @@ use std::sync::Arc;
 use axum::body::Body;
 use hyper::{Request, Response, StatusCode};
 
-const FORWARDED_HEADERS: [&str; 5] = [
+const FORWARDED_HEADERS: [&str; 9] = [
     "forwarded",
+    "cf-connecting-ip",
+    "client-ip",
+    "true-client-ip",
+    "x-real-ip",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-port",
@@ -17,6 +21,7 @@ const ENFORCE_AUTHORITY: u8 = 1;
 const STRIP_UNTRUSTED_FORWARDING: u8 = 2;
 const REJECT_CONNECT: u8 = 4;
 const ALLOW_H2C: u8 = 8;
+const HARDEN_RESPONSES: u8 = 16;
 
 /// An IP network used to identify a trusted reverse proxy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,7 +104,7 @@ impl SecurityPolicy {
         Self {
             allowed_hosts: Arc::from([]),
             trusted_proxies: Arc::from([]),
-            flags: STRIP_UNTRUSTED_FORWARDING | REJECT_CONNECT,
+            flags: STRIP_UNTRUSTED_FORWARDING | REJECT_CONNECT | HARDEN_RESPONSES,
         }
     }
 
@@ -151,6 +156,18 @@ impl SecurityPolicy {
             self.flags |= ALLOW_H2C;
         } else {
             self.flags &= !ALLOW_H2C;
+        }
+        self
+    }
+
+    /// Controls conservative response headers that are safe for arbitrary applications.
+    /// Enabled by default. Existing application-provided values are never overwritten.
+    #[must_use]
+    pub const fn harden_responses(mut self, harden: bool) -> Self {
+        if harden {
+            self.flags |= HARDEN_RESPONSES;
+        } else {
+            self.flags &= !HARDEN_RESPONSES;
         }
         self
     }
@@ -222,6 +239,58 @@ impl SecurityPolicy {
         }
         None
     }
+
+    /// Finalizes a response immediately before its transport encodes it.
+    ///
+    /// Application values win, but singleton security fields are collapsed to exactly one
+    /// value so an accidental duplicate cannot produce ambiguous wire semantics.
+    pub(super) fn finalize_response<B>(&self, response: &mut Response<B>, secure_transport: bool) {
+        if self.flags & HARDEN_RESPONSES == 0 {
+            return;
+        }
+        let is_error = response.status().is_client_error() || response.status().is_server_error();
+        let headers = response.headers_mut();
+        canonicalize_singleton(
+            headers,
+            hyper::header::X_CONTENT_TYPE_OPTIONS,
+            hyper::header::HeaderValue::from_static("nosniff"),
+        );
+        canonicalize_singleton(
+            headers,
+            hyper::header::REFERRER_POLICY,
+            hyper::header::HeaderValue::from_static("no-referrer"),
+        );
+        canonicalize_singleton(
+            headers,
+            hyper::header::HeaderName::from_static("permissions-policy"),
+            hyper::header::HeaderValue::from_static(
+                "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+            ),
+        );
+        if secure_transport {
+            canonicalize_singleton(
+                headers,
+                hyper::header::STRICT_TRANSPORT_SECURITY,
+                hyper::header::HeaderValue::from_static("max-age=63072000"),
+            );
+        }
+        if is_error {
+            headers
+                .entry(hyper::header::CACHE_CONTROL)
+                .or_insert(hyper::header::HeaderValue::from_static("no-store"));
+        }
+        headers.remove(hyper::header::SERVER);
+    }
+}
+
+fn canonicalize_singleton(
+    headers: &mut hyper::HeaderMap,
+    name: hyper::header::HeaderName,
+    default: hyper::header::HeaderValue,
+) {
+    let value = headers.get(&name).cloned().unwrap_or(default);
+    headers.remove(&name);
+    let _ = headers.insert(name, value);
 }
 
 impl Default for SecurityPolicy {
@@ -303,5 +372,45 @@ mod tests {
                 .status(),
             StatusCode::MISDIRECTED_REQUEST
         );
+    }
+
+    #[test]
+    fn hardened_response_headers_preserve_application_values() {
+        let policy = SecurityPolicy::new();
+        let mut response = empty_response(StatusCode::BAD_REQUEST);
+        response.headers_mut().insert(
+            hyper::header::REFERRER_POLICY,
+            hyper::header::HeaderValue::from_static("same-origin"),
+        );
+        response.headers_mut().append(
+            hyper::header::REFERRER_POLICY,
+            hyper::header::HeaderValue::from_static("unsafe-url"),
+        );
+        response.headers_mut().insert(
+            hyper::header::SERVER,
+            hyper::header::HeaderValue::from_static("secret-version"),
+        );
+
+        policy.finalize_response(&mut response, true);
+
+        assert_eq!(
+            response.headers()[hyper::header::REFERRER_POLICY],
+            "same-origin"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get_all(hyper::header::REFERRER_POLICY)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(response.headers()[hyper::header::CACHE_CONTROL], "no-store");
+        assert!(
+            response
+                .headers()
+                .contains_key(hyper::header::STRICT_TRANSPORT_SECURITY)
+        );
+        assert!(!response.headers().contains_key(hyper::header::SERVER));
     }
 }

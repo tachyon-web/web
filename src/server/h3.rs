@@ -77,7 +77,7 @@ async fn write_within<T, E>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_)) => Err(()),
         Err(_) => {
-            tracing::debug!("[h3] response write stalled; abandoning stream");
+            crate::telemetry_debug!("[h3] response write stalled; abandoning stream");
             Err(())
         }
     }
@@ -107,6 +107,13 @@ where
         self,
         mut quic_server: tachyon_quic::s2n_quic::Server,
     ) -> Result<(), std::io::Error> {
+        #[cfg(feature = "cnsa")]
+        if !self.cnsa_identity_verified {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "CNSA mode refuses an opaque caller-supplied QUIC server because its TLS identity cannot be verified",
+            ));
+        }
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
         let limit = state.connection_limit.clone();
@@ -159,7 +166,7 @@ where
                         // `REFUSED_STREAM` response: drop the resolver without resolving it,
                         // which cancels the stream, rather than processing it and starving
                         // every other stream sharing this budget.
-                        tracing::debug!(
+                        crate::telemetry_debug!(
                             "[h3] refusing stream: connection is at its in-flight limit"
                         );
                         drop(resolver);
@@ -171,7 +178,7 @@ where
                     if !err_str.contains("application error")
                         && !err_str.contains("ConnectionError")
                     {
-                        tracing::debug!("[h3] stream accept error: {}", e);
+                        crate::telemetry_debug!("[h3] stream accept error: {}", e);
                     }
                     break;
                 }
@@ -254,14 +261,12 @@ where
         let body_bytes = match self.read_h3_body(&parts, &mut stream).await {
             Ok(bytes) => bytes,
             Err(status) => {
-                let _ = stream
-                    .send_response(
-                        Response::builder()
-                            .status(status)
-                            .body(())
-                            .unwrap_or_else(|_| Response::new(())),
-                    )
-                    .await;
+                let mut response = Response::builder()
+                    .status(status)
+                    .body(())
+                    .unwrap_or_else(|_| Response::new(()));
+                self.security_policy.finalize_response(&mut response, true);
+                let _ = stream.send_response(response).await;
                 let _ = stream.finish().await;
                 return;
             }

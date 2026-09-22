@@ -134,10 +134,10 @@ async fn accept_tuned(
                 // The peer vanished before we got to it — routine, and remote-triggerable, so
                 // it must not reach `error!`. No backoff either: these consume one queued
                 // connection each, so the loop can't spin on them.
-                tracing::debug!("[{log_tag}] accept error: {e}");
+                crate::telemetry_debug!("[{log_tag}] accept error: {e}");
                 return None;
             }
-            tracing::error!("[{log_tag}] accept error: {e}");
+            crate::telemetry_error!("[{log_tag}] accept error: {e}");
             // Everything else fails again immediately on retry, so without a pause
             // `accept_forever` would spin a core flat and flood the log for as long as the
             // condition lasts.
@@ -251,7 +251,7 @@ where
                 #[cfg(all(feature = "http2", not(feature = "http1")))]
                 let result = builder.serve_connection(io, svc).await;
                 if let Err(e) = result {
-                    tracing::debug!("[http] connection error: {}", e);
+                    crate::telemetry_debug!("[http] connection error: {}", e);
                 }
             });
         }
@@ -274,6 +274,13 @@ where
         listener: TcpListener,
         acceptor: TlsAcceptor,
     ) -> Result<(), std::io::Error> {
+        #[cfg(feature = "cnsa")]
+        if !self.cnsa_identity_verified {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "CNSA mode refuses an opaque caller-supplied TLS config because its certificate identity cannot be verified",
+            ));
+        }
         crate::server::enforce_fips_compliance()?;
         #[cfg(feature = "fips")]
         crate::server::assert_fips_server_config(acceptor.config())?;
@@ -287,7 +294,7 @@ where
             ConnectionLimit::serve(permit, async move {
                 let Ok(_handshake_permit) = state.tls_handshake_limit.clone().try_acquire_owned()
                 else {
-                    tracing::debug!("[https] tls handshake shed at concurrency limit");
+                    crate::telemetry_debug!("[https] tls handshake shed at concurrency limit");
                     return;
                 };
                 let tls_stream =
@@ -296,11 +303,11 @@ where
                     {
                         Ok(Ok(stream)) => stream,
                         Ok(Err(e)) => {
-                            tracing::debug!("[https] tls handshake error: {}", e);
+                            crate::telemetry_debug!("[https] tls handshake error: {}", e);
                             return;
                         }
                         Err(_) => {
-                            tracing::debug!("[https] tls handshake timed out");
+                            crate::telemetry_debug!("[https] tls handshake timed out");
                             return;
                         }
                     };
@@ -322,7 +329,7 @@ where
                     let mut builder = hyper::server::conn::http2::Builder::new(LocalExecutor);
                     tune_http2!(builder);
                     if let Err(e) = builder.serve_connection(io, svc).await {
-                        tracing::debug!("[https] http/2 connection error: {}", e);
+                        crate::telemetry_debug!("[https] http/2 connection error: {}", e);
                     }
                     return;
                 }
@@ -339,7 +346,7 @@ where
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     tune_http1!(builder);
                     if let Err(e) = builder.serve_connection(io, svc).with_upgrades().await {
-                        tracing::debug!("[https] http/1.1 connection error: {}", e);
+                        crate::telemetry_debug!("[https] http/1.1 connection error: {}", e);
                     }
                 }
             });
