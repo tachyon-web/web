@@ -137,8 +137,11 @@ where
 
         let state = Arc::new(self);
         let limit = state.connection_limit.clone();
-        while let Some(permit) = limit.acquire().await {
+        loop {
             let stream = accept_i2p_forever(&mut destination).await;
+            let Some(permit) = limit.acquire().await else {
+                break;
+            };
             let state = state.clone();
             #[cfg(feature = "tls")]
             let tls_acceptor = tls_acceptor.clone();

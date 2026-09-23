@@ -83,9 +83,9 @@ impl ConnectionLimit {
 
     /// Waits for capacity, yielding the permits to hold for one connection's lifetime.
     ///
-    /// Acquiring *before* accepting is deliberate: a server at capacity stops taking
-    /// connections off the listen backlog rather than accepting them and immediately
-    /// queueing, so the backpressure is visible to the peer.
+    /// Callers acquire this after accepting one connection. That leaves at most one accepted
+    /// connection waiting per listener while preventing an idle listener from reserving a
+    /// global permit and starving another transport.
     ///
     /// The share is taken first. The other order would have a listener sitting on a pool
     /// permit — one every transport competes for — while it waited for its own sub-budget,

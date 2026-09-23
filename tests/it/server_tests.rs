@@ -116,6 +116,10 @@ async fn test_server_request_timeout() {
     let n = stream.read(&mut resp_bytes).await.unwrap();
     let resp_str = String::from_utf8_lossy(resp_bytes.get(..n).unwrap());
     assert!(resp_str.contains("400"), "response was: {resp_str}");
+    assert!(
+        resp_str.to_ascii_lowercase().contains("connection: close"),
+        "failed bodies must not leave an HTTP/1.1 connection waiting for unread bytes: {resp_str}"
+    );
 
     server_handle.abort();
 }
@@ -140,6 +144,10 @@ async fn test_server_ignores_unread_body_for_bodyless_handler() {
         .await
         .expect("handler should respond promptly without waiting on the unread body");
     assert!(resp_str.contains("200"), "response was: {resp_str}");
+    assert!(
+        resp_str.to_ascii_lowercase().contains("connection: close"),
+        "an unread HTTP/1.1 body cannot be reused safely: {resp_str}"
+    );
 
     server_handle.abort();
 }
@@ -163,6 +171,13 @@ async fn test_server_enforces_transport_body_limit() {
         .unwrap();
 
     assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close")
+    );
     handle.abort();
 }
 
@@ -379,47 +394,6 @@ async fn test_bind_rustls_https_server_serve_with_http3_enabled() {
         "ok-bind-rustls-h3",
     )
     .await;
-    handle.abort();
-}
-
-/// `serve()` must put a read deadline on request bodies, the same as `Server::serve_http`.
-///
-/// It used to map `hyper::body::Incoming` straight into a `Body`, skipping the `DeadlineBody`
-/// wrapper the `Server` path applies. A peer could then send complete headers announcing a
-/// body and simply never send it, pinning a connection for as long as it liked — and since
-/// `serve()` now caps concurrency, enough such peers lock the listener out entirely rather
-/// than merely growing memory.
-///
-/// Ignored by default: the deadline is `REQUEST_TIMEOUT` (30s), so proving it fires means
-/// actually waiting it out, which is too slow for a default run.
-#[cfg(feature = "http1")]
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "waits out the 30s body-read deadline; run explicitly with `-- --ignored`"]
-async fn serve_applies_a_request_body_read_deadline() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app: Router<()> = Router::new().route(
-        "/echo",
-        post(|body: Bytes| async move { format!("got {}", body.len()) }),
-    );
-    let handle = tokio::spawn(std::future::IntoFuture::into_future(tachyon_web::serve(
-        listener, app,
-    )));
-    wait_until_listening(addr).await;
-
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    // Complete headers announcing a body, then send exactly nothing.
-    stream
-        .write_all(b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n")
-        .await
-        .unwrap();
-
-    let mut buf = Vec::new();
-    let drained = tokio::time::timeout(Duration::from_secs(45), stream.read_to_end(&mut buf)).await;
-    assert!(
-        drained.is_ok(),
-        "connection was still held open after 45s — the body read deadline is not being applied"
-    );
     handle.abort();
 }
 

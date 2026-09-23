@@ -167,3 +167,47 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+
+    #[tokio::test]
+    async fn serving_without_a_transport_fails_immediately() {
+        let error = MultiServer::new(Server::new(Router::new()))
+            .serve()
+            .await
+            .expect_err("an empty transport set is invalid");
+        assert!(error.to_string().contains("no transports configured"));
+    }
+
+    #[cfg(feature = "http1")]
+    #[tokio::test]
+    async fn a_configured_http_transport_is_driven() {
+        use axum::routing::get;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("listener address");
+        let server =
+            Server::new(Router::new().route("/", get(|| async { "ok" }))).with_http(listener);
+        let task = tokio::spawn(server.serve());
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+
+        task.abort();
+        assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+    }
+}

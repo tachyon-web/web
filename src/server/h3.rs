@@ -1,4 +1,5 @@
 use bytes::{Buf, Bytes};
+use http_body_util::BodyExt as _;
 use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,8 +139,11 @@ where
         let state = Arc::new(self);
         let limit = state.connection_limit.clone();
 
-        while let Some(permit) = limit.acquire().await {
+        loop {
             let Some(conn) = quic_server.accept().await else {
+                break;
+            };
+            let Some(permit) = limit.acquire().await else {
                 break;
             };
             let state = state.clone();
@@ -223,16 +227,16 @@ where
             Bytes,
         >,
     ) -> Result<Bytes, StatusCode> {
-        let content_length = parts
-            .headers
-            .get(hyper::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<usize>().ok());
+        let content_length = crate::server::security::content_length(&parts.headers)
+            .map_err(|()| StatusCode::BAD_REQUEST)?;
 
-        if content_length.is_some_and(|len| len > self.max_body_size) {
+        if content_length
+            .is_some_and(|len| usize::try_from(len).map_or(true, |len| len > self.max_body_size))
+        {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
 
+        let content_length = content_length.and_then(|len| usize::try_from(len).ok());
         let limit = content_length.unwrap_or(self.max_body_size);
         let over_limit = if content_length.is_some() {
             StatusCode::BAD_REQUEST
@@ -318,21 +322,24 @@ where
         // handler producing data, which an SSE or long-poll route is entitled to sit on
         // indefinitely. Only the *write* is something a peer can stall, by holding its
         // flow-control window shut, and only that needs a deadline.
-        if write_within(stream.send_response(resp)).await.is_ok() {
-            use http_body_util::BodyExt;
-            let mut body = body;
-            while let Some(Ok(frame)) = body.frame().await {
-                let send_res = if let Some(data) = frame.data_ref() {
-                    write_within(stream.send_data(data.clone())).await
-                } else if let Some(trailers) = frame.trailers_ref() {
-                    write_within(stream.send_trailers(trailers.clone())).await
-                } else {
-                    Ok(())
-                };
-
-                if send_res.is_err() {
-                    break;
-                }
+        if write_within(stream.send_response(resp)).await.is_err() {
+            return;
+        }
+        let mut body = body;
+        while let Some(frame) = body.frame().await {
+            let Ok(frame) = frame else {
+                stream.stop_stream(tachyon_quic::h3::error::Code::H3_INTERNAL_ERROR);
+                return;
+            };
+            let send_res = if let Some(data) = frame.data_ref() {
+                write_within(stream.send_data(data.clone())).await
+            } else if let Some(trailers) = frame.trailers_ref() {
+                write_within(stream.send_trailers(trailers.clone())).await
+            } else {
+                Ok(())
+            };
+            if send_res.is_err() {
+                return;
             }
         }
         let _ = write_within(stream.finish()).await;

@@ -252,8 +252,11 @@ where
             let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
             tokio::pin!(stream_requests);
 
-            while let Some(permit) = limit.acquire().await {
+            loop {
                 let Some(stream_request) = stream_requests.next().await else {
+                    break;
+                };
+                let Some(permit) = limit.acquire().await else {
                     break;
                 };
                 let state = state.clone();
@@ -445,8 +448,11 @@ where
     let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
     tokio::pin!(stream_requests);
 
-    while let Some(permit) = limit.acquire().await {
+    loop {
         let Some(stream_request) = stream_requests.next().await else {
+            break;
+        };
+        let Some(permit) = limit.acquire().await else {
             break;
         };
         let state = state.clone();

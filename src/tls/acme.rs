@@ -417,7 +417,14 @@ impl AcmeManager {
     ) -> Arc<Self> {
         let cache_dir = cache_dir.into();
         let cache_existed = cache_dir.exists();
-        if let Err(e) = fs::create_dir_all(&cache_dir) {
+        let mut directory = fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let _ = directory.mode(0o700);
+        }
+        if let Err(e) = directory.create(&cache_dir) {
             error!(
                 "[acme] failed to create cache directory {:?}: {e}",
                 cache_dir

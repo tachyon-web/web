@@ -99,10 +99,20 @@ pub(super) fn resolve_redirect_host<'a>(
 ) -> Option<&'a str> {
     let candidate = crate::server::security::bare_host(host_header);
     let allowed = allowed_hosts?;
+    if let Some(candidate) = candidate
+        && let Some(entry) = allowed
+            .iter()
+            .find(|entry| crate::server::security::host_allowed(entry, candidate))
+    {
+        return Some(if entry.starts_with("*.") {
+            candidate
+        } else {
+            entry.as_str()
+        });
+    }
     allowed
         .iter()
-        .find(|d| candidate.is_some_and(|host| d.eq_ignore_ascii_case(host)))
-        .or_else(|| allowed.first())
+        .find(|entry| !entry.starts_with("*."))
         .map(String::as_str)
 }
 /// Plain HTTP listener that answers `/.well-known/acme-challenge/<token>` from the global
@@ -150,8 +160,11 @@ pub(super) async fn serve_http_redirect_and_challenges(
         Arc::from(format!(":{https_port}"))
     };
 
-    while let Some(permit) = limit.acquire().await {
+    loop {
         let (stream, _peer) = crate::server::http::accept_forever(&listener, "http-redirect").await;
+        let Some(permit) = limit.acquire().await else {
+            break;
+        };
         let io = hyper_util::rt::TokioIo::new(crate::server::stall::WriteDeadline::new(stream));
         let builder = builder.clone();
         let allowed_hosts = allowed_hosts.clone();

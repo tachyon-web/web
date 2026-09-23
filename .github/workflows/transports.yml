@@ -4,19 +4,13 @@ on:
   push:
     branches: [main]
     paths:
-      - 'src/server/tor.rs'
-      - 'src/server/i2p.rs'
-      - 'src/server/conn.rs'
-      - 'src/anonymity.rs'
+      - 'src/server/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/transports.yml'
   pull_request:
     paths:
-      - 'src/server/tor.rs'
-      - 'src/server/i2p.rs'
-      - 'src/server/conn.rs'
-      - 'src/anonymity.rs'
+      - 'src/server/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/transports.yml'

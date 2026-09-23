@@ -122,7 +122,8 @@ impl SecurityPolicy {
         }
     }
 
-    /// Restricts requests to these case-insensitive DNS names or IP literals.
+    /// Restricts requests to these case-insensitive DNS names or IP literals. A leading `*.`
+    /// matches exactly one DNS label, mirroring a wildcard certificate SAN.
     ///
     /// An empty explicit list rejects every authority. Authority enforcement is disabled only
     /// when this builder is never called.
@@ -229,10 +230,7 @@ impl SecurityPolicy {
         {
             return Some(empty_response(StatusCode::BAD_REQUEST));
         }
-        let mut lengths = req.headers().get_all(hyper::header::CONTENT_LENGTH).iter();
-        if let Some(first) = lengths.next()
-            && lengths.any(|value| value != first)
-        {
+        if content_length(req.headers()).is_err() {
             return Some(empty_response(StatusCode::BAD_REQUEST));
         }
         // RFC 9112 §3.2: more than one `Host` MUST be rejected.
@@ -242,6 +240,17 @@ impl SecurityPolicy {
             .iter()
             .nth(1)
             .is_some()
+        {
+            return Some(empty_response(StatusCode::BAD_REQUEST));
+        }
+        if req.headers().get(hyper::header::HOST).is_some_and(|value| {
+            value
+                .to_str()
+                .map_or(true, |authority| authority_host(authority).is_none())
+        }) || req
+            .uri()
+            .authority()
+            .is_some_and(|authority| authority_host(authority.as_str()).is_none())
         {
             return Some(empty_response(StatusCode::BAD_REQUEST));
         }
@@ -275,23 +284,33 @@ impl SecurityPolicy {
     }
 
     /// Every authority a handler could read must be allowed — the request target's *and* the
-    /// `Host` header's. Checking whichever came first let `GET http://allowed/` with
-    /// `Host: evil` (or an h2 `:authority` beside a conflicting `host`) reach an app that
-    /// builds links from `Host`.
+    /// `Host` header's — and, when both exist, their hosts must agree. Checking whichever came
+    /// first let `GET http://allowed/` with `Host: evil` (or two different allowed virtual
+    /// hosts) reach an app that builds links from the other value.
     fn authority_allowed(&self, req: &Request<Body>) -> bool {
         // Both spellings go through `bare_host` — see its docs for why that matters.
         let is_allowed = |authority: &str| {
             bare_host(authority).is_some_and(|host| {
                 self.allowed_hosts
                     .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(host))
+                    .any(|allowed| host_allowed(allowed, host))
             })
         };
-        let target = req.uri().authority().map(hyper::http::uri::Authority::host);
+        let target = req
+            .uri()
+            .authority()
+            .map(hyper::http::uri::Authority::as_str);
         let header = req
             .headers()
             .get(hyper::header::HOST)
             .map(|value| value.to_str().unwrap_or_default());
+        if let (Some(target), Some(header)) = (target, header)
+            && !bare_host(target).is_some_and(|target| {
+                bare_host(header).is_some_and(|header| target.eq_ignore_ascii_case(header))
+            })
+        {
+            return false;
+        }
         (target.is_some() || header.is_some())
             && target.is_none_or(is_allowed)
             && header.is_none_or(is_allowed)
@@ -360,15 +379,32 @@ impl Default for SecurityPolicy {
 /// any trailing `:port` and **preserving** an IPv6 literal's brackets, so the result is still
 /// valid spliced into a URL. [`crate::server::redirect`] builds `Location` values from this.
 ///
-/// `None` only for a bracketed literal with no closing `]`, which is malformed.
+/// Returns `None` for any malformed authority, including an invalid port or bracket suffix.
 pub(super) fn authority_host(authority: &str) -> Option<&str> {
-    let Some(rest) = authority.strip_prefix('[') else {
-        return Some(authority.split(':').next().unwrap_or(authority));
+    if authority.contains('@') {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let bracket_end = rest.find(']')?.checked_add(2)?;
+        (authority.get(..bracket_end)?, authority.get(bracket_end..)?)
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') {
+            return None;
+        }
+        (host, port)
+    } else {
+        (authority, "")
     };
-    // `bracket_end` indexes into `rest` (one past the leading `[`), so the matching `]` sits at
-    // `bracket_end + 1` in `authority` and an exclusive end bound of `bracket_end + 2` keeps it.
-    let bracket_end = rest.find(']')?;
-    authority.get(..bracket_end.saturating_add(2))
+    let port = port.strip_prefix(':').unwrap_or(port);
+    if host.is_empty()
+        || host.parse::<hyper::http::uri::Authority>().is_err()
+        || (!port.is_empty()
+            && (!port.bytes().all(|byte| byte.is_ascii_digit()) || port.parse::<u16>().is_err()))
+        || (authority.ends_with(':') && port.is_empty())
+    {
+        return None;
+    }
+    Some(host)
 }
 
 /// [`authority_host`] reduced to the form a host allow-list compares against: an IPv6
@@ -384,6 +420,45 @@ pub(super) fn bare_host(authority: &str) -> Option<&str> {
             .and_then(|rest| rest.strip_suffix(']'))
             .unwrap_or(host),
     )
+}
+
+/// Matches one normalized host against an allow-list entry. A wildcard follows certificate
+/// rules and covers exactly one label; all other entries are exact and case-insensitive.
+pub(super) fn host_allowed(allowed: &str, host: &str) -> bool {
+    let Some(suffix) = allowed.strip_prefix("*.") else {
+        return allowed.eq_ignore_ascii_case(host);
+    };
+    let Some(split) = host.len().checked_sub(suffix.len()) else {
+        return false;
+    };
+    let (Some(prefix), Some(actual_suffix)) = (host.get(..split), host.get(split..)) else {
+        return false;
+    };
+    let Some(label) = prefix.strip_suffix('.') else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.') && actual_suffix.eq_ignore_ascii_case(suffix)
+}
+
+/// Parses `Content-Length`, accepting repeated or comma-joined values only when every value
+/// is identical, as required by RFC 9110 section 8.6.
+pub(super) fn content_length(headers: &hyper::HeaderMap) -> Result<Option<u64>, ()> {
+    let mut parsed = None;
+    for value in headers.get_all(hyper::header::CONTENT_LENGTH) {
+        let value = value.to_str().map_err(|_| ())?;
+        for item in value.split(',') {
+            let item = item.trim();
+            if item.is_empty() || !item.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(());
+            }
+            let length = item.parse::<u64>().map_err(|_| ())?;
+            if parsed.is_some_and(|previous| previous != length) {
+                return Err(());
+            }
+            parsed = Some(length);
+        }
+    }
+    Ok(parsed)
 }
 
 pub(super) fn empty_response(status: StatusCode) -> Response<Body> {
@@ -535,6 +610,60 @@ mod tests {
             Some(StatusCode::BAD_REQUEST)
         );
         assert_eq!(inspect("http://example.com/", &["example.com:443"]), None);
+        assert_eq!(
+            inspect("/", &["example.com:not-a-port"]),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(inspect("/", &["[::1]junk"]), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            inspect("http://user@example.com/", &[]),
+            Some(StatusCode::BAD_REQUEST)
+        );
+
+        let policy = SecurityPolicy::new().allowed_hosts(["a.example", "b.example"]);
+        let mut conflicting = Request::builder()
+            .uri("http://a.example/")
+            .header("host", "b.example")
+            .body(Body::empty())
+            .expect("valid request");
+        assert_eq!(
+            policy
+                .inspect(&mut conflicting, peer, false)
+                .expect("conflicting authorities are rejected")
+                .status(),
+            StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+
+    #[test]
+    fn content_length_values_must_be_valid_and_unambiguous() {
+        let parse = |values: &[&str]| {
+            let mut headers = hyper::HeaderMap::new();
+            for value in values {
+                headers.append(
+                    hyper::header::CONTENT_LENGTH,
+                    hyper::header::HeaderValue::from_str(value).expect("valid header value"),
+                );
+            }
+            content_length(&headers)
+        };
+
+        assert_eq!(parse(&[]), Ok(None));
+        assert_eq!(parse(&["42", "42"]), Ok(Some(42)));
+        assert_eq!(parse(&["42, 42"]), Ok(Some(42)));
+        assert_eq!(parse(&["42", "43"]), Err(()));
+        assert_eq!(parse(&["42, 43"]), Err(()));
+        assert_eq!(parse(&["invalid"]), Err(()));
+        assert_eq!(parse(&["+42"]), Err(()));
+    }
+
+    #[test]
+    fn wildcard_hosts_cover_exactly_one_label() {
+        assert!(host_allowed("*.example.com", "www.example.com"));
+        assert!(host_allowed("*.EXAMPLE.com", "WWW.example.COM"));
+        assert!(!host_allowed("*.example.com", "example.com"));
+        assert!(!host_allowed("*.example.com", "a.b.example.com"));
+        assert!(!host_allowed("*.example.com", ".example.com"));
     }
 
     /// A WebSocket over HTTP/2 arrives as extended CONNECT; refusing it with the tunnel form

@@ -16,6 +16,7 @@ use hyper::{Request, Response};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 #[cfg(feature = "tls")]
@@ -23,6 +24,9 @@ use tokio_rustls::TlsAcceptor;
 
 /// The slowest a request body may arrive once [`REQUEST_TIMEOUT`]'s grace period is spent.
 const MIN_BODY_RATE: u64 = 16 * 1024;
+const BODY_ACTIVE: u8 = 0;
+const BODY_COMPLETE: u8 = 1;
+const BODY_FAILED: u8 = 2;
 
 /// Extra time a body earns by delivering `bytes`, at [`MIN_BODY_RATE`].
 ///
@@ -54,16 +58,18 @@ pin_project_lite::pin_project! {
         deadline: Option<Pin<Box<tokio::time::Sleep>>>,
         remaining: usize,
         failed: bool,
+        status: Arc<AtomicU8>,
     }
 }
 
 impl<B> DeadlineBody<B> {
-    const fn new(inner: B, max_body_size: usize) -> Self {
+    const fn new(inner: B, max_body_size: usize, status: Arc<AtomicU8>) -> Self {
         Self {
             inner,
             deadline: None,
             remaining: max_body_size,
             failed: false,
+            status,
         }
     }
 }
@@ -89,6 +95,7 @@ where
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(REQUEST_TIMEOUT)));
         if deadline.as_mut().poll(cx).is_ready() {
             *this.failed = true;
+            this.status.store(BODY_FAILED, Ordering::Release);
             return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "timed out reading request body",
@@ -99,6 +106,7 @@ where
                 if let Some(data) = frame.data_ref() {
                     let Some(remaining) = this.remaining.checked_sub(data.len()) else {
                         *this.failed = true;
+                        this.status.store(BODY_FAILED, Ordering::Release);
                         return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "request body exceeds configured limit",
@@ -114,8 +122,14 @@ where
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(axum::Error::new(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => {
+                this.status.store(BODY_FAILED, Ordering::Release);
+                Poll::Ready(Some(Err(axum::Error::new(e))))
+            }
+            Poll::Ready(None) => {
+                this.status.store(BODY_COMPLETE, Ordering::Release);
+                Poll::Ready(None)
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -277,8 +291,11 @@ where
         };
 
         let limit = state.connection_limit.clone();
-        while let Some(permit) = limit.acquire().await {
+        loop {
             let (stream, peer) = accept_forever(&listener, "http").await;
+            let Some(permit) = limit.acquire().await else {
+                break;
+            };
             let state = state.clone();
             #[cfg(feature = "http1")]
             let http1 = http1.clone();
@@ -340,8 +357,11 @@ where
         crate::server::assert_fips_server_config(acceptor.config())?;
         let state = Arc::new(self);
         let limit = state.connection_limit.clone();
-        while let Some(permit) = limit.acquire().await {
+        loop {
             let (tcp_stream, peer) = accept_forever(&listener, "https").await;
+            let Some(permit) = limit.acquire().await else {
+                break;
+            };
             let acceptor = acceptor.clone();
             let state = state.clone();
 
@@ -441,11 +461,18 @@ where
 /// can send complete headers declaring a body and then dribble it forever, pinning a
 /// connection permit for as long as it likes — `serve()` used to map `Incoming` straight into
 /// a `Body`, and so had no body-read timeout at all.
-pub(super) fn body_with_deadline(incoming: hyper::body::Incoming, max_body_size: usize) -> Body {
+fn body_with_deadline(
+    incoming: hyper::body::Incoming,
+    max_body_size: usize,
+) -> (Body, Option<Arc<AtomicU8>>) {
     if HyperBody::is_end_stream(&incoming) {
-        Body::empty()
+        (Body::empty(), None)
     } else {
-        Body::new(DeadlineBody::new(incoming, max_body_size))
+        let status = Arc::new(AtomicU8::new(BODY_ACTIVE));
+        (
+            Body::new(DeadlineBody::new(incoming, max_body_size, status.clone())),
+            Some(status),
+        )
     }
 }
 
@@ -471,21 +498,45 @@ where
         state
             .security_policy
             .finalize_response(&mut response, secure_transport);
+        if matches!(
+            parts.version,
+            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+        ) && !incoming_body.is_end_stream()
+        {
+            let _ = response.headers_mut().insert(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("close"),
+            );
+        }
         return Ok(response);
     }
-    let body = body_with_deadline(incoming_body, state.max_body_size);
+    let is_http1 = matches!(
+        parts.version,
+        hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+    );
+    let (body, body_status) = body_with_deadline(incoming_body, state.max_body_size);
 
-    Ok(state
+    let mut response = state
         .dispatch(Request::from_parts(parts, body), peer, secure_transport)
-        .await)
+        .await;
+    if is_http1 && body_status.is_some_and(|status| status.load(Ordering::Acquire) != BODY_COMPLETE)
+    {
+        let _ = response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DeadlineBody, REQUEST_TIMEOUT, body_time_earned};
+    use super::{BODY_ACTIVE, DeadlineBody, REQUEST_TIMEOUT, body_time_earned};
     use bytes::Bytes;
     use http_body_util::{BodyExt as _, StreamBody};
     use hyper::body::Frame;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU8;
     use std::time::Duration;
 
     /// An upload that keeps a floor rate outlives the old fixed 30s window; one that stalls is
@@ -496,6 +547,7 @@ mod tests {
         let mut body = DeadlineBody::new(
             StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)),
             usize::MAX,
+            Arc::new(AtomicU8::new(BODY_ACTIVE)),
         );
         let gap = REQUEST_TIMEOUT.saturating_sub(Duration::from_secs(5));
         let mut chunk_len = 1;

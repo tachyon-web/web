@@ -5,6 +5,43 @@ use super::*;
 use crate::server::redirect::resolve_redirect_host;
 use axum::Router;
 
+/// An idle listener must not reserve the only global connection permit. Otherwise a
+/// multi-transport server configured with a limit of one can serve whichever listener wins a
+/// startup race and permanently starve every other transport.
+#[cfg(feature = "http1")]
+#[tokio::test]
+async fn idle_listeners_do_not_hoard_connection_permits() {
+    use axum::routing::get;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let idle_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind idle");
+    let active_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind active");
+    let active_addr = active_listener.local_addr().expect("active address");
+    let server = Server::new(Router::new().route("/", get(|| async { "ok" }))).max_connections(1);
+
+    let idle_task = tokio::spawn(server.clone().serve_http(idle_listener));
+    tokio::task::yield_now().await;
+    let active_task = tokio::spawn(server.serve_http(active_listener));
+
+    let exchange = async {
+        let mut stream = tokio::net::TcpStream::connect(active_addr).await?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        Ok::<_, std::io::Error>(response)
+    };
+    let response = tokio::time::timeout(Duration::from_secs(2), exchange)
+        .await
+        .expect("active listener was starved")
+        .expect("request succeeds");
+
+    idle_task.abort();
+    active_task.abort();
+    assert!(String::from_utf8_lossy(&response).contains("200 OK"));
+}
+
 /// `Server::clone` is hand-written (the field list is feature-gated, so `derive` can't be
 /// used); this catches a field being dropped when a new one is added.
 #[test]
@@ -55,6 +92,10 @@ fn authority_host_strips_the_port_and_keeps_ipv6_brackets() {
         None,
         "unclosed literal is malformed"
     );
+    assert_eq!(authority_host("[::1]junk"), None);
+    assert_eq!(authority_host("example.com:not-a-port"), None);
+    assert_eq!(authority_host("example.com:65536"), None);
+    assert_eq!(authority_host("user@example.com"), None);
 }
 
 /// An IPv6 allow-list entry is stored unbracketed — that is the form the host check compares
@@ -92,6 +133,24 @@ fn resolve_redirect_host_accepts_a_matching_allowed_host() {
     assert_eq!(
         resolve_redirect_host("www.example.com", Some(&allowed)),
         Some("www.example.com")
+    );
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn wildcard_redirect_hosts_match_one_label_without_emitting_the_wildcard() {
+    let allowed = vec!["*.example.com".to_string()];
+    assert_eq!(
+        resolve_redirect_host("www.example.com:80", Some(&allowed)),
+        Some("www.example.com")
+    );
+    assert_eq!(
+        resolve_redirect_host("a.b.example.com:80", Some(&allowed)),
+        None
+    );
+    assert_eq!(
+        resolve_redirect_host("example.com:80", Some(&allowed)),
+        None
     );
 }
 
