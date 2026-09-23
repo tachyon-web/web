@@ -58,7 +58,7 @@ pub(super) fn spawn_h3_beside<S>(
     server: &Server<S>,
     config: Arc<rustls::ServerConfig>,
     listener: &tokio::net::TcpListener,
-) -> Result<(), std::io::Error>
+) -> Result<crate::server::BackgroundTask, std::io::Error>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -69,10 +69,13 @@ where
     )
     .map_err(std::io::Error::other)?;
     let server = server.clone();
-    drop(tokio::spawn(async move {
-        let _ = server.serve_h3(quic_server).await;
-    }));
-    Ok(())
+    Ok(crate::server::BackgroundTask::new(tokio::spawn(
+        async move {
+            if let Err(error) = server.serve_h3(quic_server).await {
+                crate::telemetry_error!("[h3] server stopped: {error}");
+            }
+        },
+    )))
 }
 
 /// Bounds one response-write await by [`RESPONSE_WRITE_TIMEOUT`], collapsing a stall into the

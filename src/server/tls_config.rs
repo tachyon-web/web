@@ -282,9 +282,11 @@ impl HttpsServer {
             None,
             move |server, listener| async move {
                 #[cfg(feature = "http3")]
-                if serve_http3 {
-                    super::h3::spawn_h3_beside(&server, config, &listener)?;
-                }
+                let _h3_task = if serve_http3 {
+                    Some(super::h3::spawn_h3_beside(&server, config, &listener)?)
+                } else {
+                    None
+                };
                 server.serve_https(listener, acceptor).await
             },
         )

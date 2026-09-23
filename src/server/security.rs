@@ -6,21 +6,31 @@ use std::sync::Arc;
 use axum::body::Body;
 use hyper::{Request, Response, StatusCode};
 
-const FORWARDED_HEADERS: [&str; 16] = [
+const FORWARDED_HEADERS: [&str; 26] = [
     "forwarded",
     "cf-connecting-ip",
     "client-ip",
+    "cloudfront-viewer-address",
+    "do-connecting-ip",
     "fastly-client-ip",
+    "fly-client-ip",
+    "proxy-client-ip",
     "true-client-ip",
+    "wl-proxy-client-ip",
     "x-client-ip",
     "x-cluster-client-ip",
+    "x-envoy-external-address",
     "x-real-ip",
+    "x-forwarded-client-cert",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-port",
     "x-forwarded-prefix",
     "x-forwarded-proto",
     "x-forwarded-server",
+    "x-original-forwarded-for",
+    "x-original-host",
+    "x-original-proto",
     "x-original-url",
     "x-rewrite-url",
 ];
@@ -284,9 +294,9 @@ impl SecurityPolicy {
     }
 
     /// Every authority a handler could read must be allowed — the request target's *and* the
-    /// `Host` header's — and, when both exist, their hosts must agree. Checking whichever came
-    /// first let `GET http://allowed/` with `Host: evil` (or two different allowed virtual
-    /// hosts) reach an app that builds links from the other value.
+    /// `Host` header's — and, when both exist, their hosts and effective ports must agree.
+    /// Checking whichever came first let `GET http://allowed/` with `Host: evil` (or two
+    /// conflicting authorities) reach an app that builds links from the other value.
     fn authority_allowed(&self, req: &Request<Body>) -> bool {
         // Both spellings go through `bare_host` — see its docs for why that matters.
         let is_allowed = |authority: &str| {
@@ -305,9 +315,7 @@ impl SecurityPolicy {
             .get(hyper::header::HOST)
             .map(|value| value.to_str().unwrap_or_default());
         if let (Some(target), Some(header)) = (target, header)
-            && !bare_host(target).is_some_and(|target| {
-                bare_host(header).is_some_and(|header| target.eq_ignore_ascii_case(header))
-            })
+            && !authorities_match(target, header, req.uri().scheme_str())
         {
             return false;
         }
@@ -357,6 +365,33 @@ impl SecurityPolicy {
         }
         headers.remove(hyper::header::SERVER);
     }
+}
+
+/// Compares every part of two authorities that can affect URL construction. Omitting a
+/// scheme's default port is equivalent to spelling it explicitly; any other port mismatch is
+/// rejected so handlers cannot see a trusted request-target host beside an attacker-chosen
+/// `Host` port.
+fn authorities_match(target: &str, header: &str, scheme: Option<&str>) -> bool {
+    let hosts_match = bare_host(target).is_some_and(|target| {
+        bare_host(header).is_some_and(|header| target.eq_ignore_ascii_case(header))
+    });
+    if !hosts_match {
+        return false;
+    }
+
+    let default_port = match scheme {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => Some(80),
+        Some(scheme) if scheme.eq_ignore_ascii_case("https") => Some(443),
+        _ => None,
+    };
+    let port = |authority: &str| {
+        authority
+            .parse::<hyper::http::uri::Authority>()
+            .ok()
+            .and_then(|authority| authority.port_u16())
+            .or(default_port)
+    };
+    port(target) == port(header)
 }
 
 fn canonicalize_singleton(
@@ -498,6 +533,7 @@ mod tests {
             Request::builder()
                 .uri("/")
                 .header("x-forwarded-for", "198.51.100.7")
+                .header("x-forwarded-client-cert", "spoofed-client-identity")
                 .body(Body::empty())
                 .expect("valid request")
         };
@@ -505,11 +541,13 @@ mod tests {
         let mut anonymous = request();
         assert!(policy.inspect(&mut anonymous, None, false).is_none());
         assert!(!anonymous.headers().contains_key("x-forwarded-for"));
+        assert!(!anonymous.headers().contains_key("x-forwarded-client-cert"));
 
         let mut proxied = request();
         let proxy = Some("0.0.0.0:0".parse().expect("valid peer"));
         assert!(policy.inspect(&mut proxied, proxy, false).is_none());
         assert!(proxied.headers().contains_key("x-forwarded-for"));
+        assert!(proxied.headers().contains_key("x-forwarded-client-cert"));
     }
 
     /// Deriving no hostnames (a certificate with only IP SANs, say) means "nothing was
@@ -609,7 +647,12 @@ mod tests {
             inspect("/", &["example.com", "evil.example"]),
             Some(StatusCode::BAD_REQUEST)
         );
-        assert_eq!(inspect("http://example.com/", &["example.com:443"]), None);
+        assert_eq!(inspect("http://example.com/", &["example.com:80"]), None);
+        assert_eq!(
+            inspect("http://example.com/", &["example.com:443"]),
+            Some(StatusCode::MISDIRECTED_REQUEST)
+        );
+        assert_eq!(inspect("https://example.com:443/", &["example.com"]), None);
         assert_eq!(
             inspect("/", &["example.com:not-a-port"]),
             Some(StatusCode::BAD_REQUEST)

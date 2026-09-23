@@ -500,9 +500,17 @@ impl AcmeManager {
     /// # Panics
     /// Never panics. All errors are logged via [`tracing`].
     pub fn start(self: Arc<Self>) {
-        drop(tokio::spawn(async move {
+        drop(self.spawn_task());
+    }
+
+    pub(crate) fn start_guarded(self: Arc<Self>) -> crate::server::BackgroundTask {
+        crate::server::BackgroundTask::new(self.spawn_task())
+    }
+
+    fn spawn_task(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
             self.run_loop().await;
-        }));
+        })
     }
 
     /// Internal background loop. Runs forever with controlled sleep intervals.
@@ -628,8 +636,8 @@ impl AcmeManager {
             .ok()
     }
 
-    /// Verifies that every domain this manager is configured for is covered by the
-    /// certificate's Subject Alternative Names.
+    /// Verifies that the certificate's Subject Alternative Names exactly match the domains
+    /// this manager is configured for.
     ///
     /// A cached certificate is only safe to reuse if it was actually issued for the
     /// domain set this instance is managing — an expiry check alone isn't enough: a
@@ -643,14 +651,19 @@ impl AcmeManager {
         let Ok(cert) = EndEntityCert::try_from(first) else {
             return false;
         };
-        let san_names: Vec<String> = cert
+        let mut san_names: Vec<String> = cert
             .valid_dns_names()
             .map(str::to_ascii_lowercase)
             .collect();
-        !san_names.is_empty()
-            && domains
-                .iter()
-                .all(|d| san_names.contains(&d.to_ascii_lowercase()))
+        let mut expected: Vec<String> = domains
+            .iter()
+            .map(|domain| domain.to_ascii_lowercase())
+            .collect();
+        san_names.sort_unstable();
+        san_names.dedup();
+        expected.sort_unstable();
+        expected.dedup();
+        !san_names.is_empty() && san_names == expected
     }
 
     /// Reads PEM-encoded cert and key from `<cache_dir>/domain.crt` and `domain.key`.
@@ -1107,7 +1120,16 @@ mod min_der {
         minute: u32,
         second: u32,
     ) -> Result<SystemTime, &'static str> {
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        let leap_year =
+            year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+        let days_in_month = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap_year => 29,
+            2 => 28,
+            _ => return Err("month/day out of range"),
+        };
+        if day == 0 || day > days_in_month {
             return Err("month/day out of range");
         }
         if hour > 23 || minute > 59 || second > 60 {
@@ -1196,7 +1218,10 @@ mod min_der {
         #[test]
         fn rejects_malformed_input() {
             assert!(parse_utc_time(b"not-a-time!!!").is_err());
+            assert!(parse_utc_time(b"230229000000Z").is_err());
+            assert!(parse_utc_time(b"240230000000Z").is_err());
             assert!(parse_generalized_time(b"short").is_err());
+            assert!(parse_generalized_time(b"21000229000000Z").is_err());
             assert!(parse_not_after(b"").is_err());
             assert!(parse_not_after(&[0x30, 0x00]).is_err());
         }
@@ -1230,6 +1255,25 @@ mod min_der {
 #[cfg(test)]
 mod cache_tests {
     use super::{AcmeManager, write_private_file};
+
+    #[test]
+    fn cached_certificate_must_match_the_exact_domain_set() {
+        let cert = crate::tls::generate_self_signed_cert(vec![
+            "example.com".to_string(),
+            "www.example.com".to_string(),
+        ])
+        .expect("generate cert");
+        let certs = crate::tls::pem::certs(cert.cert_pem.as_bytes());
+
+        assert!(AcmeManager::cert_matches_domains(
+            &certs,
+            &["WWW.EXAMPLE.COM".to_string(), "example.com".to_string()]
+        ));
+        assert!(!AcmeManager::cert_matches_domains(
+            &certs,
+            &["example.com".to_string()]
+        ));
+    }
 
     /// A failed key write strands the new cert beside the old key. That pair parses, covers the
     /// domains and is far from expiry, so only an explicit match check keeps it from being

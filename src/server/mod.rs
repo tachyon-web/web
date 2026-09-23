@@ -89,6 +89,22 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tower::ServiceExt as _;
 
+/// A server-owned sidecar task that cannot outlive the serving future that spawned it.
+#[derive(Debug)]
+pub(crate) struct BackgroundTask(tokio::task::JoinHandle<()>);
+
+impl BackgroundTask {
+    pub(crate) const fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self(task)
+    }
+}
+
+impl Drop for BackgroundTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Preset for deployment controls owned by this transport layer.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DeploymentProfile {
@@ -717,7 +733,6 @@ where
     /// Starts a pure plaintext HTTP server on `http_addr` (e.g. `"0.0.0.0:80"`).
     ///
     /// # Errors
-    /// Returns an error if `http_addr` does not parse or the server fails to run.
     pub async fn start_http(self, http_addr: &str) -> Result<(), std::io::Error> {
         self.start_http_addr(parse_addr(http_addr)?).await
     }
@@ -778,7 +793,7 @@ where
         let addr = parse_addr(tls_addr)?;
         let tls_acceptor = TlsAcceptor::from(config.clone());
         bind_and_serve(self, addr, None, move |server, listener| async move {
-            spawn_h3_beside(&server, config, &listener)?;
+            let _h3_task = spawn_h3_beside(&server, config, &listener)?;
             server.serve_https(listener, tls_acceptor).await
         })
         .await?;
@@ -886,8 +901,8 @@ where
 
         let addr = parse_addr(tls_addr)?;
         let redirect_addr = parse_addr(cleartext_addr)?;
-        // Before anything is spawned: the redirect listener and ACME loop are detached, so a
-        // TLS bind failing after them would return `Err` with both still running.
+        // Bind before starting either sidecar so a TLS bind failure has no background work to
+        // unwind.
         let listener = TcpListener::bind(addr).await?;
 
         // The HTTP-01 responder has to be listening *before* the ACME loop places its first
@@ -896,7 +911,7 @@ where
         // issuance failed validation, waited out the 5-minute backoff, and burned one of the
         // CA's per-hour failed-validation attempts before the retry could succeed. Binding here
         // also fails fast if the cleartext port is unavailable, rather than after an order.
-        bind::spawn_redirect_listener(RedirectInfo {
+        let _redirect_task = bind::spawn_redirect_listener(RedirectInfo {
             addr: redirect_addr,
             https_port: addr.port(),
             allowed_hosts: Some(allowed_hosts),
@@ -908,7 +923,7 @@ where
         .await?;
 
         // Start the background renewal loop now that its challenges can be answered.
-        acme.start();
+        let _acme_task = acme.start_guarded();
 
         // Give the renewal loop a bounded window to load a cached cert or
         // provision a fresh one before the TLS listener starts accepting —
@@ -952,7 +967,7 @@ where
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
 
         #[cfg(feature = "http3")]
-        spawn_h3_beside(&self, tls_config, &listener)?;
+        let _h3_task = spawn_h3_beside(&self, tls_config, &listener)?;
         self.serve_https(listener, tls_acceptor).await?;
 
         Ok(())
@@ -1047,7 +1062,7 @@ where
             redirect_info,
             move |server, listener| async move {
                 #[cfg(feature = "http3")]
-                spawn_h3_beside(&server, tls_config, &listener)?;
+                let _h3_task = spawn_h3_beside(&server, tls_config, &listener)?;
                 server.serve_https(listener, tls_acceptor).await
             },
         )

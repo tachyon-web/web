@@ -475,6 +475,39 @@ async fn a_failed_tls_bind_leaves_the_cleartext_port_free() {
     }
 }
 
+/// Sidecar listeners belong to the serving future: cancelling HTTPS must release the
+/// cleartext redirect port instead of leaving a detached server behind.
+#[cfg(feature = "cert-gen")]
+#[tokio::test]
+async fn cancelling_https_stops_its_redirect_listener() {
+    let tls_addr = free_loopback_addr().await;
+    let cleartext_addr = free_loopback_addr().await;
+    let cert = tachyon_web::tls::generate_self_signed_cert(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+
+    let tls_addr_string = tls_addr.to_string();
+    let cleartext_addr_string = cleartext_addr.to_string();
+    let task = tokio::spawn(async move {
+        Server::new(Router::new())
+            .start_all(
+                &tls_addr_string,
+                Some(&cleartext_addr_string),
+                cert.cert_pem,
+                cert.key_pem,
+            )
+            .await
+    });
+    wait_until_listening(cleartext_addr).await;
+
+    task.abort();
+    let _ = task.await;
+    drop(
+        tokio::net::TcpListener::bind(cleartext_addr)
+            .await
+            .expect("redirect listener survived its HTTPS server"),
+    );
+}
+
 /// With h2c off (the default) the HTTP/2 stack is not reachable on a plaintext port at all:
 /// HTTP/1.1 refuses the connection preface. Opting in brings HTTP/2 back.
 #[cfg(all(feature = "http1", feature = "http2"))]

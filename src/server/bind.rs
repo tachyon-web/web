@@ -20,17 +20,17 @@ where
 {
     enforce_fips_compliance()?;
 
-    // Bound first: the redirect listener is a detached task, so spawning it before a bind that
-    // then failed left port 80 held by a server whose caller had already been handed an `Err`.
+    // Bound first so a primary-listener failure cannot briefly bring up the redirect listener.
     let listener = TcpListener::bind(addr).await?;
 
     #[cfg(not(feature = "tls"))]
     let _ = redirect;
 
     #[cfg(feature = "tls")]
-    if let Some(info) = redirect {
-        spawn_redirect_listener(info).await?;
-    }
+    let _redirect_task = match redirect {
+        Some(info) => Some(spawn_redirect_listener(info).await?),
+        None => None,
+    };
 
     serve(server, listener).await
 }
@@ -42,9 +42,11 @@ where
 /// is bound to the cleartext address fails and spends one of the CA's failed-validation
 /// attempts for nothing.
 #[cfg(feature = "tls")]
-pub(super) async fn spawn_redirect_listener(info: RedirectInfo) -> Result<(), std::io::Error> {
+pub(super) async fn spawn_redirect_listener(
+    info: RedirectInfo,
+) -> Result<super::BackgroundTask, std::io::Error> {
     let listener = TcpListener::bind(info.addr).await?;
-    drop(tokio::spawn(async move {
+    Ok(super::BackgroundTask::new(tokio::spawn(async move {
         serve_http_redirect_and_challenges(
             listener,
             info.https_port,
@@ -53,6 +55,5 @@ pub(super) async fn spawn_redirect_listener(info: RedirectInfo) -> Result<(), st
             info.policy,
         )
         .await;
-    }));
-    Ok(())
+    })))
 }
