@@ -6,7 +6,7 @@ use crate::server::Server;
 use crate::server::accept::ConnectionLimit;
 #[cfg(feature = "tls")]
 use crate::server::anon_tls::AnonTls;
-use crate::server::conn::{NO_PEER_ADDR as ONION_PEER_ADDR, serve_connection};
+use crate::server::conn::serve_connection;
 use crate::server::http::hyper_handler;
 use arti_client::config::{CfgPath, TorClientConfigBuilder};
 use arti_client::{TorClient, TorClientConfig};
@@ -79,7 +79,8 @@ where
     /// Only rendezvous requests targeting virtual port 80 are accepted (the port every `.onion`
     /// HTTP client expects); anything else has its circuit shut down immediately. Requests are
     /// dispatched through the same handling pipeline as [`serve_http`](Server::serve_http) —
-    /// HTTP/1.1, plus h2c with the `http2` feature — one Tokio task per stream.
+    /// HTTP/1.1, plus h2c when [`SecurityPolicy::allow_h2c`](crate::server::SecurityPolicy::allow_h2c)
+    /// permits it — one Tokio task per stream.
     ///
     /// Since `client` is already bootstrapped, arti has already constructed its internal
     /// relay/channel TLS provider from whatever `rustls::crypto::CryptoProvider` was installed
@@ -315,7 +316,9 @@ where
                     .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())?;
                 Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
             }
-            AnonTls::Custom(server_config) => Ok(Some(TlsAcceptor::from(server_config.clone()))),
+            AnonTls::Custom(server_config) => Ok(Some(TlsAcceptor::from(
+                self.finalize_tls_config((**server_config).clone()),
+            ))),
         }
     }
 }
@@ -475,10 +478,9 @@ where
     }
 
     let onion_stream = accept_onion_stream(stream_request).await?;
-    let svc = hyper::service::service_fn(move |req| {
-        hyper_handler(state.clone(), req, ONION_PEER_ADDR, false)
-    });
-    serve_connection(onion_stream, svc).await
+    let http2 = state.security_policy.allows_h2c();
+    let svc = hyper::service::service_fn(move |req| hyper_handler(state.clone(), req, None, false));
+    serve_connection(onion_stream, svc, http2).await
 }
 
 /// Handles a single rendezvous stream for [`Server::serve_onion_with_client`], dispatching per
@@ -507,10 +509,11 @@ where
         }
         OnionAction::ServePlaintext => {
             let onion_stream = accept_onion_stream(stream_request).await?;
+            let http2 = state.security_policy.allows_h2c();
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, ONION_PEER_ADDR, false)
+                hyper_handler(state.clone(), req, None, false)
             });
-            serve_connection(onion_stream, svc).await
+            serve_connection(onion_stream, svc, http2).await
         }
         OnionAction::Redirect => {
             let onion_stream = accept_onion_stream(stream_request).await?;
@@ -525,7 +528,7 @@ where
                     Ok::<_, std::io::Error>(response)
                 }
             });
-            serve_connection(onion_stream, svc).await
+            serve_connection(onion_stream, svc, false).await
         }
         OnionAction::ServeTls => {
             let Some(acceptor) = tls_acceptor else {
@@ -533,7 +536,7 @@ where
                 return Ok(());
             };
             let onion_stream = accept_onion_stream(stream_request).await?;
-            let _handshake_permit = state
+            let handshake_permit = state
                 .tls_handshake_limit
                 .clone()
                 .try_acquire_owned()
@@ -544,10 +547,11 @@ where
             )
             .await
             .map_err(|_| "TLS handshake timed out")??;
+            drop(handshake_permit);
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, ONION_PEER_ADDR, true)
+                hyper_handler(state.clone(), req, None, true)
             });
-            serve_connection(tls_stream, svc).await
+            serve_connection(tls_stream, svc, true).await
         }
     }
 }

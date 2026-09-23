@@ -20,6 +20,10 @@ where
 {
     enforce_fips_compliance()?;
 
+    // Bound first: the redirect listener is a detached task, so spawning it before a bind that
+    // then failed left port 80 held by a server whose caller had already been handed an `Err`.
+    let listener = TcpListener::bind(addr).await?;
+
     #[cfg(not(feature = "tls"))]
     let _ = redirect;
 
@@ -28,7 +32,6 @@ where
         spawn_redirect_listener(info).await?;
     }
 
-    let listener = TcpListener::bind(addr).await?;
     serve(server, listener).await
 }
 

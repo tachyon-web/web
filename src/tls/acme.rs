@@ -164,12 +164,9 @@ fn challenges() -> &'static RwLock<HashMap<String, String>> {
     ACTIVE_CHALLENGES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Registers a temporary ACME HTTP-01 challenge response in the global store.
-///
-/// The challenge will be served by the HTTP listener until [`unregister_challenge`] is called.
-///
-/// *Tachyon extension: no `axum` equivalent.*
-pub fn register_challenge(token: String, key_authorization: String) {
+// Crate-private: anything that can write here publishes arbitrary bytes on every port-80
+// listener in the process, so only the ACME flow itself may.
+fn register_challenge(token: String, key_authorization: String) {
     if let Ok(mut map) = challenges().write() {
         let _ = map.insert(token, key_authorization);
     } else {
@@ -177,24 +174,14 @@ pub fn register_challenge(token: String, key_authorization: String) {
     }
 }
 
-/// Removes a challenge token from the global store once the ACME server has validated it.
-///
-/// *Tachyon extension: no `axum` equivalent.*
-pub fn unregister_challenge(token: &str) {
+fn unregister_challenge(token: &str) {
     if let Ok(mut map) = challenges().write() {
         let _ = map.remove(token);
     }
 }
 
-/// Looks up the key authorization for a given challenge token.
-///
-/// Returns `Some(key_authorization)` if the token is active, or `None` otherwise.
-/// Callers on the hot HTTP path acquire only a read lock.
-///
-/// *Tachyon extension: no `axum` equivalent.*
-#[inline]
-#[must_use]
-pub fn get_challenge(token: &str) -> Option<String> {
+/// The key authorization for an active HTTP-01 `token`, for the port-80 listener to answer.
+pub(crate) fn get_challenge(token: &str) -> Option<String> {
     challenges()
         .read()
         .ok()
@@ -678,9 +665,9 @@ impl AcmeManager {
 
     /// Atomically writes the PEM cert chain and private key to the cache directory.
     ///
-    /// Both files are written independently; if the key write fails the cert file is
-    /// still present. On next startup the loader will fail to parse the key and
-    /// re-provision — no data corruption risk.
+    /// Both files are written independently, so a failed key write leaves the new cert beside
+    /// the old key. [`build_certified_key`](Self::build_certified_key) rejects that pair, which
+    /// sends the loader back to provisioning.
     ///
     /// The private key is written with owner-only permissions (`0600` on Unix) so it
     /// is never left world- or group-readable on disk.
@@ -705,7 +692,11 @@ impl AcmeManager {
             .key_provider
             .load_private_key(key)
             .map_err(|e| AcmeError::TlsKeyLoad(e.to_string()))?;
-        Ok(CertifiedKey::new(certs, signing_key))
+        let certified_key = CertifiedKey::new(certs, signing_key);
+        certified_key
+            .keys_match()
+            .map_err(|e| AcmeError::TlsKeyLoad(e.to_string()))?;
+        Ok(certified_key)
     }
 
     /// Runs the full ACME HTTP-01 challenge flow and returns the new certificate chain + key.
@@ -1226,5 +1217,37 @@ mod min_der {
                 "expected a far-future notAfter, got {parsed:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{AcmeManager, write_private_file};
+
+    /// A failed key write strands the new cert beside the old key. That pair parses, covers the
+    /// domains and is far from expiry, so only an explicit match check keeps it from being
+    /// served — every handshake would fail until renewal came due months later.
+    #[test]
+    fn a_cached_cert_is_activated_only_with_its_own_key() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let domains = vec!["example.com".to_string()];
+        let cert = crate::tls::generate_self_signed_cert(domains.clone()).expect("generate cert");
+        let stale = crate::tls::generate_self_signed_cert(domains.clone()).expect("generate key");
+        let write = |name: &str, pem: &str| {
+            write_private_file(&dir.path().join(name), pem.as_bytes()).expect("write cache entry");
+        };
+        let acme = AcmeManager::new(dir.path(), domains, "admin@example.com".into(), true);
+
+        write("domain.crt", &cert.cert_pem);
+        write("domain.key", &stale.key_pem);
+        assert!(acme.load_and_activate_cached_cert().is_err());
+        assert!(!acme.resolver().has_certificate());
+
+        write("domain.key", &cert.key_pem);
+        assert!(
+            acme.load_and_activate_cached_cert()
+                .expect("matching pair loads")
+        );
+        assert!(acme.resolver().has_certificate());
     }
 }

@@ -6,7 +6,7 @@ use crate::server::Server;
 use crate::server::accept::ConnectionLimit;
 #[cfg(feature = "tls")]
 use crate::server::anon_tls::AnonTls;
-use crate::server::conn::{NO_PEER_ADDR as I2P_PEER_ADDR, serve_connection};
+use crate::server::conn::serve_connection;
 use crate::server::http::hyper_handler;
 use std::sync::Arc;
 use tachyon_i2p::I2pRouter;
@@ -130,7 +130,9 @@ where
                     .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())?;
                 Some(TlsAcceptor::from(Arc::new(server_config)))
             }
-            AnonTls::Custom(server_config) => Some(TlsAcceptor::from(server_config.clone())),
+            AnonTls::Custom(server_config) => Some(TlsAcceptor::from(
+                self.finalize_tls_config((**server_config).clone()),
+            )),
         };
 
         let state = Arc::new(self);
@@ -182,10 +184,9 @@ async fn handle_i2p_stream_plaintext<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    let svc = hyper::service::service_fn(move |req| {
-        hyper_handler(state.clone(), req, I2P_PEER_ADDR, false)
-    });
-    serve_connection(stream, svc).await
+    let http2 = state.security_policy.allows_h2c();
+    let svc = hyper::service::service_fn(move |req| hyper_handler(state.clone(), req, None, false));
+    serve_connection(stream, svc, http2).await
 }
 
 /// Handles a single accepted I2P stream: TLS (if configured) then HTTP dispatch, sharing the
@@ -203,13 +204,14 @@ where
 {
     match tls_acceptor {
         None => {
+            let http2 = state.security_policy.allows_h2c();
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, I2P_PEER_ADDR, false)
+                hyper_handler(state.clone(), req, None, false)
             });
-            serve_connection(stream, svc).await
+            serve_connection(stream, svc, http2).await
         }
         Some(acceptor) => {
-            let _handshake_permit = state
+            let handshake_permit = state
                 .tls_handshake_limit
                 .clone()
                 .try_acquire_owned()
@@ -220,10 +222,11 @@ where
             )
             .await
             .map_err(|_| "TLS handshake timed out")??;
+            drop(handshake_permit);
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, I2P_PEER_ADDR, true)
+                hyper_handler(state.clone(), req, None, true)
             });
-            serve_connection(tls_stream, svc).await
+            serve_connection(tls_stream, svc, true).await
         }
     }
 }

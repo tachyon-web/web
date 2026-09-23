@@ -6,16 +6,23 @@ use std::sync::Arc;
 use axum::body::Body;
 use hyper::{Request, Response, StatusCode};
 
-const FORWARDED_HEADERS: [&str; 9] = [
+const FORWARDED_HEADERS: [&str; 16] = [
     "forwarded",
     "cf-connecting-ip",
     "client-ip",
+    "fastly-client-ip",
     "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
     "x-real-ip",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-port",
+    "x-forwarded-prefix",
     "x-forwarded-proto",
+    "x-forwarded-server",
+    "x-original-url",
+    "x-rewrite-url",
 ];
 const ENFORCE_AUTHORITY: u8 = 1;
 const STRIP_UNTRUSTED_FORWARDING: u8 = 2;
@@ -126,7 +133,8 @@ impl SecurityPolicy {
         self
     }
 
-    /// Sets the networks allowed to supply forwarding headers.
+    /// Sets the networks allowed to supply forwarding headers. Tor and I2P peers are never
+    /// trusted, whatever this contains — they have no network address to match.
     #[must_use]
     pub fn trusted_proxies(mut self, proxies: impl IntoIterator<Item = IpNetwork>) -> Self {
         self.trusted_proxies = proxies.into_iter().collect::<Vec<_>>().into();
@@ -144,7 +152,8 @@ impl SecurityPolicy {
         self
     }
 
-    /// Allows or rejects the HTTP `CONNECT` method. It is rejected by default.
+    /// Allows or rejects the HTTP `CONNECT` method. It is rejected by default. RFC 8441
+    /// extended CONNECT (a WebSocket over HTTP/2) is not a tunnel and is never rejected here.
     #[must_use]
     pub const fn allow_connect(mut self, allow: bool) -> Self {
         if allow {
@@ -197,16 +206,22 @@ impl SecurityPolicy {
         self
     }
 
+    /// Whether plaintext listeners should speak HTTP/2 at all — see
+    /// [`allow_h2c`](Self::allow_h2c).
+    pub(super) const fn allows_h2c(&self) -> bool {
+        self.flags & ALLOW_H2C != 0
+    }
+
+    /// `peer` is `None` for an anonymity transport, which can never be a trusted proxy.
     pub(super) fn inspect(
         &self,
         req: &mut Request<Body>,
-        peer: std::net::SocketAddr,
+        peer: Option<std::net::SocketAddr>,
         secure_transport: bool,
     ) -> Option<Response<Body>> {
-        if self.flags & ALLOW_H2C == 0
-            && !secure_transport
-            && req.version() == hyper::Version::HTTP_2
-        {
+        // Plaintext listeners stop offering HTTP/2 when h2c is off, so this only still fires in
+        // an `http2`-only build, which has no HTTP/1.1 to fall back to.
+        if !self.allows_h2c() && !secure_transport && req.version() == hyper::Version::HTTP_2 {
             return Some(empty_response(StatusCode::UPGRADE_REQUIRED));
         }
         if req.headers().contains_key(hyper::header::TRANSFER_ENCODING)
@@ -220,41 +235,66 @@ impl SecurityPolicy {
         {
             return Some(empty_response(StatusCode::BAD_REQUEST));
         }
-        if self.flags & REJECT_CONNECT != 0 && req.method() == hyper::Method::CONNECT {
+        // RFC 9112 §3.2: more than one `Host` MUST be rejected.
+        if req
+            .headers()
+            .get_all(hyper::header::HOST)
+            .iter()
+            .nth(1)
+            .is_some()
+        {
+            return Some(empty_response(StatusCode::BAD_REQUEST));
+        }
+        // RFC 8441 extended CONNECT is how WebSockets ride HTTP/2 — a routed request, not a tunnel.
+        #[cfg(feature = "http2")]
+        let extended_connect = req.extensions().get::<hyper::ext::Protocol>().is_some();
+        #[cfg(not(feature = "http2"))]
+        let extended_connect = false;
+        if self.flags & REJECT_CONNECT != 0
+            && req.method() == hyper::Method::CONNECT
+            && !extended_connect
+        {
             return Some(empty_response(StatusCode::METHOD_NOT_ALLOWED));
         }
 
-        if self.flags & ENFORCE_AUTHORITY != 0 {
-            // Both spellings go through `bare_host` — see its docs for why that matters.
-            let authority = req
-                .uri()
-                .authority()
-                .map(hyper::http::uri::Authority::host)
-                .or_else(|| {
-                    req.headers()
-                        .get(hyper::header::HOST)
-                        .and_then(|value| value.to_str().ok())
-                })
-                .and_then(bare_host);
-            if !authority.is_some_and(|host| {
-                self.allowed_hosts
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(host))
-            }) {
-                return Some(empty_response(StatusCode::MISDIRECTED_REQUEST));
-            }
+        if self.flags & ENFORCE_AUTHORITY != 0 && !self.authority_allowed(req) {
+            return Some(empty_response(StatusCode::MISDIRECTED_REQUEST));
         }
 
-        let trusted = self
-            .trusted_proxies
-            .iter()
-            .any(|network| network.contains(peer.ip()));
+        let trusted = peer.is_some_and(|peer| {
+            self.trusted_proxies
+                .iter()
+                .any(|network| network.contains(peer.ip()))
+        });
         if self.flags & STRIP_UNTRUSTED_FORWARDING != 0 && !trusted {
             for header in FORWARDED_HEADERS {
                 req.headers_mut().remove(header);
             }
         }
         None
+    }
+
+    /// Every authority a handler could read must be allowed — the request target's *and* the
+    /// `Host` header's. Checking whichever came first let `GET http://allowed/` with
+    /// `Host: evil` (or an h2 `:authority` beside a conflicting `host`) reach an app that
+    /// builds links from `Host`.
+    fn authority_allowed(&self, req: &Request<Body>) -> bool {
+        // Both spellings go through `bare_host` — see its docs for why that matters.
+        let is_allowed = |authority: &str| {
+            bare_host(authority).is_some_and(|host| {
+                self.allowed_hosts
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(host))
+            })
+        };
+        let target = req.uri().authority().map(hyper::http::uri::Authority::host);
+        let header = req
+            .headers()
+            .get(hyper::header::HOST)
+            .map(|value| value.to_str().unwrap_or_default());
+        (target.is_some() || header.is_some())
+            && target.is_none_or(is_allowed)
+            && header.is_none_or(is_allowed)
     }
 
     /// Finalizes a response immediately before its transport encodes it.
@@ -373,6 +413,30 @@ mod tests {
         assert!(!network.contains("::ffff:10.3.4.8".parse().expect("valid IP")));
     }
 
+    /// Tor/I2P peers have no address. Even a trust-everything proxy list must not let one
+    /// supply forwarding headers, as the old `0.0.0.0` placeholder peer did.
+    #[test]
+    fn anonymous_peers_are_never_trusted_proxies() {
+        let policy =
+            SecurityPolicy::new().trusted_proxies(["0.0.0.0/0".parse().expect("valid CIDR")]);
+        let request = || {
+            Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", "198.51.100.7")
+                .body(Body::empty())
+                .expect("valid request")
+        };
+
+        let mut anonymous = request();
+        assert!(policy.inspect(&mut anonymous, None, false).is_none());
+        assert!(!anonymous.headers().contains_key("x-forwarded-for"));
+
+        let mut proxied = request();
+        let proxy = Some("0.0.0.0:0".parse().expect("valid peer"));
+        assert!(policy.inspect(&mut proxied, proxy, false).is_none());
+        assert!(proxied.headers().contains_key("x-forwarded-for"));
+    }
+
     /// Deriving no hostnames (a certificate with only IP SANs, say) means "nothing was
     /// learned", not "deny everything" — the latter would `421` every request forever.
     #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
@@ -388,7 +452,7 @@ mod tests {
             policy
                 .inspect(
                     &mut request,
-                    "203.0.113.1:1".parse().expect("valid peer"),
+                    Some("203.0.113.1:1".parse().expect("valid peer")),
                     false,
                 )
                 .is_none()
@@ -408,7 +472,7 @@ mod tests {
             policy
                 .inspect(
                     &mut request,
-                    "203.0.113.1:1".parse().expect("valid peer"),
+                    Some("203.0.113.1:1".parse().expect("valid peer")),
                     false,
                 )
                 .is_none()
@@ -423,7 +487,7 @@ mod tests {
             policy
                 .inspect(
                     &mut request,
-                    "203.0.113.1:1".parse().expect("valid peer"),
+                    Some("203.0.113.1:1".parse().expect("valid peer")),
                     false,
                 )
                 .expect("request rejected")
@@ -436,7 +500,7 @@ mod tests {
             deny_all
                 .inspect(
                     &mut request,
-                    "203.0.113.1:1".parse().expect("valid peer"),
+                    Some("203.0.113.1:1".parse().expect("valid peer")),
                     true,
                 )
                 .expect("empty allow-list rejects every host")
@@ -445,13 +509,71 @@ mod tests {
         );
     }
 
+    /// Handlers read `Host`, so the request target vouching for the authority is not enough:
+    /// every spelling present must pass, and a second `Host` is malformed outright.
+    #[test]
+    fn every_authority_a_handler_could_read_must_be_allowed() {
+        let policy = SecurityPolicy::new().allowed_hosts(["example.com"]);
+        let peer = Some("203.0.113.1:1".parse().expect("valid peer"));
+        let inspect = |uri: &str, hosts: &[&str]| {
+            let mut builder = Request::builder().uri(uri);
+            for host in hosts {
+                builder = builder.header("host", *host);
+            }
+            let mut request = builder.body(Body::empty()).expect("valid request");
+            policy
+                .inspect(&mut request, peer, false)
+                .map(|response| response.status())
+        };
+
+        assert_eq!(
+            inspect("http://example.com/", &["evil.example"]),
+            Some(StatusCode::MISDIRECTED_REQUEST)
+        );
+        assert_eq!(
+            inspect("/", &["example.com", "evil.example"]),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(inspect("http://example.com/", &["example.com:443"]), None);
+    }
+
+    /// A WebSocket over HTTP/2 arrives as extended CONNECT; refusing it with the tunnel form
+    /// silently broke every `ws` route served over h2.
+    #[cfg(feature = "http2")]
+    #[test]
+    fn extended_connect_is_routed_while_a_plain_tunnel_is_refused() {
+        let policy = SecurityPolicy::new();
+        let peer = Some("203.0.113.1:1".parse().expect("valid peer"));
+
+        let mut tunnel = Request::builder()
+            .method(hyper::Method::CONNECT)
+            .uri("example.com:443")
+            .body(Body::empty())
+            .expect("valid request");
+        assert_eq!(
+            policy
+                .inspect(&mut tunnel, peer, true)
+                .expect("tunnel rejected")
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        let mut websocket = Request::builder()
+            .method(hyper::Method::CONNECT)
+            .uri("https://example.com/ws")
+            .extension(hyper::ext::Protocol::from_static("websocket"))
+            .body(Body::empty())
+            .expect("valid request");
+        assert!(policy.inspect(&mut websocket, peer, true).is_none());
+    }
+
     /// `Authority::host` keeps an IPv6 literal's brackets, a `Host` header does not. Both
     /// forms must land on the same allow-list decision, or the same deployment answers
     /// HTTP/1.1 and HTTP/2 differently for one address.
     #[test]
     fn ipv6_literal_matches_whether_it_arrives_as_authority_or_host_header() {
         let policy = SecurityPolicy::new().allowed_hosts(["::1"]);
-        let peer: std::net::SocketAddr = "203.0.113.1:1".parse().expect("valid peer");
+        let peer = Some("203.0.113.1:1".parse().expect("valid peer"));
 
         let mut via_authority = Request::builder()
             .uri("http://[::1]:8443/")

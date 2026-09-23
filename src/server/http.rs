@@ -1,6 +1,7 @@
 #[cfg(feature = "tls")]
 use crate::server::TLS_HANDSHAKE_TIMEOUT;
 use crate::server::accept::ConnectionLimit;
+use crate::server::stall::WriteDeadline;
 #[cfg(feature = "http1")]
 use crate::server::tuning::tune_http1;
 #[cfg(feature = "http2")]
@@ -20,8 +21,25 @@ use tokio::net::TcpListener;
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
+/// The slowest a request body may arrive once [`REQUEST_TIMEOUT`]'s grace period is spent.
+const MIN_BODY_RATE: u64 = 16 * 1024;
+
+/// Extra time a body earns by delivering `bytes`, at [`MIN_BODY_RATE`].
+///
+/// A fixed window failed every upload slower than `max_body_size / 30s`; a bare per-chunk
+/// timeout would let a peer drip one byte just under it forever. Earning time per byte asks
+/// for a floor rate instead — shared with HTTP/3's body reader.
+pub(super) fn body_time_earned(bytes: usize) -> std::time::Duration {
+    let micros = u64::try_from(bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000_000)
+        .saturating_div(MIN_BODY_RATE);
+    std::time::Duration::from_micros(micros)
+}
+
 pin_project_lite::pin_project! {
-    /// Bounds how long a request body may take to arrive in full.
+    /// Bounds how long a request body may take to arrive: [`REQUEST_TIMEOUT`] of grace, plus
+    /// whatever [`body_time_earned`] grants for each chunk received.
     ///
     /// Bodies stream lazily, so without this a client could send headers declaring a
     /// `Content-Length` and then never send the body, holding the connection open
@@ -30,16 +48,31 @@ pin_project_lite::pin_project! {
     /// The `Sleep` is allocated on first poll rather than per request: hyper checks
     /// `is_end_stream()` before polling a body it knows is empty, so an eager timer would be
     /// registered and dropped unused on every bodyless GET.
-    struct DeadlineBody {
+    struct DeadlineBody<B> {
         #[pin]
-        inner: hyper::body::Incoming,
+        inner: B,
         deadline: Option<Pin<Box<tokio::time::Sleep>>>,
         remaining: usize,
         failed: bool,
     }
 }
 
-impl HyperBody for DeadlineBody {
+impl<B> DeadlineBody<B> {
+    const fn new(inner: B, max_body_size: usize) -> Self {
+        Self {
+            inner,
+            deadline: None,
+            remaining: max_body_size,
+            failed: false,
+        }
+    }
+}
+
+impl<B> HyperBody for DeadlineBody<B>
+where
+    B: HyperBody<Data = Bytes>,
+    B::Error: Into<axum::BoxError>,
+{
     type Data = Bytes;
     type Error = axum::Error;
 
@@ -72,6 +105,12 @@ impl HyperBody for DeadlineBody {
                         )))));
                     };
                     *this.remaining = remaining;
+                    let extended = deadline
+                        .deadline()
+                        .checked_add(body_time_earned(data.len()));
+                    if let Some(extended) = extended {
+                        deadline.as_mut().reset(extended);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -180,9 +219,10 @@ impl<S> Server<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    /// Serve HTTP/1.1 (and, with the `http2` feature, HTTP/2 over cleartext —
-    /// "h2c", detected via the connection preface with no ALPN needed) over
-    /// plaintext TCP on the given listener.
+    /// Serve HTTP/1.1 over plaintext TCP on the given listener — plus HTTP/2 over cleartext
+    /// ("h2c", detected via the connection preface with no ALPN needed) when the `http2`
+    /// feature is on *and* [`SecurityPolicy::allow_h2c`](crate::server::SecurityPolicy::allow_h2c)
+    /// is set. With h2c off (the default) the HTTP/2 stack isn't reachable on this port at all.
     ///
     /// Without the `http2` feature this uses `hyper::server::conn::http1::Builder`
     /// directly — no protocol sniffing, no `auto` dispatch overhead. With it, it
@@ -205,29 +245,30 @@ where
         crate::server::enforce_fips_compliance()?;
         let state = Arc::new(self);
 
-        // Build once outside the loop — `clone()` inside is a few pointer copies.
-        // Three cases, matching whichever of `http1`/`http2` are enabled (at least
-        // one always is — see the crate-level `compile_error!` in `lib.rs`):
-        #[cfg(all(feature = "http1", feature = "http2"))]
-        let builder = {
-            // Both enabled: `auto::Builder` sniffs each connection's first bytes
-            // for the HTTP/2 client preface and falls back to HTTP/1.1 otherwise.
-            let mut b = hyper_util::server::conn::auto::Builder::new(LocalExecutor);
-            tune_http1!(b.http1());
-            let _ = b.http1().writev(true);
-            tune_http2!(b.http2());
-            b
-        };
-        #[cfg(all(feature = "http1", not(feature = "http2")))]
-        let builder = {
-            // http1 only: the low-level builder directly, no protocol-sniffing overhead.
+        // Build once outside the loop — `clone()` inside is a few pointer copies. At least one
+        // of `http1`/`http2` is always enabled — see the crate-level `compile_error!`.
+        #[cfg(feature = "http1")]
+        let http1 = {
             let mut b = hyper::server::conn::http1::Builder::new();
             tune_http1!(b);
             let _ = b.writev(true);
             b
         };
+        // HTTP/2 here only when h2c is allowed, so otherwise its parser isn't reachable at all.
+        // A separate builder rather than `auto`'s `http1_only`, which
+        // `serve_connection_with_upgrades` ignores.
+        #[cfg(all(feature = "http1", feature = "http2"))]
+        let auto = state.security_policy.allows_h2c().then(|| {
+            // `auto::Builder` sniffs each connection's first bytes for the HTTP/2 client
+            // preface and falls back to HTTP/1.1 otherwise.
+            let mut b = hyper_util::server::conn::auto::Builder::new(LocalExecutor);
+            tune_http1!(b.http1());
+            let _ = b.http1().writev(true);
+            tune_http2!(b.http2());
+            b
+        });
         #[cfg(all(feature = "http2", not(feature = "http1")))]
-        let builder = {
+        let http2 = {
             // http2 only: h2c with no HTTP/1.1 fallback at all — a client that
             // isn't speaking HTTP/2 with prior knowledge simply fails to connect.
             let mut b = hyper::server::conn::http2::Builder::new(LocalExecutor);
@@ -239,17 +280,30 @@ where
         while let Some(permit) = limit.acquire().await {
             let (stream, peer) = accept_forever(&listener, "http").await;
             let state = state.clone();
-            let builder = builder.clone();
+            #[cfg(feature = "http1")]
+            let http1 = http1.clone();
+            #[cfg(all(feature = "http1", feature = "http2"))]
+            let auto = auto.clone();
+            #[cfg(all(feature = "http2", not(feature = "http1")))]
+            let http2 = http2.clone();
 
             ConnectionLimit::serve(permit, async move {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer, false));
+                let io = hyper_util::rt::TokioIo::new(WriteDeadline::new(stream));
+                let svc =
+                    service_fn(move |req| hyper_handler(state.clone(), req, Some(peer), false));
                 #[cfg(all(feature = "http1", feature = "http2"))]
-                let result = builder.serve_connection_with_upgrades(io, svc).await;
+                let result = match auto {
+                    Some(auto) => auto.serve_connection_with_upgrades(io, svc).await,
+                    None => http1
+                        .serve_connection(io, svc)
+                        .with_upgrades()
+                        .await
+                        .map_err(Into::into),
+                };
                 #[cfg(all(feature = "http1", not(feature = "http2")))]
-                let result = builder.serve_connection(io, svc).with_upgrades().await;
+                let result = http1.serve_connection(io, svc).with_upgrades().await;
                 #[cfg(all(feature = "http2", not(feature = "http1")))]
-                let result = builder.serve_connection(io, svc).await;
+                let result = http2.serve_connection(io, svc).await;
                 if let Err(e) = result {
                     crate::telemetry_debug!("[http] connection error: {}", e);
                 }
@@ -292,25 +346,28 @@ where
             let state = state.clone();
 
             ConnectionLimit::serve(permit, async move {
-                let Ok(_handshake_permit) = state.tls_handshake_limit.clone().try_acquire_owned()
+                let Ok(handshake_permit) = state.tls_handshake_limit.clone().try_acquire_owned()
                 else {
                     crate::telemetry_debug!("[https] tls handshake shed at concurrency limit");
                     return;
                 };
-                let tls_stream =
-                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream))
-                        .await
-                    {
-                        Ok(Ok(stream)) => stream,
-                        Ok(Err(e)) => {
-                            crate::telemetry_debug!("[https] tls handshake error: {}", e);
-                            return;
-                        }
-                        Err(_) => {
-                            crate::telemetry_debug!("[https] tls handshake timed out");
-                            return;
-                        }
-                    };
+                let tls_stream = match tokio::time::timeout(
+                    TLS_HANDSHAKE_TIMEOUT,
+                    acceptor.accept(WriteDeadline::new(tcp_stream)),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        crate::telemetry_debug!("[https] tls handshake error: {}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        crate::telemetry_debug!("[https] tls handshake timed out");
+                        return;
+                    }
+                };
+                drop(handshake_permit);
 
                 // Inspect TLS connection ALPN before consuming the stream.
                 // Copy bytes out so the borrow ends before the move.
@@ -321,7 +378,8 @@ where
                 };
 
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let svc = service_fn(move |req| hyper_handler(state.clone(), req, peer, true));
+                let svc =
+                    service_fn(move |req| hyper_handler(state.clone(), req, Some(peer), true));
 
                 #[cfg(feature = "http2")]
                 if is_h2 {
@@ -387,19 +445,14 @@ pub(super) fn body_with_deadline(incoming: hyper::body::Incoming, max_body_size:
     if HyperBody::is_end_stream(&incoming) {
         Body::empty()
     } else {
-        Body::new(DeadlineBody {
-            inner: incoming,
-            deadline: None,
-            remaining: max_body_size,
-            failed: false,
-        })
+        Body::new(DeadlineBody::new(incoming, max_body_size))
     }
 }
 
 pub(super) async fn hyper_handler<S>(
     state: Arc<Server<S>>,
     req: Request<hyper::body::Incoming>,
-    peer: std::net::SocketAddr,
+    peer: Option<std::net::SocketAddr>,
     secure_transport: bool,
 ) -> Result<Response<Body>, std::io::Error>
 where
@@ -425,4 +478,40 @@ where
     Ok(state
         .dispatch(Request::from_parts(parts, body), peer, secure_transport)
         .await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeadlineBody, REQUEST_TIMEOUT, body_time_earned};
+    use bytes::Bytes;
+    use http_body_util::{BodyExt as _, StreamBody};
+    use hyper::body::Frame;
+    use std::time::Duration;
+
+    /// An upload that keeps a floor rate outlives the old fixed 30s window; one that stalls is
+    /// still cut off once the time it earned runs out.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_earns_time_for_every_byte_it_delivers() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(1);
+        let mut body = DeadlineBody::new(
+            StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            usize::MAX,
+        );
+        let gap = REQUEST_TIMEOUT.saturating_sub(Duration::from_secs(5));
+        let mut chunk_len = 1;
+        while body_time_earned(chunk_len) < gap {
+            chunk_len = chunk_len.saturating_mul(2);
+        }
+
+        for _ in 0..3 {
+            tx.send(Ok(Frame::data(Bytes::from(vec![0; chunk_len]))))
+                .await
+                .expect("body is listening");
+            assert!(body.frame().await.expect("frame").is_ok());
+            tokio::time::advance(gap).await;
+        }
+
+        let stalled = body.frame().await.expect("deadline fires");
+        assert!(stalled.is_err());
+    }
 }

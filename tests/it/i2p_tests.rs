@@ -26,18 +26,21 @@ fn i2p_config_defaults_are_plaintext_no_on_ready() {
     assert!(!config.tls_enabled());
 }
 
+#[cfg(feature = "cert-gen")]
 #[test]
 fn i2p_config_self_signed_tls_enables_https() {
     let config = I2pConfig::new("my-nickname").self_signed_tls();
     assert!(config.tls_enabled());
 }
 
+#[cfg(feature = "cert-gen")]
 #[test]
 fn i2p_config_no_tls_disables_https_again() {
     let config = I2pConfig::new("my-nickname").self_signed_tls().no_tls();
     assert!(!config.tls_enabled());
 }
 
+#[cfg(feature = "cert-gen")]
 #[test]
 fn i2p_config_builder_methods_chain_in_any_order() {
     let config = I2pConfig::new("chained")

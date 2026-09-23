@@ -70,7 +70,7 @@
 //!         // pass your own instead:
 //!         // .tls_config(my_rustls_server_config)
 //!         .redirect_http(false) // dual-stack by default: plaintext AND TLS both work
-//!         .on_ready(|addr| tracing::info!("reachable at https://{addr}"));
+//!         .on_ready(|addr| println!("reachable at https://{addr}"));
 //!
 //!     Server::new(app).serve_onion(config).await?;
 //!     Ok(())

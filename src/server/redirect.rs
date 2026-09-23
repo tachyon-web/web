@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use crate::server::accept::ConnectionLimit;
 #[cfg(all(feature = "tls", feature = "http1"))]
 use crate::server::tuning::tune_http1;
-#[cfg(all(feature = "tls", feature = "http2"))]
+#[cfg(all(feature = "tls", feature = "http2", not(feature = "http1")))]
 use crate::server::tuning::tune_http2;
 #[cfg(feature = "tls")]
 use axum::body::Body;
@@ -130,12 +130,18 @@ pub(super) async fn serve_http_redirect_and_challenges(
     // hardening as the real one — `tune_http1!` carries the `header_read_timeout` that stops a
     // client from opening a connection, never finishing its request line, and holding one of
     // the server's global permits forever (Slowloris).
-    #[cfg_attr(not(feature = "http1"), allow(unused_mut))]
+    //
+    // HTTP/1.1 only: that is what ACME validators and redirect-following clients speak on port
+    // 80, so HTTP/2 here would be parser surface with no user. An `http2`-only build has no
+    // other choice.
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     #[cfg(feature = "http1")]
-    tune_http1!(builder.http1());
-    #[cfg(feature = "http2")]
+    {
+        tune_http1!(builder.http1());
+        builder = builder.http1_only();
+    }
+    #[cfg(not(feature = "http1"))]
     tune_http2!(builder.http2());
     // Fixed for this listener's lifetime, so it's formatted once here rather than per request.
     let port_suffix: Arc<str> = if https_port == 443 {
@@ -146,7 +152,7 @@ pub(super) async fn serve_http_redirect_and_challenges(
 
     while let Some(permit) = limit.acquire().await {
         let (stream, _peer) = crate::server::http::accept_forever(&listener, "http-redirect").await;
-        let io = hyper_util::rt::TokioIo::new(stream);
+        let io = hyper_util::rt::TokioIo::new(crate::server::stall::WriteDeadline::new(stream));
         let builder = builder.clone();
         let allowed_hosts = allowed_hosts.clone();
         let port_suffix = port_suffix.clone();

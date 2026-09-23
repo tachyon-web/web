@@ -268,18 +268,26 @@ impl HttpsServer {
         let mut rustls_config = (*self.config.server_config).clone();
 
         #[cfg(feature = "http3")]
-        if self.serve_http3 {
-            // Ensure ALPN lists "h3"
-            if !rustls_config.alpn_protocols.iter().any(|p| p == b"h3") {
-                rustls_config.alpn_protocols.insert(0, b"h3".to_vec());
-            }
-
-            crate::server::h3::spawn_h3(&server, Arc::new(rustls_config.clone()), self.addr)
-                .map_err(std::io::Error::other)?;
+        if self.serve_http3 && !rustls_config.alpn_protocols.iter().any(|p| p == b"h3") {
+            rustls_config.alpn_protocols.insert(0, b"h3".to_vec());
         }
+        let config = server.finalize_tls_config(rustls_config);
+        let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
+        #[cfg(feature = "http3")]
+        let serve_http3 = self.serve_http3;
 
-        server
-            .start_https_with_config_addr(self.addr, rustls_config)
-            .await
+        super::bind::bind_and_serve(
+            server,
+            self.addr,
+            None,
+            move |server, listener| async move {
+                #[cfg(feature = "http3")]
+                if serve_http3 {
+                    super::h3::spawn_h3_beside(&server, config, &listener)?;
+                }
+                server.serve_https(listener, acceptor).await
+            },
+        )
+        .await
     }
 }

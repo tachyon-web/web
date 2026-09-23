@@ -422,3 +422,119 @@ async fn serve_applies_a_request_body_read_deadline() {
     );
     handle.abort();
 }
+
+/// `max_tls_handshakes` bounds handshakes in flight, not live TLS connections. Its permit used
+/// to ride along for the whole connection, so a limit of 1 served exactly one client at a time.
+#[cfg(feature = "cert-gen")]
+#[tokio::test]
+async fn tls_handshake_permit_is_released_once_the_handshake_completes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("https://{}/", listener.local_addr().expect("local_addr"));
+    let server =
+        Server::new(Router::new().route("/", get(|| async { "ok" }))).max_tls_handshakes(1);
+    let config = self_signed_config(&[b"h2", b"http/1.1"]);
+    let handle = tokio::spawn(async move {
+        let _ = server.serve_https_config(listener, config).await;
+    });
+
+    // Already bound, so no `wait_until_listening` probe: with one permit, a probe's aborted
+    // handshake could still be holding it when the real client arrives.
+    // Each client keeps its pooled connection open, so both are live at once.
+    let clients = [tls_client(), tls_client()];
+    for client in &clients {
+        let response = client.get(&url).send().await.expect("TLS request");
+        assert_eq!(response.status(), 200);
+    }
+
+    handle.abort();
+}
+
+/// A failed HTTPS bind must not leave the detached cleartext listener behind: the caller got
+/// an `Err`, so a retry has to find that port free.
+#[cfg(feature = "cert-gen")]
+#[tokio::test]
+async fn a_failed_tls_bind_leaves_the_cleartext_port_free() {
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let tls_addr = occupied.local_addr().expect("local_addr").to_string();
+    let cleartext_addr = free_loopback_addr().await.to_string();
+    let cert = tachyon_web::tls::generate_self_signed_cert(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+
+    let started = Server::new(Router::new())
+        .start_all(
+            &tls_addr,
+            Some(&cleartext_addr),
+            cert.cert_pem,
+            cert.key_pem,
+        )
+        .await;
+    assert!(started.is_err());
+    drop(
+        tokio::net::TcpListener::bind(&cleartext_addr)
+            .await
+            .expect("start_all left the cleartext port bound"),
+    );
+
+    #[cfg(feature = "lets-encrypt")]
+    {
+        let cache = tempfile::tempdir().expect("create cache directory");
+        let started = Server::new(Router::new())
+            .serve_all_acme(
+                &tls_addr,
+                &cleartext_addr,
+                vec!["localhost".to_string()],
+                "admin@example.com".to_string(),
+                cache.path(),
+                true,
+            )
+            .await;
+        assert!(started.is_err());
+        drop(
+            tokio::net::TcpListener::bind(&cleartext_addr)
+                .await
+                .expect("serve_all_acme left the cleartext port bound"),
+        );
+    }
+}
+
+/// With h2c off (the default) the HTTP/2 stack is not reachable on a plaintext port at all:
+/// HTTP/1.1 refuses the connection preface. Opting in brings HTTP/2 back.
+#[cfg(all(feature = "http1", feature = "http2"))]
+#[tokio::test]
+async fn plaintext_speaks_http2_only_when_h2c_is_allowed() {
+    async fn first_bytes_after_preface(allow_h2c: bool) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let policy = tachyon_web::server::SecurityPolicy::new().allow_h2c(allow_h2c);
+        let server = Server::new(Router::new()).security_policy(policy);
+        let handle = tokio::spawn(async move {
+            let _ = server.serve_http(listener).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+            .await
+            .expect("write preface");
+        let mut head = Vec::new();
+        let _ = (&mut stream)
+            .take(8)
+            .read_to_end(&mut head)
+            .await
+            .expect("read reply");
+        handle.abort();
+        head
+    }
+
+    let refused = first_bytes_after_preface(false).await;
+    assert!(
+        refused.is_empty() || refused.starts_with(b"HTTP/1.1"),
+        "HTTP/2 answered on a plaintext port with h2c off: {refused:?}"
+    );
+    // An HTTP/2 server's first frame is its SETTINGS (type 0x4, at byte 3).
+    assert_eq!(first_bytes_after_preface(true).await.get(3), Some(&0x4));
+}

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::server::accept::ConnectionLimit;
+use crate::server::http::body_time_earned;
 use crate::server::{REQUEST_TIMEOUT, RESPONSE_WRITE_TIMEOUT, Server};
 
 /// Builds the QUIC endpoint HTTP/3 is served over, from a rustls config and a bind address.
@@ -48,19 +49,24 @@ pub(super) fn build_quic_server(
         .start()?)
 }
 
-/// Spawns [`Server::serve_h3`] on a QUIC endpoint built for `config`/`io`, alongside whichever
-/// TCP listener the caller goes on to run.
-pub(super) fn spawn_h3<S>(
+/// Spawns [`Server::serve_h3`] on the UDP twin of an already-bound HTTPS listener.
+///
+/// Only callable once TCP is bound, so a failed bind can't leave a detached QUIC endpoint
+/// behind, and UDP lands on the port TCP actually got (which differs for port `0`).
+pub(super) fn spawn_h3_beside<S>(
     server: &Server<S>,
     config: Arc<rustls::ServerConfig>,
-    io: impl tachyon_quic::s2n_quic::provider::io::TryInto<
-        Error: std::error::Error + Send + Sync + 'static,
-    >,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    listener: &tokio::net::TcpListener,
+) -> Result<(), std::io::Error>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let quic_server = build_quic_server(config, io, server.max_h3_concurrent_streams)?;
+    let quic_server = build_quic_server(
+        config,
+        listener.local_addr()?,
+        server.max_h3_concurrent_streams,
+    )
+    .map_err(std::io::Error::other)?;
     let server = server.clone();
     drop(tokio::spawn(async move {
         let _ = server.serve_h3(quic_server).await;
@@ -81,6 +87,20 @@ async fn write_within<T, E>(
             Err(())
         }
     }
+}
+
+/// Sends a bodyless response and finishes the stream.
+///
+/// Bounded like every write on the success path. These are the cheapest responses for a peer
+/// to provoke — a `content-length` past `max_body_size` needs no body at all — so unbounded
+/// awaits here let a peer that holds its flow-control window shut pin one stream permit per
+/// rejected request, for as long as it liked.
+async fn send_head_only(
+    stream: &mut tachyon_quic::h3::server::RequestStream<tachyon_quic::BidiStream<Bytes>, Bytes>,
+    response: Response<()>,
+) {
+    let _ = write_within(stream.send_response(response)).await;
+    let _ = write_within(stream.finish()).await;
 }
 
 impl<S> Server<S>
@@ -222,36 +242,37 @@ where
 
         let mut body_vec = Vec::with_capacity(content_length.unwrap_or(0).min(256 * 1024));
 
-        let timeout_res = tokio::time::timeout(REQUEST_TIMEOUT, async {
-            loop {
-                match stream.recv_data().await {
-                    Ok(Some(mut chunk)) => {
-                        while chunk.has_remaining() {
-                            let data = chunk.chunk();
-                            if body_vec.len().saturating_add(data.len()) > limit {
-                                return Err(over_limit);
-                            }
-                            body_vec.extend_from_slice(data);
-                            let len = data.len();
-                            chunk.advance(len);
+        // Same rule as the HTTP/1.1 and HTTP/2 body: a grace period plus time earned per byte.
+        let mut deadline = tokio::time::Instant::now()
+            .checked_add(REQUEST_TIMEOUT)
+            .ok_or(StatusCode::REQUEST_TIMEOUT)?;
+        loop {
+            let Ok(received) = tokio::time::timeout_at(deadline, stream.recv_data()).await else {
+                return Err(StatusCode::REQUEST_TIMEOUT);
+            };
+            match received {
+                Ok(Some(mut chunk)) => {
+                    while chunk.has_remaining() {
+                        let data = chunk.chunk();
+                        if body_vec.len().saturating_add(data.len()) > limit {
+                            return Err(over_limit);
                         }
+                        body_vec.extend_from_slice(data);
+                        let len = data.len();
+                        chunk.advance(len);
+                        deadline = deadline
+                            .checked_add(body_time_earned(len))
+                            .unwrap_or(deadline);
                     }
-                    Ok(None) => break,
-                    Err(_) => return Err(StatusCode::BAD_REQUEST),
                 }
+                Ok(None) => break,
+                Err(_) => return Err(StatusCode::BAD_REQUEST),
             }
-            if content_length.is_some_and(|declared| body_vec.len() != declared) {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-            Ok(())
-        })
-        .await;
-
-        match timeout_res {
-            Ok(Err(status)) => Err(status),
-            Err(_) => Err(StatusCode::REQUEST_TIMEOUT),
-            Ok(Ok(())) => Ok(Bytes::from(body_vec)),
         }
+        if content_length.is_some_and(|declared| body_vec.len() != declared) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        Ok(Bytes::from(body_vec))
     }
 
     async fn handle_h3_request(
@@ -265,7 +286,14 @@ where
             return;
         };
 
-        let (parts, ()) = req.into_parts();
+        // Judged on its head before its body is buffered: a request the policy refuses must not
+        // cost up to `max_body_size` of memory first.
+        let mut req = req.map(|()| axum::body::Body::empty());
+        if let Some(response) = self.reject(&mut req, Some(peer), true) {
+            send_head_only(&mut stream, response.map(|_| ())).await;
+            return;
+        }
+        let (parts, _) = req.into_parts();
 
         let body_bytes = match self.read_h3_body(&parts, &mut stream).await {
             Ok(bytes) => bytes,
@@ -275,19 +303,13 @@ where
                     .body(())
                     .unwrap_or_else(|_| Response::new(()));
                 self.security_policy.finalize_response(&mut response, true);
-                // Bounded like every write on the success path below. These are the cheapest
-                // responses for a peer to provoke — a `content-length` past `max_body_size`
-                // needs no body at all — so leaving them as unbounded awaits let a peer that
-                // holds its flow-control window shut pin one stream permit per rejected
-                // request, for as long as it liked.
-                let _ = write_within(stream.send_response(response)).await;
-                let _ = write_within(stream.finish()).await;
+                send_head_only(&mut stream, response).await;
                 return;
             }
         };
 
         let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
-        let full_resp = self.dispatch(req, peer, true).await;
+        let full_resp = self.route(req, Some(peer), true).await;
 
         let (resp_parts, body) = full_resp.into_parts();
         let resp = Response::from_parts(resp_parts, ());
@@ -359,7 +381,7 @@ mod tests {
     /// bound address and the self-signed cert's PEM (for the client to trust).
     fn start_h3_server(
         app: Router<()>,
-        max_body_size: Option<usize>,
+        configure: impl FnOnce(Server<()>) -> Server<()>,
     ) -> (std::net::SocketAddr, String) {
         let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
             .expect("generate self-signed cert");
@@ -376,10 +398,7 @@ mod tests {
             .expect("start quic server");
         let addr = quic_server.local_addr().expect("local addr");
 
-        let mut server = Server::new(app);
-        if let Some(limit) = max_body_size {
-            server = server.max_body_size(limit);
-        }
+        let server = configure(Server::new(app));
         drop(tokio::spawn(async move {
             let _ = server.serve_h3(quic_server).await;
         }));
@@ -456,7 +475,7 @@ mod tests {
         let app = Router::new()
             .route("/", get(hello))
             .route("/echo", post(echo));
-        let (addr, cert_pem) = start_h3_server(app, None);
+        let (addr, cert_pem) = start_h3_server(app, |server| server);
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -526,7 +545,7 @@ mod tests {
     async fn h3_content_length_mismatch_is_rejected_in_both_directions() {
         let app = Router::new().route("/echo", post(echo));
         // Generous body limit, so it's the declared length doing the rejecting, not `413`.
-        let (addr, cert_pem) = start_h3_server(app, Some(1024 * 1024));
+        let (addr, cert_pem) = start_h3_server(app, |server| server.max_body_size(1024 * 1024));
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -564,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn h3_exact_content_length_still_round_trips() {
         let app = Router::new().route("/echo", post(echo));
-        let (addr, cert_pem) = start_h3_server(app, None);
+        let (addr, cert_pem) = start_h3_server(app, |server| server);
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -598,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn h3_post_over_max_body_size_is_rejected() {
         let app = Router::new().route("/echo", post(echo));
-        let (addr, cert_pem) = start_h3_server(app, Some(8));
+        let (addr, cert_pem) = start_h3_server(app, |server| server.max_body_size(8));
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -620,6 +639,37 @@ mod tests {
         stream.finish().await.expect("finish POST request stream");
         let response = stream.recv_response().await.expect("recv response");
         assert_eq!(response.status(), hyper::StatusCode::PAYLOAD_TOO_LARGE);
+
+        drop(send_request);
+        driver_task.abort();
+    }
+
+    /// A refused request is answered from its head alone. The body is declared but never sent,
+    /// so a server that buffered it first would sit out the body deadline and answer `408`.
+    #[tokio::test]
+    async fn h3_policy_rejects_before_reading_the_body() {
+        let app = Router::new().route("/echo", post(echo));
+        let policy = crate::server::SecurityPolicy::new().allowed_hosts(["example.invalid"]);
+        let (addr, cert_pem) = start_h3_server(app, |server| server.security_policy(policy));
+        let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
+
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("https://localhost/echo")
+            .header(hyper::header::CONTENT_LENGTH, 4096)
+            .body(())
+            .expect("build POST request");
+        let mut stream = send_request
+            .send_request(req)
+            .await
+            .expect("send POST request");
+
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv_response())
+                .await
+                .expect("answered without waiting for the body")
+                .expect("recv response");
+        assert_eq!(response.status(), hyper::StatusCode::MISDIRECTED_REQUEST);
 
         drop(send_request);
         driver_task.abort();

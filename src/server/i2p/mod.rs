@@ -118,7 +118,7 @@
 //!
 //!     let config = I2pConfig::new("my-eepsite")
 //!         .data_dir("/var/lib/tachyon/i2p")
-//!         .on_ready(|addr| tracing::info!("reachable at http://{addr}"));
+//!         .on_ready(|addr| println!("reachable at http://{addr}"));
 //!
 //!     Server::new(app).serve_i2p_config(config).await?;
 //!     Ok(())

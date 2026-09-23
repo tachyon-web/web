@@ -5,7 +5,7 @@
 //!
 //! | Method | Protocol | Feature flag |
 //! |---|---|---|
-//! | [`serve_http`] | HTTP/1.1 plain TCP (+ HTTP/2 cleartext "h2c" with `http2`) | *(always)* |
+//! | [`serve_http`] | HTTP/1.1 plain TCP (+ HTTP/2 cleartext "h2c" with `http2` and `SecurityPolicy::allow_h2c`) | *(always)* |
 //! | [`serve_https`] | HTTP/1.1 + HTTP/2 over TLS | `tls` |
 //! | [`serve_https_config`] | Same but with custom `ServerConfig` | `tls` |
 //! | [`serve_h3`] | HTTP/3 over QUIC | `http3` |
@@ -54,7 +54,12 @@ mod accept;
 #[cfg(any(feature = "tor", feature = "i2p"))]
 mod anon_tls;
 mod bind;
-#[cfg(any(feature = "tor", feature = "i2p", test))]
+// Its tests need a protocol they can drive: HTTP/1.1, or HTTP/2 with `ws` (see `conn::tests`).
+#[cfg(any(
+    feature = "tor",
+    feature = "i2p",
+    all(test, any(feature = "http1", feature = "ws"))
+))]
 pub(crate) mod conn;
 #[cfg(feature = "http3")]
 mod h3;
@@ -64,6 +69,7 @@ pub mod i2p;
 mod multi;
 mod redirect;
 mod security;
+mod stall;
 #[cfg(feature = "tls")]
 pub(crate) mod tls_config;
 #[macro_use]
@@ -99,6 +105,8 @@ use hyper::{Request, Response};
 use tokio_rustls::TlsAcceptor;
 
 use bind::bind_and_serve;
+#[cfg(feature = "http3")]
+use h3::spawn_h3_beside;
 #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
 use redirect::RedirectInfo;
 use redirect::parse_addr;
@@ -114,15 +122,26 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default handshake timeout for TLS connections.
 #[cfg(feature = "tls")]
 pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long a single response write may make no progress before the stream is abandoned.
+/// How long a single write may make no progress before the connection (or, on HTTP/3, the
+/// stream) is abandoned.
 ///
 /// Deliberately per-write rather than a budget for the whole response: a slow client that is
 /// still consuming keeps resetting it, so long downloads and open SSE streams are unaffected,
-/// while a peer that has simply stopped reading — holding its flow-control window shut to pin
-/// the stream and its buffers — is dropped. This is the QUIC-side counterpart to bounding
-/// `max_send_buf_size` on HTTP/2 (see `tuning`).
-#[cfg(feature = "http3")]
+/// while a peer that has simply stopped reading — holding its receive window shut to pin the
+/// connection and its buffers — is dropped. See `stall::WriteDeadline` for TCP/Tor/I2P.
 pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The [`ConnectInfo`](axum::extract::ConnectInfo) reported where the transport has no peer
+/// address (Tor/I2P both exist specifically to hide it).
+///
+/// Every such request reports the *same* `0.0.0.0:0`, so per-IP logic keyed on it degrades in
+/// two ways worth knowing about before relying on it: any per-peer rate limiter collapses to a
+/// single shared bucket for all anonymous traffic, and a "trust anything that isn't a global
+/// address" check will treat every one of these requests as trusted, since `0.0.0.0` is not a
+/// global address — a real hazard in a process that also serves a clearnet listener. This
+/// crate's own [`SecurityPolicy`] never consults it: those transports pass no peer at all.
+pub(crate) const NO_PEER_ADDR: std::net::SocketAddr =
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Default for [`Server::max_connections`].
 ///
@@ -310,20 +329,43 @@ where
     /// Every transport funnels through here — HTTP/1.1, HTTP/2, `.onion` and `.i2p` via
     /// `hyper_handler`, HTTP/3 directly — so they can't disagree about which extensions a
     /// handler sees.
+    ///
+    /// `peer` is `None` on an anonymity transport — see [`NO_PEER_ADDR`].
     pub(crate) async fn dispatch(
         &self,
         mut req: Request<Body>,
-        peer: std::net::SocketAddr,
+        peer: Option<std::net::SocketAddr>,
         secure_transport: bool,
     ) -> Response<Body> {
-        if let Some(mut response) = self
-            .security_policy
-            .inspect(&mut req, peer, secure_transport)
-        {
-            self.security_policy
-                .finalize_response(&mut response, secure_transport);
+        if let Some(response) = self.reject(&mut req, peer, secure_transport) {
             return response;
         }
+        self.route(req, peer, secure_transport).await
+    }
+
+    /// The security policy's verdict on a request's head, finalized and ready to send.
+    ///
+    /// Split from [`route`](Self::route) so HTTP/3, which buffers bodies, can refuse a request
+    /// before reading one.
+    pub(crate) fn reject(
+        &self,
+        req: &mut Request<Body>,
+        peer: Option<std::net::SocketAddr>,
+        secure_transport: bool,
+    ) -> Option<Response<Body>> {
+        let mut response = self.security_policy.inspect(req, peer, secure_transport)?;
+        self.security_policy
+            .finalize_response(&mut response, secure_transport);
+        Some(response)
+    }
+
+    /// Routes a request that [`reject`](Self::reject) already let through.
+    pub(crate) async fn route(
+        &self,
+        mut req: Request<Body>,
+        peer: Option<std::net::SocketAddr>,
+        secure_transport: bool,
+    ) -> Response<Body> {
         let Ok(_permit) = self.request_limit.clone().try_acquire_owned() else {
             let mut response = security::empty_response(hyper::StatusCode::SERVICE_UNAVAILABLE);
             self.security_policy
@@ -331,7 +373,7 @@ where
             return response;
         };
         let extensions = req.extensions_mut();
-        let _ = extensions.insert(axum::extract::ConnectInfo(peer));
+        let _ = extensions.insert(axum::extract::ConnectInfo(peer.unwrap_or(NO_PEER_ADDR)));
         match self.router.clone().oneshot(req).await {
             Ok(mut response) => {
                 self.security_policy
@@ -733,11 +775,10 @@ where
         #[cfg(feature = "fips")]
         assert_fips_server_config(&config)?;
 
-        h3::spawn_h3(&self, config.clone(), tls_addr)?;
-
         let addr = parse_addr(tls_addr)?;
-        let tls_acceptor = TlsAcceptor::from(config);
+        let tls_acceptor = TlsAcceptor::from(config.clone());
         bind_and_serve(self, addr, None, move |server, listener| async move {
+            spawn_h3_beside(&server, config, &listener)?;
             server.serve_https(listener, tls_acceptor).await
         })
         .await?;
@@ -845,6 +886,9 @@ where
 
         let addr = parse_addr(tls_addr)?;
         let redirect_addr = parse_addr(cleartext_addr)?;
+        // Before anything is spawned: the redirect listener and ACME loop are detached, so a
+        // TLS bind failing after them would return `Err` with both still running.
+        let listener = TcpListener::bind(addr).await?;
 
         // The HTTP-01 responder has to be listening *before* the ACME loop places its first
         // order: that loop provisions immediately when the cache is empty, and the challenge it
@@ -908,14 +952,8 @@ where
         let tls_acceptor = TlsAcceptor::from(tls_config.clone());
 
         #[cfg(feature = "http3")]
-        h3::spawn_h3(&self, tls_config, tls_addr)?;
-
-        // Bind the HTTPS listener and serve (blocks the calling task). The cleartext listener
-        // is already running — see above — so no `RedirectInfo` is passed here.
-        bind_and_serve(self, addr, None, move |server, listener| async move {
-            server.serve_https(listener, tls_acceptor).await
-        })
-        .await?;
+        spawn_h3_beside(&self, tls_config, &listener)?;
+        self.serve_https(listener, tls_acceptor).await?;
 
         Ok(())
     }
@@ -1002,16 +1040,16 @@ where
             })
             .transpose()?;
 
-        // Start HTTP/3 QUIC Server (if the feature is enabled).
-        #[cfg(feature = "http3")]
-        h3::spawn_h3(&self, tls_config, tls_addr)?;
-
-        // Start the HTTPS listener (blocks this task).
+        // Start the HTTPS listener (blocks this task), with HTTP/3 beside it when enabled.
         bind_and_serve(
             self,
             addr,
             redirect_info,
-            move |server, listener| async move { server.serve_https(listener, tls_acceptor).await },
+            move |server, listener| async move {
+                #[cfg(feature = "http3")]
+                spawn_h3_beside(&server, tls_config, &listener)?;
+                server.serve_https(listener, tls_acceptor).await
+            },
         )
         .await?;
 
