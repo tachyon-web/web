@@ -30,7 +30,7 @@
 //!
 //! ## HTTPS with automatic Let's Encrypt certificates
 //!
-//! [`Server::serve_all_acme`] issues the certificate on first startup, answers the HTTP-01
+//! `Server::serve_all_acme` (`lets-encrypt`) issues the certificate on first startup, answers the HTTP-01
 //! challenge in-process, caches account credentials and the certificate to disk, renews 30
 //! days before expiry, and hot-swaps the result into the running TLS stack.
 //!
@@ -94,7 +94,7 @@
 //!
 //! ## Native Tor `.onion` hidden services
 //!
-//! With the `tor` feature, [`Server::serve_tor`] publishes the app directly as a v3 Tor hidden
+//! With the `tor` feature, `Server::serve_tor` publishes the app directly as a v3 Tor hidden
 //! service — via [`arti-client`](https://docs.rs/arti-client)/[`tor-hsservice`](https://docs.rs/tor-hsservice) —
 //! with no external `tor` daemon or reverse proxy required:
 //!
@@ -116,7 +116,7 @@
 //!
 //! ## Native I2P `.b32.i2p` eepsites
 //!
-//! With the `i2p` feature, [`Server::serve_i2p`] publishes the app directly as an I2P eepsite —
+//! With the `i2p` feature, `Server::serve_i2p` publishes the app directly as an I2P eepsite —
 //! via the vendored, statically-linked [`libi2pd`](https://github.com/PurpleI2P/i2pd) router —
 //! with no external `i2pd`/Java-I2P process required:
 //!
@@ -136,13 +136,10 @@
 //! }
 //! ```
 //!
-//! Unlike every other feature here, `i2p` links in `unsafe` code. The
-//! `#![forbid(unsafe_code)]` below still holds for this crate's own source — no feature can
-//! override it — but it says nothing about the FFI boundary. `libi2pd` is C++ with no stable
-//! C ABI, so the bindings ([`i2pd-sys`](https://docs.rs/i2pd-sys) /
-//! [`tachyon-i2p`](https://docs.rs/tachyon-i2p)) were written for this project rather than
-//! being an independently audited pure-Rust dependency the way `arti-client` is for `tor`.
-//! Read [`server::i2p`] before enabling it in anything security-sensitive.
+//! Unlike every other feature, `i2p` links C++ through project-specific FFI bindings
+//! ([`i2pd-sys`](https://docs.rs/i2pd-sys)/[`tachyon-i2p`](https://docs.rs/tachyon-i2p)).
+//! This crate's own `#![forbid(unsafe_code)]` still holds, but says nothing about that boundary.
+//! Read the `server::i2p` module docs before enabling it in anything security-sensitive.
 
 #![forbid(unsafe_code, elided_lifetimes_in_paths)]
 #![allow(clippy::multiple_crate_versions)]
@@ -208,7 +205,6 @@ compile_error!(
     feature = "tls",
     feature = "cert-gen",
     feature = "http3",
-    feature = "fips",
     not(feature = "cnsa"),
     feature = "lets-encrypt",
     feature = "tor",
@@ -226,6 +222,6 @@ pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub use axum::*;
-pub use server::{DeploymentProfile, MultiServer, Server};
+pub use server::{DeploymentProfile, Limits, MultiServer, Server};
 #[cfg(feature = "tls")]
 pub use server::{HttpsServer, RustlsConfig, bind_rustls};

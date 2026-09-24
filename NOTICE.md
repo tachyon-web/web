@@ -38,5 +38,4 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 This notice covers Axum specifically, as the foundation Tachyon-Web is built on. The full set
-of dependencies (each under its own license) is in `Cargo.lock`; `cargo license` (or similar)
-will enumerate them if a complete bill of licenses is needed.
+of dependencies (each under its own license) is in `Cargo.lock`.

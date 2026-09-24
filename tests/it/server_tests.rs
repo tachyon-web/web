@@ -50,7 +50,7 @@ async fn assert_serves(
 fn test_server_debug_and_config() {
     let router = Router::new();
     let server = Server::new(router).max_body_size(1024);
-    assert_eq!(server.max_body_size, 1024);
+    assert_eq!(server.limits().max_body_size, 1024);
     let dbg = format!("{:?}", server);
     assert!(dbg.contains("Server"));
 }
@@ -544,4 +544,51 @@ async fn plaintext_speaks_http2_only_when_h2c_is_allowed() {
     );
     // An HTTP/2 server's first frame is its SETTINGS (type 0x4, at byte 3).
     assert_eq!(first_bytes_after_preface(true).await.get(3), Some(&0x4));
+}
+
+/// A still-valid cached certificate is activated and served immediately, with no ACME order
+/// placed — the path every restart of a live deployment takes.
+#[cfg(feature = "lets-encrypt")]
+#[tokio::test]
+async fn serve_all_acme_serves_a_cached_certificate_without_ordering() {
+    let cache = tempfile::tempdir().expect("create cache directory");
+    // The manager refuses a cache directory others can read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restrict cache directory");
+    }
+    let cert = tachyon_web::tls::generate_self_signed_cert(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+    std::fs::write(cache.path().join("domain.crt"), cert.cert_pem).expect("write cert");
+    std::fs::write(cache.path().join("domain.key"), cert.key_pem).expect("write key");
+
+    let tls_addr = free_loopback_addr().await;
+    let cleartext_addr = free_loopback_addr().await;
+    let cache_dir = cache.path().to_path_buf();
+    let router = Router::new().route("/", get(|| async { "ok-acme-cached" }));
+    let handle = tokio::spawn(async move {
+        let result = Server::new(router)
+            .serve_all_acme(
+                &tls_addr.to_string(),
+                &cleartext_addr.to_string(),
+                vec!["localhost".to_string()],
+                "admin@example.com".to_string(),
+                cache_dir,
+                true,
+            )
+            .await;
+        assert!(result.is_ok(), "serve_all_acme stopped: {result:?}");
+    });
+
+    // The certificate's name is the only allowed host, so the request must use it.
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .resolve("localhost", tls_addr)
+        .build()
+        .expect("build TLS test client");
+    let url = format!("https://localhost:{}/", tls_addr.port());
+    assert_serves(&client, &url, tls_addr, "ok-acme-cached").await;
+    handle.abort();
 }

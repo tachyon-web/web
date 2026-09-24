@@ -13,10 +13,7 @@ use tachyon_i2p::I2pRouter;
 #[cfg(feature = "tls")]
 use tokio_rustls::TlsAcceptor;
 
-impl<S> Server<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+impl Server {
     /// Publishes this router as an I2P eepsite and serves requests arriving over it, blocking
     /// indefinitely — the accept loop retries forever on error and has no graceful-stop
     /// mechanism today; abort the surrounding task (e.g. via `JoinHandle::abort`) to end it.
@@ -74,8 +71,7 @@ where
     /// **See the [module docs](crate::server::i2p) for why this feature does not honor
     /// `tachyon-web`'s `forbid(unsafe_code)` guarantee.**
     ///
-    /// The self-signed certificate (when [`I2pConfig::self_signed_tls`] is used) shares this
-    /// server's crypto/TLS policy — see [`Server::tls_policy`].
+    /// TLS, when enabled, uses this server's TLS policy.
     ///
     /// # Errors
     /// Returns an error if `nickname` contains path separators or `..` (it's used verbatim to
@@ -139,9 +135,7 @@ where
         let limit = state.connection_limit.clone();
         loop {
             let stream = accept_i2p_forever(&mut destination).await;
-            let Some(permit) = limit.acquire().await else {
-                break;
-            };
+            let permit = limit.acquire().await;
             let state = state.clone();
             #[cfg(feature = "tls")]
             let tls_acceptor = tls_acceptor.clone();
@@ -155,15 +149,13 @@ where
                 }
             });
         }
-        Ok(())
     }
 }
 
 /// Accepts the next I2P stream, retrying after recoverable errors.
 ///
 /// Mirrors [`crate::server::http::accept_forever`]: a failed accept is logged and retried
-/// after a short back-off rather than ending the eepsite, so the caller's loop only ever
-/// stops when the connection limiter is closed.
+/// after a short back-off rather than ending the eepsite.
 async fn accept_i2p_forever(destination: &mut tachyon_i2p::Destination) -> tachyon_i2p::I2pStream {
     loop {
         match destination.accept().await {
@@ -180,13 +172,10 @@ async fn accept_i2p_forever(destination: &mut tachyon_i2p::Destination) -> tachy
 /// only, sharing the same [`serve_connection`] helper (and thus HTTP/1.1-vs-HTTP/2 negotiation
 /// logic) `tor`'s serve module uses.
 #[cfg(not(feature = "tls"))]
-async fn handle_i2p_stream_plaintext<S>(
-    state: Arc<Server<S>>,
+async fn handle_i2p_stream_plaintext(
+    state: Arc<Server>,
     stream: tachyon_i2p::I2pStream,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: Clone + Send + Sync + 'static,
-{
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let http2 = state.security_policy.allows_h2c();
     let svc = hyper::service::service_fn(move |req| hyper_handler(state.clone(), req, None, false));
     serve_connection(stream, svc, http2).await
@@ -197,14 +186,11 @@ where
 /// serve module uses. Requires the `tls` feature (see [`handle_i2p_stream_plaintext`] for the
 /// non-TLS build).
 #[cfg(feature = "tls")]
-async fn handle_i2p_stream<S>(
-    state: Arc<Server<S>>,
+async fn handle_i2p_stream(
+    state: Arc<Server>,
     stream: tachyon_i2p::I2pStream,
     tls_acceptor: Option<TlsAcceptor>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: Clone + Send + Sync + 'static,
-{
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match tls_acceptor {
         None => {
             let http2 = state.security_policy.allows_h2c();

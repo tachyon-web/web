@@ -1,57 +1,59 @@
 //! The plaintext port-80 listener spawned alongside a TLS listener: answers ACME HTTP-01
 //! challenges and redirects everything else to HTTPS.
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 use std::sync::Arc;
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 use tokio::net::TcpListener;
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 use crate::server::accept::ConnectionLimit;
-#[cfg(all(feature = "tls", feature = "http1"))]
+#[cfg(feature = "cert-gen")]
+use crate::server::security::empty_response;
+#[cfg(all(feature = "cert-gen", feature = "http1"))]
 use crate::server::tuning::tune_http1;
-#[cfg(all(feature = "tls", feature = "http2", not(feature = "http1")))]
+#[cfg(all(feature = "cert-gen", feature = "http2", not(feature = "http1")))]
 use crate::server::tuning::tune_http2;
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 use axum::body::Body;
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 use hyper::service::service_fn;
-#[cfg(feature = "tls")]
-use hyper::{Request, Response};
+#[cfg(feature = "cert-gen")]
+use hyper::{Request, Response, StatusCode};
 
-/// Parameters for the plaintext port-80 redirect/ACME-challenge listener spawned alongside a
-/// TLS listener — see [`serve_http_redirect_and_challenges`].
+/// Parameters for the plaintext port-80 redirect/ACME-challenge listener.
 ///
-/// Always defined because the shared bind path, [`bind_and_serve`](crate::server::bind::bind_and_serve),
-/// takes `Option<RedirectInfo>` unconditionally — only *constructing* a `Some` (and consuming
-/// it there) requires the `tls` feature.
-#[derive(Clone)]
+/// Always defined because [`bind_and_serve`](crate::server::bind::bind_and_serve) takes an
+/// `Option` of it; the fields exist only in `cert-gen` builds, the only ones that construct it.
 pub(super) struct RedirectInfo {
-    // All three fields are only ever populated behind `#[cfg(feature = "tls")]` construction
-    // sites — cfg'd out entirely (rather than left in and unread) for a non-`tls` build, so
-    // that build doesn't trip `-D dead-code` over a type it can only ever hold as `None`.
-    #[cfg(feature = "tls")]
+    #[cfg(feature = "cert-gen")]
     pub addr: std::net::SocketAddr,
-    #[cfg(feature = "tls")]
+    #[cfg(feature = "cert-gen")]
     pub https_port: u16,
-    /// A share of the server's connection pool, not the pool itself — built with
-    /// [`ConnectionLimit::with_share`] so this listener cannot starve the TLS one.
-    #[cfg(feature = "tls")]
+    /// A share of the server's connection pool, so this listener cannot starve the TLS one.
+    #[cfg(feature = "cert-gen")]
     pub limit: ConnectionLimit,
-    #[cfg(feature = "tls")]
+    #[cfg(feature = "cert-gen")]
     pub policy: crate::server::SecurityPolicy,
-    /// The known-good hostnames this deployment serves, when available (e.g. the ACME
-    /// `domains` list in [`Server::serve_all_acme`]). An inbound `Host` header that doesn't
-    /// match any entry is replaced with the first domain rather than echoed into `Location`.
-    /// `None` means no hostname is trusted and redirects are rejected with `400`; this is used
-    /// by APIs that receive only certificate bytes and therefore cannot establish an explicit
-    /// host allow-list.
-    #[cfg(feature = "tls")]
-    pub allowed_hosts: Option<Arc<[String]>>,
+    /// The hostnames this deployment serves. An inbound `Host` that matches none is replaced
+    /// with the first entry rather than echoed into `Location`; an empty list rejects every
+    /// redirect with `400`.
+    #[cfg(feature = "cert-gen")]
+    pub allowed_hosts: Arc<[String]>,
 }
-/// Parses a bind address string (e.g. `"0.0.0.0:443"`), wrapping the error the same way every
-/// `serve_*`/`start_*` entry point below does — shared so that wrapping can't drift between
-/// call sites.
+
+#[cfg(feature = "cert-gen")]
+impl RedirectInfo {
+    /// Binds the listener and drives it on a task owned by the returned handle.
+    pub(super) async fn spawn(self) -> Result<crate::server::BackgroundTask, std::io::Error> {
+        let listener = TcpListener::bind(self.addr).await?;
+        Ok(crate::server::BackgroundTask::new(tokio::spawn(
+            serve_http_redirect_and_challenges(listener, self),
+        )))
+    }
+}
+
+/// Parses a bind address string (e.g. `"0.0.0.0:443"`) into an `InvalidInput` error on failure.
 pub(super) fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Error> {
     addr.parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
@@ -63,10 +65,10 @@ pub(super) fn parse_addr(addr: &str) -> Result<std::net::SocketAddr, std::io::Er
 /// Allow-list entries are stored unbracketed, because that is the form
 /// [`SecurityPolicy`](crate::server::SecurityPolicy) compares against — so an IPv6 entry
 /// spliced straight into a `Location` would produce `https://::1:8443/`, which is not a URL.
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 struct UrlHost<'a>(&'a str);
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 impl std::fmt::Display for UrlHost<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0.contains(':') && !self.0.starts_with('[') {
@@ -78,28 +80,20 @@ impl std::fmt::Display for UrlHost<'_> {
 }
 /// Resolves the host to put in the `Location` header of a plaintext→HTTPS redirect.
 ///
-/// When `allowed_hosts` is `Some` (i.e. the caller knows its real domain list — see
-/// [`RedirectInfo::allowed_hosts`]), an inbound `Host` that doesn't match any entry is replaced
-/// with the first allowed domain rather than echoed back: otherwise a request naming an
-/// arbitrary `Host` would get a same-status redirect to an attacker-chosen origin (an open
-/// redirect). `None` rejects the redirect because no request-provided authority is trustworthy.
+/// An inbound `Host` that matches no allow-list entry is replaced with the first non-wildcard
+/// entry rather than echoed back, which would be an open redirect. `None` — an empty list, or
+/// only wildcards and no match — means there is nowhere safe to redirect to.
 ///
-/// Returns `None` when there is no host that can safely be redirected to — either no
-/// allow-list was supplied, or the one that was is empty. Falling back to the inbound `Host`
-/// in either case would reopen exactly the hole this function exists to close.
-///
-/// The inbound `Host` is reduced by [`bare_host`](crate::server::security::bare_host), the
-/// same normalization the allow-list itself is matched with, so `[::1]:8443` and `::1` reach
-/// one answer here too. The result is always an allow-list entry, never request-controlled
-/// text, so [`UrlHost`] is all that stands between it and a well-formed `Location`.
-#[cfg(feature = "tls")]
+/// Matching uses [`bare_host`](crate::server::security::bare_host), the same normalization
+/// the security policy uses, so `[::1]:8443` and `::1` agree. The result is an allow-list
+/// entry, or for a `*.` wildcard the inbound host that matched it, which `bare_host` has
+/// already validated as a URI authority (no `/`, `@`, `?` or `#`).
+#[cfg(feature = "cert-gen")]
 pub(super) fn resolve_redirect_host<'a>(
     host_header: &'a str,
-    allowed_hosts: Option<&'a [String]>,
+    allowed: &'a [String],
 ) -> Option<&'a str> {
-    let candidate = crate::server::security::bare_host(host_header);
-    let allowed = allowed_hosts?;
-    if let Some(candidate) = candidate
+    if let Some(candidate) = crate::server::security::bare_host(host_header)
         && let Some(entry) = allowed
             .iter()
             .find(|entry| crate::server::security::host_allowed(entry, candidate))
@@ -115,35 +109,21 @@ pub(super) fn resolve_redirect_host<'a>(
         .find(|entry| !entry.starts_with("*."))
         .map(String::as_str)
 }
-/// Plain HTTP listener that answers `/.well-known/acme-challenge/<token>` from the global
-/// challenge store and `308`s everything else to the equivalent HTTPS URL.
+/// Plain HTTP listener that answers `/.well-known/acme-challenge/<token>` from the in-process
+/// challenge store and `308`s everything else (`308` keeps the method) to the HTTPS URL.
 ///
-/// `308` rather than `301` because it preserves the request method, so redirected `POST`s stay
-/// `POST`s.
-///
-/// This listener is bound to port 80 and therefore reachable by anyone, even though it never
-/// reaches application handlers. Its `limit` is a *share* of the server's global connection
-/// budget rather than the whole of it — see
-/// [`Server::redirect_connection_share`](crate::server::Server::redirect_connection_share) —
-/// so a flood here cannot take the permits the TLS listener needs.
-///
-/// *Tachyon extension: no `axum` equivalent.*
-#[cfg(feature = "tls")]
-pub(super) async fn serve_http_redirect_and_challenges(
-    listener: TcpListener,
-    https_port: u16,
-    allowed_hosts: Option<Arc<[String]>>,
-    limit: ConnectionLimit,
-    policy: crate::server::SecurityPolicy,
-) {
-    // This listener is bound to port 80 and reachable by anyone, so it gets exactly the same
-    // hardening as the real one — `tune_http1!` carries the `header_read_timeout` that stops a
-    // client from opening a connection, never finishing its request line, and holding one of
-    // the server's global permits forever (Slowloris).
-    //
-    // HTTP/1.1 only: that is what ACME validators and redirect-following clients speak on port
-    // 80, so HTTP/2 here would be parser surface with no user. An `http2`-only build has no
-    // other choice.
+/// Reachable by anyone on port 80, so it gets the same `tune_http1!` hardening (including the
+/// Slowloris header timeout) as every other listener, and only HTTP/1.1 — the only thing ACME
+/// validators and redirect-following clients speak here.
+#[cfg(feature = "cert-gen")]
+async fn serve_http_redirect_and_challenges(listener: TcpListener, info: RedirectInfo) {
+    let RedirectInfo {
+        https_port,
+        allowed_hosts,
+        limit,
+        policy,
+        ..
+    } = info;
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     #[cfg(feature = "http1")]
@@ -153,18 +133,15 @@ pub(super) async fn serve_http_redirect_and_challenges(
     }
     #[cfg(not(feature = "http1"))]
     tune_http2!(builder.http2());
-    // Fixed for this listener's lifetime, so it's formatted once here rather than per request.
-    let port_suffix: Arc<str> = if https_port == 443 {
-        Arc::from("")
+    let port_suffix = if https_port == 443 {
+        String::new()
     } else {
-        Arc::from(format!(":{https_port}"))
+        format!(":{https_port}")
     };
 
     loop {
         let (stream, _peer) = crate::server::http::accept_forever(&listener, "http-redirect").await;
-        let Some(permit) = limit.acquire().await else {
-            break;
-        };
+        let permit = limit.acquire().await;
         let io = hyper_util::rt::TokioIo::new(crate::server::stall::WriteDeadline::new(stream));
         let builder = builder.clone();
         let allowed_hosts = allowed_hosts.clone();
@@ -172,86 +149,66 @@ pub(super) async fn serve_http_redirect_and_challenges(
         let policy = policy.clone();
 
         ConnectionLimit::serve(permit, async move {
-            let _ = builder
-                .serve_connection(
-                    io,
-                    service_fn(move |req: Request<hyper::body::Incoming>| {
-                        let allowed_hosts = allowed_hosts.clone();
-                        let port_suffix = port_suffix.clone();
-                        let policy = policy.clone();
-                        async move {
-                            // Serve ACME HTTP-01 challenge response.
-                            #[cfg(feature = "lets-encrypt")]
-                            if req.method() == hyper::Method::GET
-                                && let Some(token) = req
-                                    .uri()
-                                    .path()
-                                    .strip_prefix("/.well-known/acme-challenge/")
-                                && let Some(key_auth) = crate::tls::acme::get_challenge(token)
-                            {
-                                let mut resp = Response::builder()
-                                    .status(200)
-                                    .header("content-type", "text/plain")
-                                    .body(Body::from(bytes::Bytes::from(key_auth)))
-                                    .unwrap_or_else(|_| Response::new(Body::empty()));
-                                policy.finalize_response(&mut resp, false);
-                                return Ok::<_, std::convert::Infallible>(resp);
-                            }
-
-                            let host = req
-                                .headers()
-                                .get("host")
-                                .and_then(|h| h.to_str().ok())
-                                .unwrap_or("localhost");
-                            let Some(redirect_host) =
-                                resolve_redirect_host(host, allowed_hosts.as_deref())
-                            else {
-                                // No allow-list, or an empty one — nowhere safe to send them.
-                                let mut resp = Response::builder()
-                                    .status(400)
-                                    .body(Body::empty())
-                                    .unwrap_or_else(|_| Response::new(Body::empty()));
-                                policy.finalize_response(&mut resp, false);
-                                return Ok::<_, std::convert::Infallible>(resp);
-                            };
-                            let path_and_query = req
-                                .uri()
-                                .path_and_query()
-                                .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-                            let location = format!(
-                                "https://{}{port_suffix}{path_and_query}",
-                                UrlHost(redirect_host)
-                            );
-
-                            let mut resp =
-                                hyper::header::HeaderValue::from_bytes(location.as_bytes())
-                                    .map_or_else(
-                                        |_| {
-                                            let mut resp = Response::new(Body::empty());
-                                            *resp.status_mut() = hyper::StatusCode::BAD_REQUEST;
-                                            resp
-                                        },
-                                        |location| {
-                                            let mut resp = Response::new(Body::empty());
-                                            *resp.status_mut() =
-                                                hyper::StatusCode::PERMANENT_REDIRECT;
-                                            let _ = resp
-                                                .headers_mut()
-                                                .insert(hyper::header::LOCATION, location);
-                                            resp
-                                        },
-                                    );
-                            policy.finalize_response(&mut resp, false);
-                            Ok::<_, std::convert::Infallible>(resp)
-                        }
-                    }),
-                )
-                .await;
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                let mut response = redirect_or_challenge(&req, &allowed_hosts, &port_suffix);
+                policy.finalize_response(&mut response, false);
+                async move { Ok::<_, std::convert::Infallible>(response) }
+            });
+            let _ = builder.serve_connection(io, service).await;
         });
     }
 }
 
-#[cfg(all(test, feature = "tls"))]
+/// The ACME HTTP-01 answer for a pending challenge token, or a `308` to the HTTPS URL.
+#[cfg(feature = "cert-gen")]
+fn redirect_or_challenge<B>(
+    req: &Request<B>,
+    allowed_hosts: &[String],
+    port_suffix: &str,
+) -> Response<Body> {
+    #[cfg(feature = "lets-encrypt")]
+    if req.method() == hyper::Method::GET
+        && let Some(token) = req
+            .uri()
+            .path()
+            .strip_prefix("/.well-known/acme-challenge/")
+        && let Some(key_auth) = crate::tls::acme::get_challenge(token)
+    {
+        let mut response = Response::new(Body::from(key_auth));
+        let _ = response.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static("text/plain"),
+        );
+        return response;
+    }
+
+    let host = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let Some(redirect_host) = resolve_redirect_host(host, allowed_hosts) else {
+        return empty_response(StatusCode::BAD_REQUEST);
+    };
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    let location = format!(
+        "https://{}{port_suffix}{path_and_query}",
+        UrlHost(redirect_host)
+    );
+    let Ok(location) = hyper::header::HeaderValue::from_str(&location) else {
+        return empty_response(StatusCode::BAD_REQUEST);
+    };
+    let mut response = empty_response(StatusCode::PERMANENT_REDIRECT);
+    let _ = response
+        .headers_mut()
+        .insert(hyper::header::LOCATION, location);
+    response
+}
+
+#[cfg(all(test, feature = "cert-gen"))]
 mod tests {
     use super::UrlHost;
 

@@ -36,23 +36,13 @@ const ONION_HTTP_PORT: u16 = 80;
 #[cfg(feature = "tls")]
 const ONION_HTTPS_PORT: u16 = 443;
 
-impl<S> Server<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
+impl Server {
     /// Publishes this router as a Tor `.onion` hidden service and serves requests arriving
     /// over it, blocking until the service stops.
     ///
-    /// Bootstraps a fresh [`TorClient`] with [`TorClientConfig::default`] — this alone can
-    /// take from several seconds up to a minute or more, since it involves connecting to and
-    /// syncing with the live Tor network — then behaves like
-    /// [`serve_tor_with_client`](Server::serve_tor_with_client). Reuse a [`TorClient`] across
-    /// calls (via `serve_tor_with_client`) rather than bootstrapping one per service.
-    ///
-    /// This is the plaintext-only entry point (virtual port 80 only, no HTTPS, no
-    /// configuration) — available under the `tor` feature alone, no TLS stack required. For
-    /// native onion HTTPS (needs the `tls` feature too), custom state/cache directories, or the
-    /// other [`OnionConfig`] options, use [`serve_onion`](Server::serve_onion) instead.
+    /// Bootstraps a fresh [`TorClient`] (seconds to minutes on the live network), then behaves
+    /// like [`serve_tor_with_client`](Server::serve_tor_with_client). Plaintext on virtual
+    /// port 80 only; use [`serve_onion`](Server::serve_onion) for HTTPS or other options.
     ///
     /// # Errors
     /// Returns an error if the Tor client fails to bootstrap, `nickname` is not a valid
@@ -61,12 +51,7 @@ where
         self,
         nickname: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Install this server's crypto/TLS policy as rustls's process-wide default *before*
-        // bootstrapping — arti reads this global default for its own relay/channel TLS
-        // connections (it has no API to accept a `ClientConfig` directly). See `TlsPolicy`'s
-        // docs. Idempotent: a no-op if something already installed a default. Only relevant
-        // (and only compiled) when this crate's own `tls` feature is enabled — without it,
-        // arti simply falls back to whatever crypto provider it installs on its own.
+        // arti's relay TLS reads rustls's process-wide provider, so install ours first.
         #[cfg(feature = "tls")]
         self.effective_tls_policy().install_as_process_default();
         let client = TorClient::create_bootstrapped(TorClientConfig::default()).await?;
@@ -82,13 +67,9 @@ where
     /// HTTP/1.1, plus h2c when [`SecurityPolicy::allow_h2c`](crate::server::SecurityPolicy::allow_h2c)
     /// permits it — one Tokio task per stream.
     ///
-    /// Since `client` is already bootstrapped, arti has already constructed its internal
-    /// relay/channel TLS provider from whatever `rustls::crypto::CryptoProvider` was installed
-    /// process-wide *before this call* — install one yourself (e.g.
-    /// `server.effective_tls_policy()`, or simply `TlsPolicy::new().install_as_process_default()`,
-    /// both requiring this crate's `tls` feature) before bootstrapping `client` if that matters
-    /// to you; it's too late to affect `client` by the time this function runs.
-    /// [`serve_tor`](Server::serve_tor) does this for you because it owns the bootstrap.
+    /// `client`'s relay TLS already uses whatever provider was installed process-wide when it
+    /// bootstrapped; call `TlsPolicy::install_as_process_default` (`tls` feature) before that
+    /// if it should match. [`serve_tor`](Server::serve_tor) does this for you.
     ///
     /// # Errors
     /// Returns an error if `nickname` is not a valid [`HsNickname`](tor_hsservice::HsNickname),
@@ -159,7 +140,7 @@ where
                 .mode(ExplicitOrAuto::Explicit(VanguardMode::Disabled));
         }
 
-        // See the equivalent comment in `serve_tor` — must happen before bootstrapping.
+        // Before bootstrapping — see `serve_tor`.
         #[cfg(feature = "tls")]
         self.effective_tls_policy().install_as_process_default();
         let client_config = builder.build()?;
@@ -171,22 +152,13 @@ where
     /// already-bootstrapped [`TorClient`], and serves requests arriving over it, blocking until
     /// the service stops.
     ///
-    /// Dispatch depends on `config` and on which features are compiled in: virtual port 80
-    /// serves plaintext HTTP unless [`redirect_http`](OnionConfig::redirect_http) is enabled
-    /// (in which case it issues a `308` to the `https://` equivalent) — both only possible with
-    /// the `tls` feature enabled; virtual port 443 terminates TLS — self-signed by default with
-    /// `cert-gen`, or a caller-supplied config via [`tls_config`](OnionConfig::tls_config) with
-    /// just `tls` — and is only listened on if the `tls` feature is enabled and
-    /// [`no_tls`](OnionConfig::no_tls) wasn't called. Without the `tls` feature at all, this
-    /// behaves exactly like [`serve_tor_with_client`](Server::serve_tor_with_client): plaintext
-    /// on virtual port 80 only. Anything else has its circuit shut down immediately.
+    /// Virtual port 80 serves plaintext HTTP, or `308`s to HTTPS with
+    /// [`redirect_http`](OnionConfig::redirect_http). With `tls` and TLS enabled in `config`,
+    /// virtual port 443 terminates TLS using this server's TLS policy. Any other port has its
+    /// circuit shut down. Without `tls` this is [`serve_tor_with_client`](Server::serve_tor_with_client).
     ///
-    /// Since `client` is already bootstrapped, install a `CryptoProvider` process-wide
-    /// yourself *before* bootstrapping it if you want arti's relay/channel TLS to share this
-    /// server's policy — see the equivalent note on
-    /// [`serve_tor_with_client`](Server::serve_tor_with_client). The self-signed certificate on
-    /// virtual port 443 always uses this server's [`TlsPolicy`](crate::tls::TlsPolicy)
-    /// (see [`Server::tls_policy`]), regardless of what's installed process-wide.
+    /// As with `serve_tor_with_client`, install a process-wide `CryptoProvider` before
+    /// bootstrapping `client` if arti's relay TLS should share this server's policy.
     ///
     /// # Errors
     /// Returns an error if `config.nickname` is not a valid
@@ -243,7 +215,22 @@ where
         require_onion_host_for_redirect(config.redirect_http, onion_host.is_some())?;
         #[cfg(feature = "tls")]
         {
-            let tls_acceptor = self.build_onion_tls_acceptor(&config.tls, onion_host.as_deref())?;
+            let tls_acceptor = match &config.tls {
+                AnonTls::None => None,
+                #[cfg(feature = "cert-gen")]
+                AnonTls::SelfSigned => {
+                    let domain = onion_host.as_deref().unwrap_or("onion-service.invalid");
+                    let cert = crate::tls::generate_self_signed_cert(vec![domain.to_string()])?;
+                    let server_config = self.effective_tls_policy().server_config_from_pem(
+                        cert.cert_pem.as_bytes(),
+                        cert.key_pem.as_bytes(),
+                    )?;
+                    Some(TlsAcceptor::from(Arc::new(server_config)))
+                }
+                AnonTls::Custom(server_config) => Some(TlsAcceptor::from(
+                    self.finalize_tls_config((**server_config).clone()),
+                )),
+            };
             let onion_host: Arc<str> = Arc::from(onion_host.unwrap_or_default());
             let redirect_http = config.redirect_http;
 
@@ -252,13 +239,8 @@ where
             let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
             tokio::pin!(stream_requests);
 
-            loop {
-                let Some(stream_request) = stream_requests.next().await else {
-                    break;
-                };
-                let Some(permit) = limit.acquire().await else {
-                    break;
-                };
+            while let Some(stream_request) = stream_requests.next().await {
+                let permit = limit.acquire().await;
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let onion_host = onion_host.clone();
@@ -290,38 +272,6 @@ where
 
             drop(service);
             Ok(())
-        }
-    }
-
-    /// Builds the TLS acceptor (if any) for [`serve_onion_with_client`](Self::serve_onion_with_client),
-    /// per `config.tls`. `onion_host` is only consulted for [`AnonTls::SelfSigned`], to name the
-    /// generated certificate.
-    #[cfg(feature = "tls")]
-    fn build_onion_tls_acceptor(
-        &self,
-        tls: &AnonTls,
-        onion_host: Option<&str>,
-    ) -> Result<Option<TlsAcceptor>, Box<dyn std::error::Error + Send + Sync>> {
-        // Only the `SelfSigned` arm below names a certificate, and that arm needs `cert-gen`.
-        #[cfg(not(feature = "cert-gen"))]
-        let _ = onion_host;
-        match tls {
-            AnonTls::None => Ok(None),
-            #[cfg(feature = "cert-gen")]
-            AnonTls::SelfSigned => {
-                let domain = onion_host.unwrap_or("onion-service.invalid").to_string();
-                let cert = crate::tls::generate_self_signed_cert(vec![domain])?;
-                // Shares this server's crypto/TLS policy (see `Server::tls_policy`) rather than
-                // stock rustls defaults, so a non-default/FIPS/custom provider set for clearnet
-                // applies here too.
-                let server_config = self
-                    .effective_tls_policy()
-                    .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())?;
-                Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
-            }
-            AnonTls::Custom(server_config) => Ok(Some(TlsAcceptor::from(
-                self.finalize_tls_config((**server_config).clone()),
-            ))),
         }
     }
 }
@@ -439,22 +389,16 @@ fn redirect_location(onion_host: &str, path_and_query: &str) -> String {
 /// Shared by [`serve_tor_with_client`](Server::serve_tor_with_client) and — in builds without
 /// the `tls` feature, where `AnonTls::None` is the only variant that exists — by
 /// [`serve_onion_with_client`](Server::serve_onion_with_client).
-async fn serve_plaintext_onion_streams<S, R>(state: Arc<Server<S>>, request_stream: R)
+async fn serve_plaintext_onion_streams<R>(state: Arc<Server>, request_stream: R)
 where
-    S: Clone + Send + Sync + 'static,
     R: futures_util::Stream<Item = tor_hsservice::RendRequest> + Send,
 {
     let limit = state.connection_limit.clone();
     let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
     tokio::pin!(stream_requests);
 
-    loop {
-        let Some(stream_request) = stream_requests.next().await else {
-            break;
-        };
-        let Some(permit) = limit.acquire().await else {
-            break;
-        };
+    while let Some(stream_request) = stream_requests.next().await {
+        let permit = limit.acquire().await;
         let state = state.clone();
         ConnectionLimit::serve(permit, async move {
             if let Err(e) = handle_plaintext_only_stream(state, stream_request).await {
@@ -466,13 +410,10 @@ where
 
 /// Handles a single rendezvous stream for [`Server::serve_tor_with_client`] — plaintext HTTP on
 /// virtual port 80 only, everything else rejected.
-async fn handle_plaintext_only_stream<S>(
-    state: Arc<Server<S>>,
+async fn handle_plaintext_only_stream(
+    state: Arc<Server>,
     stream_request: StreamRequest,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: Clone + Send + Sync + 'static,
-{
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let IncomingStreamRequest::Begin(begin) = stream_request.request() else {
         stream_request.shutdown_circuit()?;
         return Ok(());
@@ -493,16 +434,13 @@ where
 /// [`route_onion_request`]. Requires the `tls` feature (see [`OnionAction`]'s docs for why the
 /// non-TLS case never needs this — it reuses [`handle_plaintext_only_stream`] instead).
 #[cfg(feature = "tls")]
-async fn handle_onion_stream<S>(
-    state: Arc<Server<S>>,
+async fn handle_onion_stream(
+    state: Arc<Server>,
     stream_request: StreamRequest,
     tls_acceptor: Option<TlsAcceptor>,
     redirect_http: bool,
     onion_host: Arc<str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    S: Clone + Send + Sync + 'static,
-{
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let IncomingStreamRequest::Begin(begin) = stream_request.request() else {
         stream_request.shutdown_circuit()?;
         return Ok(());

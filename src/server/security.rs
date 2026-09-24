@@ -208,13 +208,12 @@ impl SecurityPolicy {
     /// say), which is not the same statement as [`allowed_hosts`](Self::allowed_hosts) with an
     /// empty list — and turning it into one would silently `421` every request the server ever
     /// receives.
-    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
-    pub(super) fn with_default_allowed_hosts(mut self, hosts: Arc<[String]>) -> Self {
+    #[cfg(feature = "cert-gen")]
+    pub(super) fn set_default_allowed_hosts(&mut self, hosts: Arc<[String]>) {
         if self.flags & ENFORCE_AUTHORITY == 0 && !hosts.is_empty() {
             self.allowed_hosts = hosts;
             self.flags |= ENFORCE_AUTHORITY;
         }
-        self
     }
 
     /// Whether plaintext listeners should speak HTTP/2 at all — see
@@ -552,10 +551,11 @@ mod tests {
 
     /// Deriving no hostnames (a certificate with only IP SANs, say) means "nothing was
     /// learned", not "deny everything" — the latter would `421` every request forever.
-    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+    #[cfg(feature = "cert-gen")]
     #[test]
     fn an_empty_derived_allow_list_leaves_authority_enforcement_off() {
-        let policy = SecurityPolicy::new().with_default_allowed_hosts(Arc::from([]));
+        let mut policy = SecurityPolicy::new();
+        policy.set_default_allowed_hosts(Arc::from([]));
         let mut request = Request::builder()
             .uri("/")
             .header("host", "anything.example")

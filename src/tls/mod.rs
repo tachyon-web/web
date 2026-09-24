@@ -93,11 +93,7 @@ pub(crate) fn certificate_dns_names(
 /// PEM parsing, on `rustls-pki-types`' own [`PemObject`] implementation.
 ///
 /// [`PemObject`]: rustls::pki_types::pem::PemObject
-// `unreachable_pub` (rustc) requires these items be `pub(crate)` rather than `pub`, while
-// `clippy::redundant_pub_crate` calls `pub(crate)` redundant inside a `pub(crate)` module.
-// The two lints directly contradict each other here; rustc's wins, and clippy's is silenced.
 #[cfg(feature = "tls")]
-#[allow(clippy::redundant_pub_crate)]
 pub(crate) mod pem {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};

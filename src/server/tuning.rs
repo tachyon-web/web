@@ -6,42 +6,26 @@
 //! transport — plain TCP, TLS, the port-80 redirect listener, Tor and I2P — reaches the
 //! *same* definition.
 //!
-//! Before this module existed, `conn.rs` (the Tor/I2P path) set only the keep-alives and
-//! otherwise ran on hyper's defaults, while the TCP and TLS listeners ran on the full tuning.
-//! That is the kind of drift a second copy produces: silent, and only in the settings that
-//! happen not to match. `conn::tests::serve_connection_applies_the_shared_http2_tuning` is
-//! what pins the Tor/I2P path to this module — note that every value below now *coincides*
-//! with hyper's own defaults except `enable_connect_protocol`, so that is the one the test
-//! can actually use to tell "went through here" from "got hyper's defaults".
+//! `conn::tests::serve_connection_applies_the_shared_http2_tuning` pins the Tor/I2P path to
+//! this module. The HTTP/2 window, frame and stream values below coincide with hyper's own
+//! defaults, so it tells "went through here" from "got hyper's defaults" by
+//! `enable_connect_protocol` instead.
 
-/// Applies the HTTP/1.1 connection tuning shared by every listener.
-///
-/// `writev` is opt-in per call site — forcing vectored writes over a TLS stream, which
-/// buffers its own records, is a different tradeoff than over a bare socket.
-///
-/// Gated on `http1` because every call site is, and `unused_macros` is denied.
+/// Applies the HTTP/1.1 connection tuning shared by every listener. `writev` stays per call
+/// site: TLS buffers its own records, so vectored writes are a different tradeoff there.
 #[cfg(feature = "http1")]
 macro_rules! tune_http1 {
     ($builder:expr) => {{
         let tuned = &mut $builder;
-        // Without a `Timer`, hyper silently drops `header_read_timeout` (only a `warn!`, no
-        // error) — leaving a peer that opens a stream and never finishes its request line
-        // able to hold this connection's slot in `max_connections` forever (Slowloris).
+        // Without a `Timer`, hyper silently ignores `header_read_timeout` (Slowloris).
         let _ = tuned
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout($crate::server::REQUEST_TIMEOUT)
             .keep_alive(true)
             .max_buf_size(8192)
-            // Already the default; pinned because inheriting it is a bet on that never
-            // changing, and it is a request-smuggling primitive if it does — desync is
-            // entirely a disagreement about where one request ends, so an origin that accepts
-            // a header a fronting proxy rejects is the whole bug class (RFC 9112 §2.2).
-            // `allow_multiple_spaces_in_request_line_delimiters` deserves the same treatment
-            // but `hyper_util`'s `auto` builder doesn't re-export it; it defaults strict.
+            // Pinned defaults: accepting headers a fronting proxy rejects is a request-smuggling
+            // primitive (RFC 9112 §2.2).
             .ignore_invalid_headers(false)
-            // The HTTP/1.1 counterpart to HPACK's per-field accounting: an explicit ceiling on
-            // header *count*, not just the total bytes `max_buf_size` bounds. Same value hyper
-            // defaults to — stated here so the limit is ours rather than inherited.
             .max_headers(100);
     }};
 }
@@ -54,34 +38,20 @@ macro_rules! tune_http2 {
         let tuned = &mut $builder;
         let _ = tuned
             .timer(hyper_util::rt::TokioTimer::new())
-            // Matched to the connection window below, so one stream can use the whole
-            // connection budget. The previous 64 KiB capped a *single* upload at
-            // window/RTT — roughly 655 KB/s at a 100ms RTT — while saving nothing: the
-            // connection window already bounds in-flight request data to 1 MiB per
-            // connection either way, so the stream window only decides whether one stream
-            // or sixteen have to share it.
+            // Equal windows: the connection window already bounds in-flight data, so a smaller
+            // stream window would only throttle single uploads.
             .initial_stream_window_size(1024 * 1024)
             .initial_connection_window_size(1024 * 1024)
             .max_frame_size(16384)
             .max_concurrent_streams(200)
-            // Bounds the decoded size of one header block. With RFC 9113 §6.5.2's mandatory
-            // 32-byte-per-field accounting (which h2 implements), this doubles as a cap of
-            // ~512 header fields — the per-entry allocation amplification that the HPACK half
-            // of CVE-2026-49975 turned into a memory bomb against servers that counted only
-            // total decoded bytes. Same value hyper defaults to, pinned rather than inherited.
+            // With RFC 9113 §6.5.2's 32-byte-per-field overhead this also caps a header block at
+            // ~512 fields (the HPACK half of CVE-2026-49975).
             .max_header_list_size(16 * 1024)
-            // Per *stream*, and the only thing bounding what a stalled reader can pin:
-            // CVE-2026-49975's second half is a peer that advertises a zero flow-control
-            // window and drips `WINDOW_UPDATE`s to keep the stream alive while the response
-            // sits in this buffer. hyper's ~400 KiB default times 200 streams is 80 MiB of
-            // attacker-pinned memory per connection; 64 KiB brings that to 12.8 MiB. Costs a
-            // draining client nothing — capacity is released as soon as bytes reach the
-            // connection, so this only caps read-ahead past a peer that has stopped reading.
+            // Per stream: bounds what a peer holding its window shut can pin (the other half of
+            // CVE-2026-49975) — 12.8 MiB per connection here vs. 80 MiB at hyper's default.
             .max_send_buf_size(64 * 1024)
-            // `keep_alive_timeout` alone does nothing — hyper only sends the pings (and
-            // enforces the timeout) once `keep_alive_interval` is also set. Without this, a
-            // dead or idle peer that completes the handshake and goes silent holds its
-            // connection permit forever.
+            // `keep_alive_timeout` does nothing without an interval; a silent peer would
+            // otherwise hold its connection permit forever.
             .keep_alive_interval($crate::server::REQUEST_TIMEOUT)
             .keep_alive_timeout($crate::server::REQUEST_TIMEOUT);
         // RFC 8441: let `ws::WebSocketUpgrade` accept WebSocket-over-HTTP/2 requests.

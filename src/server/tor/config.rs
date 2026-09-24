@@ -38,12 +38,9 @@ impl std::fmt::Debug for OnionConfig {
 impl OnionConfig {
     /// Creates a new configuration for a service published under `nickname`.
     ///
-    /// Defaults: TLS enabled with a self-signed certificate if the `cert-gen` feature is
-    /// enabled (virtual port 443, alongside plaintext on virtual port 80 — see
-    /// [`redirect_http`](Self::redirect_http)); plaintext-only otherwise (or always, if the
-    /// `tls` feature isn't enabled at all — see the [module docs](super)). No forced
-    /// HTTP→HTTPS redirect, and vanguards on — see [`vanguards`](Self::vanguards) to change it.
-    /// `nickname` is validated (as an [`HsNickname`]) when the service is actually launched.
+    /// Defaults: with `cert-gen`, HTTPS on virtual port 443 from a self-signed certificate
+    /// beside plaintext on port 80; otherwise plaintext only. No forced redirect, vanguards on.
+    /// `nickname` is validated (as an [`HsNickname`]) when the service is launched.
     #[must_use]
     pub fn new(nickname: impl Into<String>) -> Self {
         Self {
@@ -79,10 +76,7 @@ impl OnionConfig {
 
     /// Disables HTTPS entirely — only plaintext HTTP on virtual port 80 is served, matching
     /// [`Server::serve_tor`](crate::server::Server::serve_tor).
-    // Only `const`-eligible when neither `Custom`/`SelfSigned` variant exists (their non-trivial
-    // `Drop` glue — an `Arc<rustls::ServerConfig>` — can't run in a `const fn`), i.e. only
-    // without `tls`/`cert-gen` — not worth splitting this method's signature across features
-    // for.
+    // `const`-eligible only without `tls`, where `AnonTls` has no drop glue.
     #[cfg_attr(not(feature = "tls"), allow(clippy::missing_const_for_fn))]
     #[must_use]
     pub fn no_tls(mut self) -> Self {
@@ -90,9 +84,8 @@ impl OnionConfig {
         self
     }
 
-    /// Re-enables HTTPS with a freshly generated self-signed certificate (the default when this
-    /// feature is available), after a prior [`no_tls`](Self::no_tls) or
-    /// [`tls_config`](Self::tls_config) call. Requires the `cert-gen` feature.
+    /// Re-enables HTTPS with a freshly generated self-signed certificate (the default with
+    /// `cert-gen`), after a prior [`no_tls`](Self::no_tls) or `tls_config` call.
     #[cfg(feature = "cert-gen")]
     #[must_use]
     pub fn self_signed_tls(mut self) -> Self {
@@ -100,11 +93,9 @@ impl OnionConfig {
         self
     }
 
-    /// Enables HTTPS using a caller-supplied `rustls::ServerConfig` instead of the default
-    /// self-signed certificate — for example, the exact same config passed to
-    /// [`Server::serve_https_config`](crate::server::Server::serve_https_config) for the
-    /// clearnet listener, so a custom crypto provider, FIPS constraints, or a real cert chain
-    /// carry over unchanged. Requires the `tls` feature.
+    /// Enables HTTPS using a caller-supplied `rustls::ServerConfig` — e.g. the same one passed
+    /// to [`Server::serve_https_config`](crate::server::Server::serve_https_config) for the
+    /// clearnet listener. Requires the `tls` feature.
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn tls_config(mut self, config: rustls::ServerConfig) -> Self {
@@ -112,13 +103,8 @@ impl OnionConfig {
         self
     }
 
-    /// Controls what happens to plaintext HTTP (virtual port 80) requests when TLS is enabled.
-    ///
-    /// `false` (the default): plaintext and TLS are both served — a dual-stack onion service,
-    /// same as browsing a clearnet site over either `http://` or `https://`. `true`: port 80
-    /// instead issues a `308 Permanent Redirect` to the equivalent `https://` URL, forcing all
-    /// traffic onto TLS. Has no effect when TLS is disabled ([`no_tls`](Self::no_tls)) or the
-    /// `tls` feature isn't enabled.
+    /// With TLS enabled, `true` makes virtual port 80 `308`-redirect to the `https://` URL;
+    /// `false` (the default) serves both. No effect without TLS.
     #[must_use]
     pub const fn redirect_http(mut self, enable: bool) -> Self {
         self.redirect_http = enable;
@@ -133,12 +119,12 @@ impl OnionConfig {
         self
     }
 
-    /// Registers a callback invoked exactly once — with the published `.onion` address (no
+    /// Registers a callback invoked at most once — with the published `.onion` address (no
     /// scheme, e.g. `"abcd...xyz.onion"`) — as soon as the service is fully reachable, just
-    /// before requests start being served. This is the only way to observe the address
-    /// programmatically, since
+    /// before requests start being served. It is skipped if arti never reports an address.
+    /// This is the only way to observe the address programmatically, since
     /// [`serve_onion`](crate::server::Server::serve_onion) blocks for the lifetime of
-    /// the service; the address is also always logged via `tracing` at `info` level.
+    /// the service; with the `telemetry` feature the address is also logged at `info` level.
     #[must_use]
     pub fn on_ready(mut self, f: impl FnOnce(&str) + Send + 'static) -> Self {
         self.on_ready = Some(Box::new(f));
@@ -151,9 +137,8 @@ impl OnionConfig {
         &self.nickname
     }
 
-    /// Whether HTTPS is enabled (via the default self-signed cert or a custom
-    /// [`tls_config`](Self::tls_config)) — `false` after [`no_tls`](Self::no_tls), and always
-    /// `false` when the `tls` feature isn't enabled.
+    /// Whether HTTPS is enabled — `false` after [`no_tls`](Self::no_tls), and always without
+    /// the `tls` feature.
     #[must_use]
     pub const fn tls_enabled(&self) -> bool {
         !matches!(self.tls, AnonTls::None)

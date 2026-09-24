@@ -1,7 +1,7 @@
 //! Tests for shared server configuration and helpers.
 
 use super::*;
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 use crate::server::redirect::resolve_redirect_host;
 use axum::Router;
 
@@ -42,44 +42,6 @@ async fn idle_listeners_do_not_hoard_connection_permits() {
     assert!(String::from_utf8_lossy(&response).contains("200 OK"));
 }
 
-/// `Server::clone` is hand-written (the field list is feature-gated, so `derive` can't be
-/// used); this catches a field being dropped when a new one is added.
-#[test]
-#[allow(clippy::redundant_clone)]
-fn clone_preserves_every_field() {
-    #[cfg_attr(not(any(feature = "tls", feature = "http3")), allow(unused_mut))]
-    let mut server = Server::new(Router::new())
-        .max_body_size(4096)
-        .max_connections(7);
-    #[cfg(feature = "http3")]
-    {
-        server = server.max_h3_concurrent_streams(11);
-    }
-    #[cfg(feature = "tls")]
-    {
-        server = server
-            .tls_policy(crate::tls::TlsPolicy::new().tls13_only())
-            .max_tls_handshakes(13);
-    }
-    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
-    {
-        server = server.redirect_connection_share(23);
-    }
-
-    let cloned = server.clone();
-    assert_eq!(cloned.max_body_size, 4096);
-    assert_eq!(cloned.max_connections, 7);
-    #[cfg(feature = "http3")]
-    assert_eq!(cloned.max_h3_concurrent_streams, 11);
-    #[cfg(feature = "tls")]
-    {
-        assert!(cloned.tls_policy.is_some());
-        assert_eq!(cloned.max_tls_handshakes, 13);
-    }
-    #[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
-    assert_eq!(cloned.redirect_connection_share, 23);
-}
-
 #[test]
 fn authority_host_strips_the_port_and_keeps_ipv6_brackets() {
     use crate::server::security::authority_host;
@@ -104,57 +66,42 @@ fn authority_host_strips_the_port_and_keeps_ipv6_brackets() {
 ///
 /// `::1` is deliberately not first in the list: a mismatch would silently fall back to
 /// `example.com`, so only a real match can produce this result.
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[test]
 fn resolve_redirect_host_matches_a_bracketed_host_against_an_unbracketed_entry() {
     let allowed = vec!["example.com".to_string(), "::1".to_string()];
-    assert_eq!(
-        resolve_redirect_host("[::1]:8443", Some(&allowed)),
-        Some("::1")
-    );
+    assert_eq!(resolve_redirect_host("[::1]:8443", &allowed), Some("::1"));
 }
 
-#[cfg(feature = "tls")]
-#[test]
-fn resolve_redirect_host_rejects_requests_without_an_allow_list() {
-    assert_eq!(resolve_redirect_host("attacker.example:80", None), None);
-}
-
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[test]
 fn resolve_redirect_host_accepts_a_matching_allowed_host() {
     let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
     assert_eq!(
-        resolve_redirect_host("EXAMPLE.com:80", Some(&allowed)),
+        resolve_redirect_host("EXAMPLE.com:80", &allowed),
         Some("example.com"),
         "matching must be case-insensitive, and the request's own casing is dropped in \
          favor of the configured domain"
     );
     assert_eq!(
-        resolve_redirect_host("www.example.com", Some(&allowed)),
+        resolve_redirect_host("www.example.com", &allowed),
         Some("www.example.com")
     );
 }
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[test]
 fn wildcard_redirect_hosts_match_one_label_without_emitting_the_wildcard() {
     let allowed = vec!["*.example.com".to_string()];
     assert_eq!(
-        resolve_redirect_host("www.example.com:80", Some(&allowed)),
+        resolve_redirect_host("www.example.com:80", &allowed),
         Some("www.example.com")
     );
-    assert_eq!(
-        resolve_redirect_host("a.b.example.com:80", Some(&allowed)),
-        None
-    );
-    assert_eq!(
-        resolve_redirect_host("example.com:80", Some(&allowed)),
-        None
-    );
+    assert_eq!(resolve_redirect_host("a.b.example.com:80", &allowed), None);
+    assert_eq!(resolve_redirect_host("example.com:80", &allowed), None);
 }
 
-#[cfg(feature = "tls")]
+#[cfg(feature = "cert-gen")]
 #[test]
 fn resolve_redirect_host_falls_back_to_the_first_allowed_domain_on_a_mismatch() {
     // The open-redirect regression test: an inbound `Host` naming an arbitrary origin must
@@ -162,15 +109,12 @@ fn resolve_redirect_host_falls_back_to_the_first_allowed_domain_on_a_mismatch() 
     // is known (e.g. `serve_all_acme`'s `domains`).
     let allowed = vec!["example.com".to_string(), "www.example.com".to_string()];
     assert_eq!(
-        resolve_redirect_host("evil.example:80", Some(&allowed)),
+        resolve_redirect_host("evil.example:80", &allowed),
         Some("example.com")
     );
 
-    // An allow-list that is present but empty used to fall through `allowed.first()` straight
-    // back to the inbound `Host`, i.e. fail open into the very redirect this guards against.
-    // With no trustworthy host and nothing to fall back to, the only safe answer is no
-    // redirect at all — the caller turns this into a 400.
-    assert_eq!(resolve_redirect_host("evil.example:80", Some(&[])), None);
+    // With nothing to fall back to, the only safe answer is no redirect at all (a 400).
+    assert_eq!(resolve_redirect_host("evil.example:80", &[]), None);
 }
 
 #[test]
@@ -198,12 +142,16 @@ fn is_resource_exhaustion_matches_only_known_codes() {
 
 #[test]
 fn zero_concurrency_limits_are_clamped() {
-    let server = Server::new(Router::new()).max_connections(0);
-    assert_eq!(server.max_connections, 1);
+    let server = Server::new(Router::new())
+        .max_connections(0)
+        .max_active_requests(0);
+    assert_eq!(server.limits().max_connections, 1);
+    assert_eq!(server.limits().max_active_requests, 1);
     #[cfg(feature = "http3")]
     assert_eq!(
         server
             .max_h3_concurrent_streams(0)
+            .limits()
             .max_h3_concurrent_streams,
         1
     );
@@ -238,7 +186,7 @@ fn bind_rustls_and_https_server_builders() {
         .with_no_client_auth()
         .with_single_cert(vec![cert.cert_der], cert.key_der)
         .expect("build server config");
-    server_config.alpn_protocols = alpn_protocols(false);
+    server_config.alpn_protocols = tls_config::alpn_protocols(false);
     let config = RustlsConfig {
         server_config: Arc::new(server_config),
     };
@@ -257,19 +205,17 @@ fn bind_rustls_and_https_server_builders() {
     assert!(dbg.contains("serve_http3: true"));
 }
 
-/// A `rustls::ServerConfig` handed to `serve_https_config`/`start_https_with_config*`/
-/// `start_https_and_h3_with_config` must still pick up this server's `TlsPolicy`. Only the
-/// first of those applied it, so `deployment_profile(ExtremePrivacy)` left 0-RTT, TLS 1.3
-/// tickets and the session cache enabled on the other two.
-#[cfg(feature = "cert-gen")]
+/// A caller-supplied `rustls::ServerConfig` must pick up `ExtremePrivacy`'s resumption
+/// lockdown — including when a `TlsPolicy` is set *after* the profile. (`cnsa` always locks
+/// resumption down, so there is nothing to observe there.)
+#[cfg(all(feature = "cert-gen", not(feature = "cnsa")))]
 #[test]
 fn a_caller_supplied_tls_config_inherits_the_resumption_lockdown() {
     let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
         .expect("generate self-signed cert");
-    let config = tls_config_builder(&crate::tls::TlsPolicy::new())
-        .expect("build config prefix")
-        .with_single_cert(vec![cert.cert_der], cert.key_der)
-        .expect("single cert");
+    let config = crate::tls::TlsPolicy::new()
+        .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
+        .expect("build config");
     assert!(
         config.session_storage.can_cache(),
         "precondition: an unmodified config resumes, so the assertions below mean something"
@@ -277,6 +223,7 @@ fn a_caller_supplied_tls_config_inherits_the_resumption_lockdown() {
 
     let finalized = Server::new(Router::new())
         .deployment_profile(DeploymentProfile::ExtremePrivacy)
+        .tls_policy(crate::tls::TlsPolicy::new())
         .finalize_tls_config(config);
 
     assert_eq!(finalized.max_early_data_size, 0);
@@ -287,7 +234,7 @@ fn a_caller_supplied_tls_config_inherits_the_resumption_lockdown() {
 
 /// The redirect listener's slice of the pool: rounded down, clamped at 100%, and never zero —
 /// a zero budget would leave port 80 unable to accept, taking ACME renewal down with it.
-#[cfg(any(feature = "cert-gen", feature = "lets-encrypt"))]
+#[cfg(feature = "cert-gen")]
 #[test]
 fn the_redirect_share_resolves_to_a_usable_slice_of_the_pool() {
     let permits = |conns: usize, percent: u8| {
@@ -318,7 +265,9 @@ fn the_redirect_share_resolves_to_a_usable_slice_of_the_pool() {
     );
 
     assert_eq!(
-        Server::new(Router::new()).redirect_connection_share_percent(),
+        Server::new(Router::new())
+            .limits()
+            .redirect_connection_share,
         DEFAULT_REDIRECT_CONNECTION_SHARE
     );
 }

@@ -125,20 +125,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Excess requests are shed with 503 immediately rather than queued — a queue under
         // overload just converts a throughput problem into a latency and memory problem.
         .max_active_requests(256)
-        // Coherent preset applied last so it cannot be silently undone by a later builder call.
-        // `ExtremePrivacy` additionally disables TLS session resumption and tightens the
-        // anonymity-transport limits; `Hardened` is the default.
+        // `ExtremePrivacy` additionally disables TLS session resumption and lowers the
+        // connection, handler and HTTP/3 stream ceilings; `Hardened` is the default.
         .deployment_profile(DeploymentProfile::Hardened);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     println!("listening on http://{addr}");
+    let limits = server.limits();
     println!(
         "limits: {} connections, {} concurrent handlers, {} byte bodies",
-        server.connection_limit(),
-        server.active_request_limit(),
-        64 * 1024,
+        limits.max_connections, limits.max_active_requests, limits.max_body_size,
     );
 
     server.serve_http(listener).await?;

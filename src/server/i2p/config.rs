@@ -39,15 +39,9 @@ impl I2pConfig {
     /// seeds libi2pd's own default data directory name (its router keys/netDb cache, separate
     /// from this eepsite's own persistent destination keys — see [`data_dir`](Self::data_dir)).
     ///
-    /// Defaults: plaintext only (see the [module docs](super) for why TLS defaults off here,
-    /// unlike Tor's `OnionConfig`), no `on_ready` hook, destination keys stored under
-    /// `./.tachyon-i2p/<nickname>.keys` relative to the current working directory,
-    /// [`SigType::default`] for the identity's signature algorithm (only used the first time
-    /// this destination's keys are generated — see
-    /// [`signature_type`](Self::signature_type)), and no explicit
-    /// [`crypto_type`](Self::crypto_type) override — which means the destination publishes
-    /// libi2pd's own automatic hybrid encryption set rather than a single fixed algorithm; see
-    /// [`crypto_type`](Self::crypto_type)'s docs before assuming a specific one is always used.
+    /// Defaults: plaintext only, no `on_ready` hook, keys at `./.tachyon-i2p/<nickname>.keys`,
+    /// [`SigType::default`], and libi2pd's automatic encryption set (see
+    /// [`crypto_type`](Self::crypto_type)).
     #[must_use]
     pub fn new(nickname: impl Into<String>) -> Self {
         Self {
@@ -70,46 +64,29 @@ impl I2pConfig {
         self
     }
 
-    /// Overrides the signature algorithm used **the first time** this destination's keys are
-    /// generated — irrelevant if a keys file already exists at the resolved path (an existing
-    /// destination keeps whatever algorithm it was originally created with). See
-    /// [`tachyon_i2p::SigType`]'s own docs for what's available and why RSA isn't one of the
-    /// options; defaults to [`SigType::default`] (`Eddsa25519`, the I2P network's own default).
+    /// Overrides the signature algorithm used when this destination's keys are **first**
+    /// generated; an existing keys file keeps its own. Defaults to [`SigType::default`]
+    /// (`Eddsa25519`).
     #[must_use]
     pub const fn signature_type(mut self, sig: SigType) -> Self {
         self.sig_type = sig;
         self
     }
 
-    /// Overrides which encryption algorithm this destination's `LeaseSet2` advertises as usable —
-    /// convenience for the common single-algorithm case; see
-    /// [`encryption_types`](Self::encryption_types) (which this is built on) for the general
-    /// case, including "prefer post-quantum but still accept classical" multi-algorithm setups.
-    /// See [`tachyon_i2p::CryptoType`]'s own docs for the available options.
+    /// Advertises exactly one encryption algorithm — shorthand for
+    /// [`encryption_types`](Self::encryption_types) with one entry.
     ///
-    /// Not calling this at all (the default) publishes libi2pd's own automatic hybrid set —
-    /// `ElGamal` + ECIES-X25519, plus ML-KEM-768+X25519 if this was built against a
-    /// post-quantum-capable crypto backend — which is what most callers want. Call this to
-    /// *narrow* that down to exactly one algorithm instead, e.g. for a smaller `LeaseSet2` or to
-    /// deliberately exclude the post-quantum component.
+    /// By default libi2pd publishes `ElGamal` + ECIES-X25519, plus ML-KEM-768+X25519 on a
+    /// post-quantum-capable backend, which suits most callers.
     #[must_use]
     pub fn crypto_type(mut self, crypto: CryptoType) -> Self {
         self.encryption_types = vec![crypto];
         self
     }
 
-    /// Overrides which encryption algorithm(s) this destination's `LeaseSet2` advertises as usable
-    /// — unlike [`signature_type`](Self::signature_type), this applies on *every* run, not just
-    /// first-time key generation (the identity's own certificate is always plain `ElGamal`
-    /// regardless of this setting, per real I2P clients' requirements — this only controls the
-    /// destination's advertised encryption capability).
-    ///
-    /// Order matters: the **first** entry becomes the preferred type (published first in the
-    /// actual `LeaseSet2`, and what a peer that understands multiple of the listed types will
-    /// choose), with every later entry a fallback for peers that don't recognize it — publishing
-    /// something a given peer doesn't understand at all is harmless, not an error, since it
-    /// simply skips entries it can't use and tries the next one. This is how to express "prefer
-    /// post-quantum, but still reachable by peers that don't support it yet":
+    /// Overrides the encryption algorithms this destination's `LeaseSet2` advertises, on every
+    /// run. The first entry is preferred; peers skip entries they don't understand, so later
+    /// entries are fallbacks:
     ///
     /// ```rust,no_run
     /// use tachyon_web::server::i2p::I2pConfig;
@@ -129,10 +106,9 @@ impl I2pConfig {
         self
     }
 
-    /// Enables TLS using a caller-supplied `rustls::ServerConfig` instead of the plaintext
-    /// default — for example, the exact same config passed to
-    /// [`Server::serve_https_config`](crate::server::Server::serve_https_config) for a clearnet
-    /// listener. Requires the `tls` feature.
+    /// Enables TLS using a caller-supplied `rustls::ServerConfig` — e.g. the same one passed to
+    /// [`Server::serve_https_config`](crate::server::Server::serve_https_config). Requires the
+    /// `tls` feature.
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn tls_config(mut self, config: rustls::ServerConfig) -> Self {
@@ -149,11 +125,8 @@ impl I2pConfig {
         self
     }
 
-    /// Disables TLS (the default) after a prior [`tls_config`](Self::tls_config)/
-    /// [`self_signed_tls`](Self::self_signed_tls) call.
-    // Only `const`-eligible when neither `Custom`/`SelfSigned` variant exists (their
-    // non-trivial `Drop` glue can't run in a `const fn`), i.e. only without `tls`/`cert-gen` —
-    // not worth splitting this method's signature across features for.
+    /// Disables TLS (the default) after a prior `tls_config`/`self_signed_tls` call.
+    // `const`-eligible only without `tls`, where `AnonTls` has no drop glue.
     #[cfg_attr(not(feature = "tls"), allow(clippy::missing_const_for_fn))]
     #[must_use]
     pub fn no_tls(mut self) -> Self {
@@ -161,12 +134,11 @@ impl I2pConfig {
         self
     }
 
-    /// Registers a callback invoked exactly once — with the published `.b32.i2p` address (no
-    /// scheme, e.g. `"abcd...xyz.b32.i2p"`) — as soon as the destination is created, just before
-    /// requests start being served. This is the only way to observe the address
-    /// programmatically, since
+    /// Registers a callback invoked once with the `.b32.i2p` address (no scheme) as soon as the
+    /// destination is created — not necessarily reachable yet — before requests are served.
+    /// This is the only way to observe the address programmatically, since
     /// [`serve_i2p_config`](crate::server::Server::serve_i2p_config) blocks for the lifetime of
-    /// the service; the address is also always logged via `tracing` at `info` level.
+    /// the service; with the `telemetry` feature the address is also logged at `info` level.
     #[must_use]
     pub fn on_ready(mut self, f: impl FnOnce(&str) + Send + 'static) -> Self {
         self.on_ready = Some(Box::new(f));
@@ -179,8 +151,8 @@ impl I2pConfig {
         &self.nickname
     }
 
-    /// Whether TLS is enabled — `false` (the default) unless
-    /// [`tls_config`](Self::tls_config)/[`self_signed_tls`](Self::self_signed_tls) was called.
+    /// Whether TLS is enabled — `false` (the default) unless `tls_config`/`self_signed_tls`
+    /// was called.
     #[must_use]
     pub const fn tls_enabled(&self) -> bool {
         !matches!(self.tls, AnonTls::None)
@@ -195,19 +167,12 @@ impl I2pConfig {
     }
 }
 
-/// Rejects nicknames that could escape [`I2pConfig::data_dir`] when used to build the
-/// destination keys file path (`<data_dir>/<nickname>.keys`) — unlike the Tor `nickname`, which
-/// is validated as a typed `HsNickname` before any file I/O, I2P has no equivalent typed
-/// nickname to lean on, so it's checked directly here.
+/// Rejects nicknames that could escape [`I2pConfig::data_dir`] in `<data_dir>/<nickname>.keys`.
 pub(super) fn validate_nickname(
     nickname: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // The nickname becomes a single path component under `data_dir` (see
-    // `I2pConfig::keys_path`), so reject anything the OS could read as more than a plain file
-    // name. Both separators are checked by hand — `\\` is only one to Windows, but a nickname
-    // carrying it has no business on disk anywhere — and `components()` covers the rest by the
-    // running platform's own path rules: empty, `.`, `..`, and a Windows drive prefix like
-    // `C:`, which `Path::join` treats as absolute and would silently escape `data_dir`.
+    // Both separators by hand on every platform; `components()` covers empty, `.`, `..`, and
+    // Windows drive prefixes like `C:`, which `Path::join` treats as absolute.
     let mut components = std::path::Path::new(nickname).components();
     let is_plain_name = !nickname.contains(['/', '\\'])
         && matches!(components.next(), Some(std::path::Component::Normal(_)))

@@ -10,7 +10,7 @@ description = "A fast, Axum-compatible async web framework with native TLS, HTTP
 repository = "https://github.com/tachyon-web/web"
 documentation = "https://docs.rs/tachyon-web"
 keywords = ["web", "framework", "server", "routing"]
-categories = ["web-programming", "development-tools::debugging", "development-tools::profiling"]
+categories = ["web-programming::http-server", "network-programming"]
 
 [dependencies]
 # Async & Concurrency
@@ -86,14 +86,12 @@ ws = ["axum/ws"]
 form = ["axum/form"]
 query = ["axum/query"]
 multipart = ["axum/multipart"]
-
-# No-op axum-parity features.
-tokio = []
+tokio = [] # no-op, kept for axum parity
 tracing = ["axum/tracing"]
-telemetry = ["dep:tracing"]
 macros = ["axum/macros"]
 
 # Tachyon-only additions
+telemetry = ["dep:tracing"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]
 tls12-legacy = ["tls", "rustls?/tls12", "tokio-rustls?/tls12", "hyper-rustls?/tls12"]
 cert-gen = ["dep:rcgen", "dep:webpki", "tls"]
@@ -112,27 +110,6 @@ tor = [
     "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",
 ]
 i2p = ["dep:tachyon-i2p", "tachyon-i2p/aws-lc"]
-
-[workspace]
-members = [
-    ".",
-    "benches/optimistic",
-    "benches/api",
-]
-
-[workspace.dependencies]
-tokio = { version = "1" }
-serde = { version = "1" }
-serde_json = "1"
-axum = "0.8"
-axum-server = "0.8"
-actix-web = "4"
-actix-files = "0.7"
-rocket = "0.5"
-salvo = "0.96"
-tower-http = "0.7"
-rustls = { version = "0.23", default-features = false }
-rustls-pki-types = "1"
 
 [lints.rust]
 warnings = "deny"

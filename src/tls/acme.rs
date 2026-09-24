@@ -29,14 +29,9 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use webpki::EndEntityCert;
 
-/// Writes `contents` to `path` with owner-only read/write access (`0600` on Unix)
-/// from the moment the file is created — never leaving a window where the file
-/// briefly exists with the process's default (often world/group-readable) umask
-/// permissions, unlike a `write()` followed by a separate `chmod()`.
-///
-/// Used for private keys and ACME account credentials, both of which are
-/// sensitive enough that even a brief on-disk exposure to other local users is
-/// worth closing.
+/// Atomically replaces `path` with `contents`, owner-only (`0600` on Unix) from the moment
+/// the temporary file is created — no window where a key or credential is readable by others,
+/// and a symlink at `path` is replaced rather than followed.
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -197,7 +192,7 @@ pub(crate) fn get_challenge(token: &str) -> Option<String> {
 ///
 /// # Thread safety
 /// All accesses are protected by an inner [`RwLock`]; reads (handshakes) never block
-/// each other, and writes (certificate renewals) happen at most once every 24 hours.
+/// each other, and writes happen only when the renewal loop (re)loads a certificate.
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 #[derive(Debug)]
@@ -244,8 +239,7 @@ impl Default for AcmeResolver {
 }
 
 impl ResolvesServerCert for AcmeResolver {
-    /// Called by `rustls` on every TLS handshake. Acquires a read-lock and clones
-    /// the `Arc` — this is a very cheap operation (two atomic increments).
+    /// Called by `rustls` on every TLS handshake: a read-lock and an `Arc` clone.
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         self.current_key.read().ok()?.clone()
     }
@@ -268,7 +262,7 @@ pub enum AcmeError {
     OrderInvalid,
     /// No private key was found in the PEM data on disk.
     MissingPrivateKey,
-    /// Certificate parsing failed (x509-parser error).
+    /// Certificate parsing failed.
     CertParse(String),
     /// TLS signing key could not be loaded from the private key.
     TlsKeyLoad(String),
@@ -379,6 +373,13 @@ const CHECK_INTERVAL: Duration = Duration::from_hours(24);
 const BACKOFF_INITIAL: Duration = Duration::from_mins(5);
 /// Maximum backoff delay on repeated provisioning failures.
 const BACKOFF_MAX: Duration = Duration::from_hours(6);
+
+/// Whether a certificate expiring at `expiry` is inside the renewal window (or expired).
+fn renewal_due(expiry: SystemTime) -> bool {
+    expiry
+        .duration_since(SystemTime::now())
+        .map_or(true, |remaining| remaining <= RENEW_THRESHOLD)
+}
 
 impl AcmeManager {
     /// Creates an `AcmeManager`, creating `cache_dir` if it does not exist.
@@ -497,8 +498,8 @@ impl AcmeManager {
     /// Provisioning failures use exponential backoff instead of immediately retrying
     /// to respect Let's Encrypt rate limits.
     ///
-    /// # Panics
-    /// Never panics. All errors are logged via [`tracing`].
+    /// The task is detached and runs for the life of the runtime. Errors are logged only with
+    /// the `telemetry` feature; without it a failing order is silent.
     pub fn start(self: Arc<Self>) {
         drop(self.spawn_task());
     }
@@ -513,116 +514,91 @@ impl AcmeManager {
         })
     }
 
-    /// Internal background loop. Runs forever with controlled sleep intervals.
+    /// The renewal loop. The active certificate's expiry is tracked in memory, so a cache
+    /// write that failed neither triggers a daily re-order nor lets an older cached
+    /// certificate replace the one being served.
     async fn run_loop(&self) {
         if let Err(e) = self.validate_cache() {
             error!("[acme] certificate manager stopped: {e}");
             return;
         }
         let mut backoff = BACKOFF_INITIAL;
+        let mut active_expiry: Option<SystemTime> = None;
 
         loop {
-            let needs_provisioning = match self.load_and_activate_cached_cert() {
-                Ok(true) => {
-                    // Valid cert loaded and activated — reset backoff for next cycle.
-                    backoff = BACKOFF_INITIAL;
-                    false
-                }
-                Ok(false) => {
-                    info!("[acme] no valid cached certificate, provisioning a new one");
-                    true
-                }
-                Err(e) => {
+            if active_expiry.is_none_or(renewal_due) {
+                active_expiry = self.load_and_activate_cached_cert().unwrap_or_else(|e| {
                     warn!("[acme] error loading cached certificate: {e}");
-                    true
-                }
-            };
-
-            if needs_provisioning {
-                match self.provision_cert().await {
-                    Ok((certs, key)) => {
-                        info!("[acme] provisioned new certificate");
-                        match self.build_certified_key(certs, key) {
-                            Ok(certified_key) => {
-                                self.resolver.update_cert(certified_key);
-                                backoff = BACKOFF_INITIAL; // success — reset backoff
-                            }
-                            Err(e) => {
-                                error!(
-                                    "[acme] Failed to build TLS signing key: {e}. Retrying in {:?}",
-                                    backoff
-                                );
-                                tokio::time::sleep(backoff).await;
-                                backoff = backoff
-                                    .checked_mul(2)
-                                    .unwrap_or(BACKOFF_MAX)
-                                    .min(BACKOFF_MAX);
-                                continue;
-                            }
-                        }
-                    }
+                    None
+                });
+            }
+            if active_expiry.is_none_or(renewal_due) {
+                match self.provision_and_activate().await {
+                    Ok(expiry) => active_expiry = expiry,
                     Err(e) => {
-                        error!(
-                            "[acme] Certificate provisioning failed: {e}. Retrying in {:?}",
-                            backoff
-                        );
+                        error!("[acme] provisioning failed: {e}. Retrying in {backoff:?}");
                         tokio::time::sleep(backoff).await;
-                        // Exponential backoff, capped at BACKOFF_MAX.
                         backoff = backoff
                             .checked_mul(2)
                             .unwrap_or(BACKOFF_MAX)
                             .min(BACKOFF_MAX);
-                        continue; // Skip the CHECK_INTERVAL sleep on failure.
+                        continue;
                     }
                 }
             }
-
+            backoff = BACKOFF_INITIAL;
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
     }
 
-    /// Loads the cached certificate from disk and activates it in the resolver.
+    /// Orders a new certificate, activates it, and returns its expiry.
+    async fn provision_and_activate(&self) -> Result<Option<SystemTime>, AcmeError> {
+        info!("[acme] provisioning a new certificate");
+        let (certs, key) = self.provision_cert().await?;
+        let expiry = Self::check_cert_expiry(&certs);
+        self.resolver
+            .update_cert(self.build_certified_key(certs, key)?);
+        info!("[acme] provisioned new certificate");
+        Ok(expiry)
+    }
+
+    /// Loads the cached certificate from disk, activates it if it is still valid, and returns
+    /// its expiry.
     ///
-    /// Returns `Ok(true)` if a valid (non-expiring) certificate was loaded,
-    /// `Ok(false)` if the certificate is missing or about to expire,
-    /// or `Err` if reading/parsing failed with an unexpected error.
-    fn load_and_activate_cached_cert(&self) -> Result<bool, AcmeError> {
+    /// `Ok(None)` means nothing was activated: the certificate is missing, unparsable, covers
+    /// the wrong domains, or has expired. A certificate inside the renewal window is still
+    /// activated, so a failing renewal doesn't take the listener down with it.
+    fn load_and_activate_cached_cert(&self) -> Result<Option<SystemTime>, AcmeError> {
         let Ok((certs, key)) = self.load_cached_certs_and_key() else {
-            return Ok(false); // Cache miss — silently request provisioning.
+            return Ok(None);
         };
-
         let Some(expiry) = Self::check_cert_expiry(&certs) else {
-            return Ok(false);
+            return Ok(None);
         };
-
         if !Self::cert_matches_domains(&certs, &self.domains) {
             warn!(
                 "[acme] Cached certificate in {:?} does not cover the configured domain set {:?} \
                  — discarding stale cache and re-provisioning",
                 self.cache_dir, self.domains
             );
-            return Ok(false);
+            return Ok(None);
         }
+        let Some(time_remaining) = expiry
+            .duration_since(SystemTime::now())
+            .ok()
+            .filter(|remaining| !remaining.is_zero())
+        else {
+            warn!("[acme] Cached certificate has expired");
+            return Ok(None);
+        };
 
-        let now = SystemTime::now();
-        let time_remaining = expiry.duration_since(now).unwrap_or(Duration::ZERO);
-
-        if expiry <= now || time_remaining <= RENEW_THRESHOLD {
-            warn!(
-                "[acme] Cached certificate expires in {:.1} days — triggering renewal",
-                time_remaining.as_secs_f64() / 86400.0
-            );
-            return Ok(false);
-        }
-
+        self.resolver
+            .update_cert(self.build_certified_key(certs, key)?);
         info!(
             "[acme] Loaded cached certificate (expires in {:.1} days)",
             time_remaining.as_secs_f64() / 86400.0
         );
-
-        let certified_key = self.build_certified_key(certs, key)?;
-        self.resolver.update_cert(certified_key);
-        Ok(true)
+        Ok(Some(expiry))
     }
 
     /// Parses the `notAfter` field from the first DER certificate in the chain.
@@ -721,9 +697,7 @@ impl AcmeManager {
 
     /// Runs the full ACME HTTP-01 challenge flow and returns the new certificate chain + key.
     ///
-    /// A mutex guard prevents two concurrent `provision_cert` calls (both driven by
-    /// [`run_loop`][Self::run_loop] today) from racing each other — e.g. two overlapping
-    /// HTTP-01 challenge flows stomping on each other's [`ACTIVE_CHALLENGES`] entries.
+    /// Serialized, so two overlapping HTTP-01 flows can't stomp on each other's challenges.
     async fn provision_cert(
         &self,
     ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), AcmeError> {
@@ -814,17 +788,9 @@ impl AcmeManager {
             .await?)
     }
 
-    /// Builds an [`AccountBuilder`] whose HTTP client negotiates outbound TLS to the ACME
-    /// server through this manager's own `CryptoProvider` — the same one `self.provider`
-    /// loads signing keys through (see the `provider` field) — rather than
-    /// [`Account::builder`]'s bundled default, which resolves to rustls's process-wide
-    /// default provider and doesn't honor a `fips`/custom provider passed to
-    /// [`with_policy`](Self::with_policy).
-    ///
-    /// Roots come from `webpki-roots`, not the platform trust store: the only hosts this
-    /// client ever contacts are the two Let's Encrypt directory URLs in
-    /// [`provision_cert`](Self::provision_cert), so a pinned set is the tighter choice and
-    /// keeps a local trust-store edit from widening what this connection will accept.
+    /// An [`AccountBuilder`] whose client talks to the CA through this manager's own provider
+    /// (so `fips`/custom providers cover it) and the pinned `webpki-roots` set, since it only
+    /// ever contacts Let's Encrypt.
     fn account_builder(&self) -> Result<AccountBuilder, AcmeError> {
         let connector = HttpsConnectorBuilder::new()
             .with_provider_and_webpki_roots(self.provider.clone())
@@ -849,10 +815,6 @@ impl AcmeManager {
         let account_path = self.cache_dir.join(format!("account-{env_suffix}.json"));
 
         if account_path.exists() {
-            // Bounded and regular-file-checked like every other cache entry: a plain
-            // `fs::read` here would follow a symlink and had no size cap at all, so a stray
-            // link to a huge or unreadable-by-size file in the cache directory could be read
-            // in full before `serde_json` ever rejected it.
             match read_bounded_string(&account_path) {
                 Ok(creds_json) => match serde_json::from_str::<AccountCredentials>(&creds_json) {
                     Ok(creds) => {
@@ -905,11 +867,8 @@ impl AcmeManager {
 
 /// Adapts a `hyper_util` client to [`instant_acme::HttpClient`].
 ///
-/// `instant-acme` ships this same impl, but only behind its `hyper-rustls` feature — and that
-/// feature's dependency spec pins `hyper-rustls` to `native-tokio` + `tls12`, which Cargo's
-/// feature unification would then force onto this crate's own `hyper-rustls` as well. Writing
-/// the twenty lines here is what lets [`AcmeManager::account_builder`] keep a webpki-roots,
-/// TLS-1.3-capable client instead of inheriting that pin.
+/// `instant-acme` ships this impl behind its `hyper-rustls` feature, but that would unify
+/// `native-tokio` + `tls12` onto this crate's `hyper-rustls`.
 struct AcmeHttpClient<C>(HyperClient<C, BodyWrapper<bytes::Bytes>>);
 
 impl<C> instant_acme::HttpClient for AcmeHttpClient<C>
@@ -932,23 +891,11 @@ where
     }
 }
 
-/// Minimal, purpose-built DER reader for extracting a certificate's `notAfter`
-/// timestamp — nothing else.
+/// Minimal DER reader for a certificate's `notAfter` — nothing else.
 ///
-/// # Why this exists instead of a general X.509-parsing crate
-///
-/// The only certificate this module parses is one this process itself wrote to
-/// `<cache_dir>/domain.crt` after a successful ACME order (see
-/// [`AcmeManager::provision_cert`]) — never arbitrary network input. Reading one timestamp
-/// out of it doesn't justify a full X.509/ASN.1 stack (`x509-parser` and its
-/// `der-parser`/`asn1-rs`/`nom`/`oid-registry`/`num-bigint` tree), so this walks only the DER
-/// TLVs needed to reach `TBSCertificate.validity.notAfter`. SAN parsing, a more involved
-/// structure, is delegated to [`cert_matches_domains`] via `rustls-webpki`'s
-/// `EndEntityCert::valid_dns_names()`, already linked through `rustls`.
-///
-/// X.509 certificates are always definite-length DER (never indefinite-length BER),
-/// so this only needs to handle short- and long-form DER lengths — no indefinite
-/// length, no BER quirks.
+/// It only ever reads the certificate this process cached after an ACME order, so a full
+/// X.509 stack isn't worth the dependency tree. SANs go through `rustls-webpki` instead.
+/// X.509 is always definite-length DER, so only short- and long-form lengths are handled.
 mod min_der {
     use std::num::Wrapping;
     use std::time::{Duration, SystemTime};
@@ -1173,7 +1120,6 @@ mod min_der {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::unwrap_used)]
         use super::*;
 
         #[test]
@@ -1298,7 +1244,42 @@ mod cache_tests {
         assert!(
             acme.load_and_activate_cached_cert()
                 .expect("matching pair loads")
+                .is_some()
         );
         assert!(acme.resolver().has_certificate());
+    }
+
+    /// A cert inside the renewal window is still valid, so it must keep serving while renewal
+    /// runs — otherwise a restart during a CA outage leaves every handshake failing for days.
+    #[test]
+    fn a_cert_due_for_renewal_is_served_until_replaced() {
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let domains = vec!["example.com".to_string()];
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate key pair");
+        let mut params = rcgen::CertificateParams::new(domains.clone()).expect("cert params");
+        params.not_after = std::time::SystemTime::now()
+            .checked_add(std::time::Duration::from_hours(10 * 24))
+            .expect("expiry fits")
+            .into();
+        let cert = params.self_signed(&key_pair).expect("self-sign");
+        write_private_file(&dir.path().join("domain.crt"), cert.pem().as_bytes())
+            .expect("write cert");
+        write_private_file(
+            &dir.path().join("domain.key"),
+            key_pair.serialize_pem().as_bytes(),
+        )
+        .expect("write key");
+
+        let acme = AcmeManager::new(dir.path(), domains, "admin@example.com".into(), true);
+        let expiry = acme
+            .load_and_activate_cached_cert()
+            .expect("cached pair loads")
+            .expect("a still-valid cert is activated");
+        assert!(acme.resolver().has_certificate());
+        assert!(
+            super::renewal_due(expiry),
+            "a cert inside the renewal window must still trigger renewal"
+        );
     }
 }

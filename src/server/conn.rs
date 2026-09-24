@@ -118,14 +118,8 @@ mod tests {
             .expect("serve_connection ok");
     }
 
-    /// `serve_connection` is the path Tor and I2P take. It used to build its own hyper
-    /// builders and set only the keep-alives, so those two transports ran on hyper's default
-    /// HTTP/2 settings while plain TCP and TLS ran on `tuning::tune_http2!`.
-    ///
-    /// Every window/frame/stream value the tuning pins now coincides with hyper's own
-    /// defaults, so none of them can tell the two apart. `enable_connect_protocol` can:
-    /// hyper leaves it off, `tune_http2!` turns it on. That assertion is the real guard here;
-    /// the rest are ordinary value checks that would catch a typo'd constant.
+    /// The Tor/I2P path must use `tune_http2!`. Its window/frame/stream values match hyper's
+    /// defaults, so `enable_connect_protocol` (off in hyper) is what tells the two apart.
     #[cfg(all(feature = "http2", feature = "ws"))]
     #[tokio::test]
     async fn serve_connection_applies_the_shared_http2_tuning() {

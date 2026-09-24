@@ -1,10 +1,5 @@
-//! Fluent multi-transport server builder — see the [module docs](super#publishing-over-more-than-one-transport-at-once).
-//!
-//! [`MultiServer`] is the preferred way to publish one [`Router`](axum::Router) over
-//! more than one transport at once. It owns exactly the boilerplate a hand-rolled
-//! `tokio::spawn` + `tokio::select!` around individual `serve_*` calls would otherwise require:
-//! one task per configured transport, all driven concurrently, with the whole group torn down
-//! as soon as any one of them finishes (success or error).
+//! Fluent multi-transport server builder: one task per transport, the whole group torn down
+//! as soon as any one of them finishes.
 
 use super::Server;
 use tokio::net::TcpListener;
@@ -12,11 +7,7 @@ use tokio::net::TcpListener;
 /// One transport this [`MultiServer`] will drive, alongside its configuration.
 enum Transport {
     Http(TcpListener),
-    // Boxed because `rustls::ServerConfig` is ~280 bytes against the ~40 of the next-largest
-    // variant, and `Vec<Transport>` pays the largest variant's size for *every* element — so
-    // an unboxed config made a plain HTTP-only `MultiServer` seven times bigger than it needs
-    // to be. Boxing costs one allocation per HTTPS transport, of which there are a handful at
-    // startup and never any afterwards.
+    // Boxed: `ServerConfig` is ~7x the next-largest variant.
     #[cfg(feature = "tls")]
     Https(TcpListener, Box<rustls::ServerConfig>),
     #[cfg(feature = "http3")]
@@ -30,18 +21,17 @@ enum Transport {
 /// Builds a group of transports to drive concurrently from one [`Server`] — see the
 /// [module docs](crate::server#publishing-over-more-than-one-transport-at-once).
 ///
-/// Constructed via [`Server::with_http`]/[`Server::with_https`]/[`Server::with_onion`]/
-/// [`Server::with_i2p`]/[`Server::with_h3`], chained with more of the same to add further
-/// transports, and finished with [`serve`](Self::serve).
+/// Started by any `Server::with_*` method (e.g. [`Server::with_http`]), chained with more
+/// `with_*` calls, and finished with [`serve`](Self::serve).
 ///
 /// *Tachyon extension: no `axum` equivalent.*
 #[must_use = "MultiServer does nothing until `.serve()` is called and awaited"]
-pub struct MultiServer<S> {
-    server: Server<S>,
+pub struct MultiServer {
+    server: Server,
     transports: Vec<Transport>,
 }
 
-impl<S> std::fmt::Debug for MultiServer<S> {
+impl std::fmt::Debug for MultiServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MultiServer")
             .field("transports", &self.transports.len())
@@ -49,11 +39,8 @@ impl<S> std::fmt::Debug for MultiServer<S> {
     }
 }
 
-impl<S> MultiServer<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    pub(super) const fn new(server: Server<S>) -> Self {
+impl MultiServer {
+    pub(super) const fn new(server: Server) -> Self {
         Self {
             server,
             transports: Vec::new(),
@@ -104,10 +91,8 @@ where
     /// **first** one finishes — success or error — at which point every other transport task is
     /// aborted and that outcome is returned.
     ///
-    /// Each transport is driven from an independent clone of this `MultiServer`'s underlying
-    /// [`Server`] (cheap — [`Server`]'s settings are `Arc`/`Copy` under the hood), so
-    /// [`Server::max_body_size`]/[`Server::max_connections`]/[`Server::tls_policy`] apply
-    /// identically across all of them.
+    /// Every transport runs on a clone of the same [`Server`], so its limits and policies are
+    /// shared across all of them.
     ///
     /// # Errors
     ///

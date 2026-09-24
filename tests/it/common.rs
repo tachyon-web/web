@@ -48,7 +48,7 @@ impl TestServer {
     /// `.max_body_size(..)`).
     pub(crate) async fn spawn_with(
         router: Router<()>,
-        configure: impl FnOnce(Server<()>) -> Server<()>,
+        configure: impl FnOnce(Server) -> Server,
     ) -> Self {
         Self::spawn_inner(router, configure, Client::new()).await
     }
@@ -64,7 +64,7 @@ impl TestServer {
 
     async fn spawn_inner(
         router: Router<()>,
-        configure: impl FnOnce(Server<()>) -> Server<()>,
+        configure: impl FnOnce(Server) -> Server,
         client: Client,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

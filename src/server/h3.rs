@@ -25,10 +25,8 @@ pub(super) fn build_quic_server(
         .with_bidirectional_remote_data_window(1_048_576)?
         // 100ms is a safe, standard default initial RTT for public internet clients.
         .with_initial_round_trip_time(Duration::from_millis(100))?
-        // Matches `Server::max_h3_concurrent_streams`, the per-connection budget
-        // `handle_h3_connection` actually enforces. Advertising a larger credit than that
-        // only invites the peer to open streams we then reset on arrival; keeping the two
-        // equal lets QUIC's own flow control apply the backpressure instead.
+        // Equal to the per-connection budget `handle_h3_connection` enforces, so QUIC flow
+        // control applies the backpressure instead of us resetting streams on arrival.
         .with_max_open_remote_bidirectional_streams(
             u64::try_from(max_concurrent_streams).unwrap_or(u64::MAX),
         )?
@@ -54,18 +52,15 @@ pub(super) fn build_quic_server(
 ///
 /// Only callable once TCP is bound, so a failed bind can't leave a detached QUIC endpoint
 /// behind, and UDP lands on the port TCP actually got (which differs for port `0`).
-pub(super) fn spawn_h3_beside<S>(
-    server: &Server<S>,
+pub(super) fn spawn_h3_beside(
+    server: &Server,
     config: Arc<rustls::ServerConfig>,
     listener: &tokio::net::TcpListener,
-) -> Result<crate::server::BackgroundTask, std::io::Error>
-where
-    S: Clone + Send + Sync + 'static,
-{
+) -> Result<crate::server::BackgroundTask, std::io::Error> {
     let quic_server = build_quic_server(
         config,
         listener.local_addr()?,
-        server.max_h3_concurrent_streams,
+        server.limits.max_h3_concurrent_streams,
     )
     .map_err(std::io::Error::other)?;
     let server = server.clone();
@@ -95,10 +90,8 @@ async fn write_within<T, E>(
 
 /// Sends a bodyless response and finishes the stream.
 ///
-/// Bounded like every write on the success path. These are the cheapest responses for a peer
-/// to provoke — a `content-length` past `max_body_size` needs no body at all — so unbounded
-/// awaits here let a peer that holds its flow-control window shut pin one stream permit per
-/// rejected request, for as long as it liked.
+/// Bounded like every other write: these are the cheapest responses for a peer to provoke, and
+/// a peer holding its flow-control window shut would otherwise pin a stream permit each.
 async fn send_head_only(
     stream: &mut tachyon_quic::h3::server::RequestStream<tachyon_quic::BidiStream<Bytes>, Bytes>,
     response: Response<()>,
@@ -107,26 +100,18 @@ async fn send_head_only(
     let _ = write_within(stream.finish()).await;
 }
 
-impl<S> Server<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    /// Serve HTTP/3 over QUIC using the given s2n-quic server.
+impl Server {
+    /// Serve HTTP/3 over QUIC using the given s2n-quic server, until it stops accepting.
     ///
-    /// Under the `fips` feature, this only checks that the crypto *backend* is in FIPS mode
-    /// (via `enforce_fips_compliance`) — unlike
-    /// [`serve_https`](Server::serve_https), it can't additionally verify that
-    /// `quic_server`'s own TLS config negotiates FIPS-approved algorithms: `s2n_quic::Server`
-    /// doesn't expose the `rustls::ServerConfig` it was built with. Build `quic_server` from a
-    /// config produced by this crate's [`TlsPolicy`](crate::tls::TlsPolicy) (as
-    /// [`Server::start_https_and_h3_with_config`](Server::start_https_and_h3_with_config)
-    /// does) if you need that guarantee here too.
+    /// Under `fips` this can only check the crypto backend, not `quic_server`'s TLS config:
+    /// `s2n_quic::Server` doesn't expose it. Prefer
+    /// [`start_https_and_h3_with_config`](Server::start_https_and_h3_with_config), which checks
+    /// the config before building the endpoint.
     ///
     /// # Errors
     ///
-    /// Returns an error if FIPS compliance enforcement fails. The accept loop
-    /// itself never surfaces per-connection errors as an `Err`; it just stops
-    /// when `quic_server.accept()` returns `None`.
+    /// Returns an error only if FIPS compliance enforcement fails. Per-connection errors are
+    /// logged and never end the accept loop.
     pub async fn serve_h3(
         self,
         mut quic_server: tachyon_quic::s2n_quic::Server,
@@ -142,13 +127,8 @@ where
         let state = Arc::new(self);
         let limit = state.connection_limit.clone();
 
-        loop {
-            let Some(conn) = quic_server.accept().await else {
-                break;
-            };
-            let Some(permit) = limit.acquire().await else {
-                break;
-            };
+        while let Some(conn) = quic_server.accept().await {
+            let permit = limit.acquire().await;
             let state = state.clone();
             ConnectionLimit::serve(permit, async move {
                 state.handle_h3_connection(conn).await;
@@ -162,11 +142,8 @@ where
             return;
         };
 
-        // Bounded for the same reason every other transport bounds its handshake: this runs
-        // while holding one of `max_connections` permits, and a peer that completes the QUIC
-        // handshake but never opens its HTTP/3 control stream — keeping the connection alive
-        // past QUIC's idle timeout with PINGs — would otherwise pin that permit indefinitely
-        // without ever speaking HTTP.
+        // Bounded because this holds a connection permit: a peer could otherwise complete the
+        // QUIC handshake, keep it alive with PINGs, and never open its HTTP/3 control stream.
         let setup = tokio::time::timeout(
             REQUEST_TIMEOUT,
             tachyon_quic::h3::server::Connection::new(tachyon_quic::Connection::new(conn)),
@@ -176,19 +153,14 @@ where
             return;
         };
 
-        // Limit concurrent streams per connection for DoS protection — see
-        // `Server::max_h3_concurrent_streams`.
-        let stream_semaphore =
-            Arc::new(tokio::sync::Semaphore::new(self.max_h3_concurrent_streams));
+        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            self.limits.max_h3_concurrent_streams,
+        ));
 
         loop {
-            // `accept()` drives the whole connection (control stream, QPACK, GOAWAY), not
-            // just stream acceptance — mirroring the h2 driver's `connection.accept()`, it
-            // must be awaited unconditionally on every iteration rather than gated behind the
-            // stream semaphore. Acquiring the permit *first* (the previous ordering) meant a
-            // peer that opened `max_h3_concurrent_streams` streams and went quiet stalled
-            // this connection's control-plane processing for as long as those streams stayed
-            // open, since `accept()` would never be called again to service it.
+            // `accept()` also drives the control stream, QPACK and GOAWAY, so it must run every
+            // iteration rather than wait behind the stream semaphore — otherwise a peer holding
+            // every stream open would stall the connection's control plane.
             match h3_server.accept().await {
                 Ok(Some(resolver)) => {
                     if let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() {
@@ -198,10 +170,8 @@ where
                             drop(stream_permit);
                         });
                     } else {
-                        // At the connection's in-flight limit — matches h2's
-                        // `REFUSED_STREAM` response: drop the resolver without resolving it,
-                        // which cancels the stream, rather than processing it and starving
-                        // every other stream sharing this budget.
+                        // At the in-flight limit: dropping the resolver cancels the stream, like
+                        // h2's `REFUSED_STREAM`.
                         crate::telemetry_debug!(
                             "[h3] refusing stream: connection is at its in-flight limit"
                         );
@@ -233,14 +203,14 @@ where
         let content_length = crate::server::security::content_length(&parts.headers)
             .map_err(|()| StatusCode::BAD_REQUEST)?;
 
-        if content_length
-            .is_some_and(|len| usize::try_from(len).map_or(true, |len| len > self.max_body_size))
-        {
+        if content_length.is_some_and(|len| {
+            usize::try_from(len).map_or(true, |len| len > self.limits.max_body_size)
+        }) {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
 
         let content_length = content_length.and_then(|len| usize::try_from(len).ok());
-        let limit = content_length.unwrap_or(self.max_body_size);
+        let limit = content_length.unwrap_or(self.limits.max_body_size);
         let over_limit = if content_length.is_some() {
             StatusCode::BAD_REQUEST
         } else {
@@ -351,15 +321,12 @@ where
 
 #[cfg(all(test, feature = "cert-gen"))]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-
     use crate::server::Server;
     use axum::{
         Router,
         routing::{get, post},
     };
     use bytes::{Buf, Bytes};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::sync::Arc;
 
     async fn hello() -> &'static str {
@@ -370,32 +337,18 @@ mod tests {
         body.to_vec()
     }
 
-    /// Builds a self-signed `rustls::ServerConfig` (ALPN "h3") from PEM cert/key strings.
-    /// Hand-rolled via `crate::tls::pem` (mirroring `Server::start_all_inner`/`RustlsConfig::
-    /// from_pem` in `server/mod.rs`) rather than reusing `TlsPolicy::server_config_from_pem`, so
-    /// this test module only needs `cert-gen` — not also `tor`/`i2p` — to compile.
-    fn build_server_config(cert_pem: &str, key_pem: &str) -> rustls::ServerConfig {
-        let cert_chain: Vec<CertificateDer<'static>> = crate::tls::pem::certs(cert_pem.as_bytes());
-        let key_der: PrivateKeyDer<'static> =
-            crate::tls::pem::private_key(key_pem.as_bytes()).expect("parse private key");
-
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key_der)
-            .expect("build rustls ServerConfig");
-        config.alpn_protocols = vec![b"h3".to_vec()];
-        config
-    }
-
     /// Starts a real `Server::serve_h3` on loopback (OS-assigned port) serving `app`. Returns the
     /// bound address and the self-signed cert's PEM (for the client to trust).
     fn start_h3_server(
         app: Router<()>,
-        configure: impl FnOnce(Server<()>) -> Server<()>,
+        configure: impl FnOnce(Server) -> Server,
     ) -> (std::net::SocketAddr, String) {
         let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
             .expect("generate self-signed cert");
-        let config = build_server_config(&cert.cert_pem, &cert.key_pem);
+        let mut config = crate::tls::TlsPolicy::new()
+            .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
+            .expect("build server config");
+        config.alpn_protocols = vec![b"h3".to_vec()];
 
         let quic_tls =
             tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(Arc::new(config));
