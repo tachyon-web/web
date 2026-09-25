@@ -27,17 +27,28 @@
 //! # Both fingerprints, and which endpoints serve them.
 //! curl -ksS https://localhost:8443/certs
 //! ```
+//!
+//! A `cnsa` build has neither P-256 nor ML-DSA-65, so there this example only says so.
 
-use std::fmt::Write as _;
+#[cfg(not(feature = "cnsa"))]
+use {
+    axum::{Router, routing::get},
+    std::fmt::Write as _,
+    tachyon_web::tls::{KeyAlgorithm, Tls, TlsPolicy},
+    tachyon_web::{Limits, Server, ServerInfo},
+};
 
-use axum::{Router, routing::get};
-use tachyon_web::tls::{KeyAlgorithm, Tls, TlsPolicy};
-use tachyon_web::{Limits, Server, ServerInfo};
+#[cfg(feature = "cnsa")]
+fn main() {
+    eprintln!("self_signed_https uses P-256 and ML-DSA-65, which a `cnsa` build does not have");
+}
 
+#[cfg(not(feature = "cnsa"))]
 async fn index() -> &'static str {
     "hello over TLS\n"
 }
 
+#[cfg(not(feature = "cnsa"))]
 async fn certs(info: ServerInfo) -> String {
     let mut out = String::new();
     for cert in info.certificates() {
@@ -52,8 +63,11 @@ async fn certs(info: ServerInfo) -> String {
     out
 }
 
+#[cfg(not(feature = "cnsa"))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt::init();
+
     let app = Router::new()
         .route("/", get(index))
         .route("/certs", get(certs));
@@ -76,7 +90,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .limits(Limits::default().max_tls_handshakes(256))
         .https("127.0.0.1:8443", tls)
         .redirect("127.0.0.1:8080")
-        .on_ready(|endpoint| println!("serving {}", endpoint.url()))
         .serve()
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

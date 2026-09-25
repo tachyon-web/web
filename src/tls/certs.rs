@@ -170,18 +170,14 @@ impl ResolvesServerCert for CertStore {
 
 /// Rejects a [`Tls`] that cannot work, before anything is bound.
 pub(crate) fn validate(tls: &Tls, anonymous: bool) -> Result<(), Error> {
-    if tls.rustls.is_some() {
-        if !tls.sources.is_empty() {
-            return Err(Error::config(
-                "Tls::rustls cannot be combined with other certificate sources",
-            ));
-        }
-        if cfg!(feature = "cnsa") {
-            return Err(Error::config(
-                "CNSA mode refuses a caller-built rustls config: its identity cannot be verified",
-            ));
-        }
-        return Ok(());
+    if let Some(name) = tls
+        .domains
+        .iter()
+        .find(|name| !crate::server::security::valid_host_entry(name))
+    {
+        return Err(Error::config(format!(
+            "Tls::domains: {name:?} is not a DNS name, `*.` wildcard or IP literal"
+        )));
     }
     if tls.sources.is_empty() {
         return Err(Error::config("a Tls set needs at least one certificate"));
@@ -196,37 +192,30 @@ pub(crate) fn validate(tls: &Tls, anonymous: bool) -> Result<(), Error> {
             "self-signed and ACME certificates need names: call Tls::domains",
         ));
     }
-    for source in &tls.sources {
-        match source {
-            Source::SelfSigned(alg) if cfg!(feature = "cnsa") && *alg != KeyAlgorithm::MlDsa87 => {
-                return Err(Error::config(format!(
-                    "CNSA mode only permits ML-DSA-87 certificates, not {alg:?}"
-                )));
-            }
-            #[cfg(feature = "acme")]
-            Source::Acme(acme) => {
-                if anonymous {
-                    return Err(Error::config(
-                        "ACME cannot issue for .onion or .b32.i2p addresses",
-                    ));
-                }
-                if tls.store.is_none() {
-                    return Err(Error::config(
-                        "ACME needs a certificate store: call Tls::store",
-                    ));
-                }
-                if let Some(name) = tls
-                    .domains
-                    .iter()
-                    .find(|name| name.starts_with("*.") || name.parse::<std::net::IpAddr>().is_ok())
-                {
-                    return Err(Error::config(format!(
-                        "ACME orders DNS names over HTTP-01, which cannot validate {name:?}"
-                    )));
-                }
-                acme.validate()?;
-            }
-            _ => {}
+    #[cfg(feature = "acme")]
+    if tls
+        .sources
+        .iter()
+        .any(|source| matches!(source, Source::Acme(_)))
+    {
+        if anonymous {
+            return Err(Error::config(
+                "ACME cannot issue for .onion or .b32.i2p addresses",
+            ));
+        }
+        if tls.store.is_none() {
+            return Err(Error::config(
+                "ACME needs a certificate store: call Tls::store",
+            ));
+        }
+        if let Some(name) = tls
+            .domains
+            .iter()
+            .find(|name| name.starts_with("*.") || name.parse::<std::net::IpAddr>().is_ok())
+        {
+            return Err(Error::config(format!(
+                "ACME orders DNS names over HTTP-01, which cannot validate {name:?}"
+            )));
         }
     }
     Ok(())
@@ -235,7 +224,7 @@ pub(crate) fn validate(tls: &Tls, anonymous: bool) -> Result<(), Error> {
 /// The TLS side of one endpoint, ready to serve.
 pub(crate) struct Built {
     pub(crate) config: Arc<rustls::ServerConfig>,
-    pub(crate) store: Option<Arc<CertStore>>,
+    pub(crate) store: Arc<CertStore>,
     #[cfg(feature = "acme")]
     pub(crate) acme: Vec<super::acme::Manager>,
 }
@@ -249,20 +238,6 @@ pub(crate) fn build(
     url: &str,
     alpn: Vec<Vec<u8>>,
 ) -> Result<Built, Error> {
-    if let Some(config) = &tls.rustls {
-        let mut config = (**config).clone();
-        config.alpn_protocols = alpn;
-        let config = policy.finalize(config);
-        #[cfg(feature = "fips")]
-        super::policy::assert_fips_server_config(&config)?;
-        return Ok(Built {
-            config,
-            store: None,
-            #[cfg(feature = "acme")]
-            acme: Vec::new(),
-        });
-    }
-
     let store = tls.store.as_deref().map(Store::open).transpose()?;
     let endpoints = vec![url.to_string()];
     let mut slots = Vec::with_capacity(tls.sources.len());
@@ -313,12 +288,9 @@ pub(crate) fn build(
     let store = Arc::new(CertStore { slots });
     let mut config = policy.config_builder()?.with_cert_resolver(store.clone());
     config.alpn_protocols = alpn;
-    let config = policy.finalize(config);
-    #[cfg(feature = "fips")]
-    super::policy::assert_fips_server_config(&config)?;
     Ok(Built {
-        config,
-        store: Some(store),
+        config: policy.finalize(config),
+        store,
         #[cfg(feature = "acme")]
         acme,
     })
@@ -475,11 +447,10 @@ mod tests {
 
     /// Every algorithm generates, loads through the policy's provider, and reports itself —
     /// with fingerprints that match the certificate actually served.
-    #[cfg(not(feature = "cnsa"))]
     #[test]
     fn every_key_algorithm_generates_a_servable_certificate() {
         let policy = TlsPolicy::new();
-        for alg in KeyAlgorithm::ALL {
+        for &alg in KeyAlgorithm::ALL {
             let names = random_names();
             let (key, info) = self_signed(alg, &names, None, &policy, &endpoint())
                 .unwrap_or_else(|e| panic!("{alg:?}: {e}"));
@@ -532,25 +503,49 @@ mod tests {
         ));
     }
 
-    /// CNSA 2.0 permits one signature algorithm; anything else is refused before binding.
-    #[cfg(feature = "cnsa")]
+    /// A domain that could never match a request or name a certificate is refused.
     #[test]
-    fn cnsa_refuses_every_algorithm_but_ml_dsa_87() {
-        let tls = |alg| Tls::new().domains(random_names()).self_signed(alg);
-        for alg in KeyAlgorithm::ALL {
-            assert_eq!(
-                validate(&tls(alg), false).is_ok(),
-                alg == KeyAlgorithm::MlDsa87,
-                "{alg:?}"
-            );
+    fn malformed_domains_are_refused() {
+        let tls = |name: String| {
+            Tls::new()
+                .domains([name])
+                .self_signed(KeyAlgorithm::MlDsa87)
+        };
+        let host = random_names().remove(0);
+        for good in [host.clone(), format!("*.{host}"), "::1".to_string()] {
+            assert!(validate(&tls(good.clone()), false).is_ok(), "{good}");
+        }
+        for bad in [
+            format!("https://{host}"),
+            format!("{host}:443"),
+            format!("{host}/"),
+        ] {
+            assert!(validate(&tls(bad.clone()), false).is_err(), "{bad}");
         }
     }
 
-    /// Provided certificates load from memory or files, report their own SANs and issuer, and a
-    /// caller-built rustls config bypasses the set entirely — but never mixes with it.
+    /// A provided certificate is the one place CNSA can't be settled at compile time: its
+    /// algorithm is data, so anything but ML-DSA-87 is refused when it loads.
+    #[cfg(feature = "cnsa")]
+    #[test]
+    fn cnsa_refuses_a_provided_certificate_that_is_not_ml_dsa_87() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("key");
+        let cert = rcgen::CertificateParams::new(random_names())
+            .and_then(|params| params.self_signed(&key))
+            .expect("cert");
+        let loaded = provided(
+            cert.pem().as_bytes(),
+            key.serialize_pem().as_bytes(),
+            &TlsPolicy::new(),
+            &endpoint(),
+        );
+        assert!(matches!(loaded, Err(Error::Certificate(_))));
+    }
+
+    /// Provided certificates load from memory or files and report their own SANs and issuer.
     #[cfg(not(feature = "cnsa"))]
     #[test]
-    fn provided_certificates_and_the_rustls_escape_hatch() {
+    fn provided_certificates_report_their_own_names() {
         let names = random_names();
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("key");
         let cert = rcgen::CertificateParams::new(names.clone())
@@ -566,35 +561,13 @@ mod tests {
             .pem_files(&cert_file, &key_file);
         validate(&tls, false).expect("provided certificates need no domains");
         let built = build(&tls, &TlsPolicy::new(), &[], "https://x", Vec::new()).expect("build");
-        let infos = built.store.expect("store").infos();
+        let infos = built.store.infos();
         assert_eq!(infos.len(), 2);
         for info in infos {
             assert_eq!(info.issuer, Issuer::Provided);
             assert_eq!(info.names, names);
             assert_eq!(info.algorithm, Some(KeyAlgorithm::EcdsaP384));
         }
-
-        let config = TlsPolicy::new()
-            .config_builder()
-            .expect("builder")
-            .with_single_cert(
-                vec![cert.der().clone()],
-                pem::private_key(key.serialize_pem().as_bytes()).expect("key"),
-            )
-            .expect("config");
-        let custom = Tls::rustls(config);
-        validate(&custom, false).expect("a rustls config stands alone");
-        let built = build(
-            &custom,
-            &TlsPolicy::new(),
-            &[],
-            "https://x",
-            vec![b"h2".to_vec()],
-        )
-        .expect("build");
-        assert!(built.store.is_none());
-        assert_eq!(built.config.alpn_protocols, [b"h2".to_vec()]);
-        assert!(validate(&custom.self_signed(KeyAlgorithm::EcdsaP256), false).is_err());
         assert!(format!("{tls:?}").contains("PemFiles"));
     }
 }

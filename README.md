@@ -85,8 +85,9 @@ Add transports, then `serve()`:
 | `.i2p(config)` | an I2P eepsite | `i2p` |
 
 `bind` is an address string, a `SocketAddr`, or a `TcpListener` you already bound. The whole
-configuration is checked, every listener bound and every certificate loaded before the first
-request is served; a mistake is an `Error::Config` at start-up, never a silent default.
+configuration is checked, every clearnet listener bound and its certificates loaded before the
+first request is served; a mistake fails the start, never a silent default. Onion and I2P
+certificates load once their address is published, since it is one of their names.
 
 ## HTTPS with several certificates
 
@@ -134,7 +135,9 @@ Handlers take a `ServerInfo` argument: every endpoint the server has published â
 `.onion` and `.b32.i2p` addresses, as soon as each network publishes them â€” and every certificate
 it serves, with its chain, PEM, SHA-256 of the certificate and of its public key, algorithm,
 issuer, names, expiry and the endpoints using it. Render mirror links, publish pins, or bind the
-fingerprints into an attestation report. `Server::on_ready` gets each endpoint as it comes up.
+fingerprints into an attestation report. A `.onion` or `.b32.i2p` address is listed as soon as
+it is known, with a `Reachability` saying whether its network confirms it reachable yet;
+`Server::info()` returns the same handle for code outside a handler.
 
 ## Tor and I2P
 

@@ -4,8 +4,8 @@
 /// transport it runs so adding listeners does not multiply them.
 ///
 /// A plain value: set the fields you care about, in any order, and hand it to
-/// [`Server::limits`](crate::Server::limits). Zero is read as one, so a mistake cannot stop
-/// the server accepting anything.
+/// [`Server::limits`](crate::Server::limits). A zero count is read as one, so a mistake cannot
+/// stop the server accepting anything; `usize::MAX` is read as the largest count supported.
 ///
 /// ```rust
 /// use tachyon_web::Limits;
@@ -94,13 +94,16 @@ impl Limits {
         self
     }
 
-    /// Every count raised to at least one.
+    /// Every count raised to at least one and capped at what a semaphore (and a `u32`
+    /// `acquire_many` drain) can hold, so `usize::MAX` means "as many as possible", not a panic.
     pub(crate) fn sanitized(self) -> Self {
+        let max = tokio::sync::Semaphore::MAX_PERMITS
+            .min(usize::try_from(u32::MAX).unwrap_or(usize::MAX));
         Self {
-            max_connections: self.max_connections.max(1),
-            max_active_requests: self.max_active_requests.max(1),
-            max_tls_handshakes: self.max_tls_handshakes.max(1),
-            max_h3_streams: self.max_h3_streams.max(1),
+            max_connections: self.max_connections.clamp(1, max),
+            max_active_requests: self.max_active_requests.clamp(1, max),
+            max_tls_handshakes: self.max_tls_handshakes.clamp(1, max),
+            max_h3_streams: self.max_h3_streams.clamp(1, max),
             redirect_share: self.redirect_share.min(100),
             ..self
         }
@@ -122,7 +125,7 @@ mod tests {
     use super::Limits;
 
     #[test]
-    fn zero_limits_are_raised_and_the_redirect_share_keeps_one_connection() {
+    fn counts_are_clamped_and_the_redirect_share_keeps_one_connection() {
         let limits = Limits::default()
             .max_connections(0)
             .max_active_requests(0)
@@ -144,5 +147,11 @@ mod tests {
         assert_eq!(limits.redirect_share, 100);
         #[cfg(feature = "tls")]
         assert_eq!(limits.sanitized().redirect_connections(), connections);
+
+        let limits = Limits::default()
+            .max_connections(rand::random_range(usize::MAX / 2..=usize::MAX))
+            .sanitized();
+        assert!(limits.max_connections <= tokio::sync::Semaphore::MAX_PERMITS);
+        assert!(u32::try_from(limits.max_connections).is_ok());
     }
 }

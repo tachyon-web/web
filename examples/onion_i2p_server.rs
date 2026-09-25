@@ -2,8 +2,8 @@
 //! no external `tor` or `i2pd` process, no reverse proxy, no SAM/BOB bridge.
 //!
 //! The onion service also serves HTTPS with a persistent ML-DSA-87 certificate for its
-//! `.onion` address, and every page links to the mirrors the server has published so far —
-//! the addresses only exist once each network has published them.
+//! `.onion` address, and every page links to the mirrors — each listed as soon as its address
+//! is known, with whether its network confirms it reachable yet.
 //!
 //! Run with:
 //!
@@ -24,7 +24,13 @@ async fn mirrors(info: ServerInfo) -> String {
     let mut page = String::from("Hello from Tachyon-Web. Mirrors:\n");
     for endpoint in info.endpoints() {
         if endpoint.network != Network::Clearnet {
-            let _ = writeln!(page, "  {:?}: {}", endpoint.network, endpoint.url());
+            let _ = writeln!(
+                page,
+                "  {:?}: {} ({:?})",
+                endpoint.network,
+                endpoint.url(),
+                endpoint.reachability
+            );
         }
     }
     for cert in info.certificates() {
@@ -59,7 +65,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .http("127.0.0.1:8080")
         .onion(onion)
         .i2p(eepsite)
-        .on_ready(|endpoint| println!("[{:?}] reachable at {}", endpoint.network, endpoint.url()))
         .serve()
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

@@ -159,11 +159,13 @@ pub(crate) async fn accept_next(
     shutdown: &Shutdown,
 ) -> Option<(tokio::net::TcpStream, std::net::SocketAddr)> {
     loop {
+        // Biased: with clients queued, an unbiased pick kept accepting during the drain.
         tokio::select! {
+            biased;
+            () = shutdown.requested() => return None,
             accepted = accept_tuned(listener, log_tag) => if accepted.is_some() {
                 return accepted;
             },
-            () = shutdown.requested() => return None,
         }
     }
 }

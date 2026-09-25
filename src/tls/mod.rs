@@ -44,51 +44,68 @@ mod policy;
 mod store;
 
 #[cfg(feature = "acme")]
-pub use acme::Acme;
+pub use acme::{Acme, AcmeKey};
 pub use certs::{CertificateInfo, Issuer};
-pub use policy::TlsPolicy;
+pub use policy::{Cipher, KeyExchange, TlsPolicy};
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 /// The key and signature algorithm of a generated certificate.
 ///
 /// Browser support differs: every browser verifies P-256 and P-384; Chrome does not verify
 /// P-521 at all; no browser verifies ML-DSA yet (`draft-ietf-tls-mldsa`). The ML-DSA
 /// parameter sets are FIPS 204's.
+///
+/// A `cnsa` build has only [`MlDsa87`](Self::MlDsa87), so no other certificate can be
+/// generated there.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum KeyAlgorithm {
     /// ECDSA over NIST P-256 with SHA-256.
+    #[cfg(not(feature = "cnsa"))]
     EcdsaP256,
     /// ECDSA over NIST P-384 with SHA-384.
+    #[cfg(not(feature = "cnsa"))]
     EcdsaP384,
     /// ECDSA over NIST P-521 with SHA-512.
+    #[cfg(not(feature = "cnsa"))]
     EcdsaP521,
     /// ML-DSA-44 (NIST security category 2).
+    #[cfg(not(feature = "cnsa"))]
     MlDsa44,
     /// ML-DSA-65 (NIST security category 3).
+    #[cfg(not(feature = "cnsa"))]
     MlDsa65,
     /// ML-DSA-87 (NIST security category 5; the only one CNSA 2.0 permits).
     MlDsa87,
 }
 
 impl KeyAlgorithm {
-    const ALL: [Self; 6] = [
+    pub(crate) const ALL: &[Self] = &[
+        #[cfg(not(feature = "cnsa"))]
         Self::EcdsaP256,
+        #[cfg(not(feature = "cnsa"))]
         Self::EcdsaP384,
+        #[cfg(not(feature = "cnsa"))]
         Self::EcdsaP521,
+        #[cfg(not(feature = "cnsa"))]
         Self::MlDsa44,
+        #[cfg(not(feature = "cnsa"))]
         Self::MlDsa65,
         Self::MlDsa87,
     ];
 
     pub(crate) fn rcgen(self) -> &'static rcgen::SignatureAlgorithm {
         match self {
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP256 => &rcgen::PKCS_ECDSA_P256_SHA256,
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP384 => &rcgen::PKCS_ECDSA_P384_SHA384,
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP521 => &rcgen::PKCS_ECDSA_P521_SHA512,
+            #[cfg(not(feature = "cnsa"))]
             Self::MlDsa44 => &rcgen::PKCS_ML_DSA_44,
+            #[cfg(not(feature = "cnsa"))]
             Self::MlDsa65 => &rcgen::PKCS_ML_DSA_65,
             Self::MlDsa87 => &rcgen::PKCS_ML_DSA_87,
         }
@@ -96,26 +113,38 @@ impl KeyAlgorithm {
 
     pub(crate) const fn scheme(self) -> rustls::SignatureScheme {
         match self {
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP256 => rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP384 => rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP521 => rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            #[cfg(not(feature = "cnsa"))]
             Self::MlDsa44 => rustls::SignatureScheme::ML_DSA_44,
+            #[cfg(not(feature = "cnsa"))]
             Self::MlDsa65 => rustls::SignatureScheme::ML_DSA_65,
             Self::MlDsa87 => rustls::SignatureScheme::ML_DSA_87,
         }
     }
 
+    /// The algorithm behind `scheme`, or `None` for one this build cannot generate — which a
+    /// `cnsa` build then refuses to serve.
     pub(crate) fn from_scheme(scheme: rustls::SignatureScheme) -> Option<Self> {
-        Self::ALL.into_iter().find(|alg| alg.scheme() == scheme)
+        Self::ALL.iter().copied().find(|alg| alg.scheme() == scheme)
     }
 
     /// A short stable name, used in certificate store file names.
     pub(crate) const fn tag(self) -> &'static str {
         match self {
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP256 => "p256",
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP384 => "p384",
+            #[cfg(not(feature = "cnsa"))]
             Self::EcdsaP521 => "p521",
+            #[cfg(not(feature = "cnsa"))]
             Self::MlDsa44 => "mldsa44",
+            #[cfg(not(feature = "cnsa"))]
             Self::MlDsa65 => "mldsa65",
             Self::MlDsa87 => "mldsa87",
         }
@@ -134,7 +163,6 @@ pub struct Tls {
     pub(crate) domains: Vec<String>,
     pub(crate) store: Option<PathBuf>,
     pub(crate) sources: Vec<Source>,
-    pub(crate) rustls: Option<Arc<rustls::ServerConfig>>,
 }
 
 #[derive(Clone)]
@@ -169,7 +197,6 @@ impl std::fmt::Debug for Tls {
             .field("domains", &self.domains)
             .field("store", &self.store)
             .field("sources", &sources)
-            .field("rustls", &self.rustls.is_some())
             .finish()
     }
 }
@@ -179,21 +206,6 @@ impl Tls {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Terminates TLS with a fully caller-built `rustls::ServerConfig` instead of a
-    /// certificate set — for client authentication or anything else this type does not model.
-    ///
-    /// The server's [`TlsPolicy`] resumption setting is still applied, and under `fips` the
-    /// config must itself be FIPS-approved. Refused under `cnsa`, and combining it with any
-    /// other source is a configuration error. Its certificates are not listed in
-    /// [`ServerInfo`](crate::ServerInfo).
-    #[must_use]
-    pub fn rustls(config: rustls::ServerConfig) -> Self {
-        Self {
-            rustls: Some(Arc::new(config)),
-            ..Self::default()
-        }
     }
 
     /// The DNS names (or IP literals) this endpoint serves. They become the SANs of generated
@@ -224,7 +236,7 @@ impl Tls {
     }
 
     /// Adds a certificate chain and private key, both PEM. The key may be PKCS#8, PKCS#1 or
-    /// SEC1.
+    /// SEC1. Under `cnsa` it must be ML-DSA-87, checked when the server starts.
     #[must_use]
     pub fn pem(mut self, cert_chain: impl Into<Vec<u8>>, key: impl Into<Vec<u8>>) -> Self {
         self.sources.push(Source::Pem {

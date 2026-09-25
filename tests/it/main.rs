@@ -29,7 +29,8 @@ mod static_dir_tests;
 
 #[cfg(feature = "i2p")]
 mod i2p_tests;
-#[cfg(all(feature = "tls", feature = "http1"))]
+// Exercises P-256, P-384, P-521 and ML-DSA-65, none of which a `cnsa` build has.
+#[cfg(all(feature = "tls", feature = "http1", not(feature = "cnsa")))]
 mod tls_tests;
 #[cfg(feature = "tor")]
 mod tor_tests;

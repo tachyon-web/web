@@ -14,7 +14,7 @@ use crate::Error;
 ///
 /// Serves plaintext HTTP on virtual port 80 by default — Tor already encrypts and
 /// authenticates the connection to the `.onion` address. With [`tls`](Self::tls), HTTPS is
-/// also served on virtual port 443.
+/// also served on virtual port 443; with [`tls_only`](Self::tls_only), port 80 redirects there.
 ///
 /// The same `nickname` and [`state_dir`](Self::state_dir) keep the same `.onion` address
 /// across restarts.
@@ -106,15 +106,17 @@ impl OnionConfig {
     #[must_use]
     pub fn tls(mut self, tls: crate::tls::Tls) -> Self {
         self.tls = Some(tls);
+        self.redirect_http = false;
         self
     }
 
-    /// Makes virtual port 80 `308`-redirect to HTTPS instead of serving the app. Needs
-    /// [`tls`](Self::tls).
+    /// As [`tls`](Self::tls), but virtual port 80 `308`-redirects to HTTPS instead of serving
+    /// the app.
     #[cfg(feature = "tls")]
     #[must_use]
-    pub const fn redirect_http(mut self, enable: bool) -> Self {
-        self.redirect_http = enable;
+    pub fn tls_only(mut self, tls: crate::tls::Tls) -> Self {
+        self.tls = Some(tls);
+        self.redirect_http = true;
         self
     }
 
@@ -129,15 +131,8 @@ impl OnionConfig {
             ));
         }
         #[cfg(feature = "tls")]
-        {
-            if self.redirect_http && self.tls.is_none() {
-                return Err(Error::config(
-                    "OnionConfig::redirect_http needs OnionConfig::tls",
-                ));
-            }
-            if let Some(tls) = &self.tls {
-                crate::tls::certs::validate(tls, true)?;
-            }
+        if let Some(tls) = &self.tls {
+            crate::tls::certs::validate(tls, true)?;
         }
         Ok(())
     }
@@ -162,14 +157,5 @@ mod tests {
             .validate()
             .expect_err("spaces are not allowed");
         assert!(err.to_string().contains("not a nickname!!"));
-
-        #[cfg(feature = "tls")]
-        assert!(
-            OnionConfig::new("svc")
-                .redirect_http(true)
-                .validate()
-                .is_err(),
-            "a redirect to HTTPS without HTTPS must not be silently ignored"
-        );
     }
 }

@@ -160,6 +160,10 @@ impl Shared {
                 }
             }
         }
+        // Requests run on their own tasks; hold the connection permit until they finish, or
+        // the shutdown drain returns while responses are still being written.
+        let streams = u32::try_from(self.limits.max_h3_streams).unwrap_or(u32::MAX);
+        let _ = stream_semaphore.acquire_many(streams).await;
     }
 
     async fn read_h3_body(
@@ -289,7 +293,8 @@ impl Shared {
     }
 }
 
-#[cfg(test)]
+// The test client offers neither ML-KEM-1024 nor ML-DSA-87, all a `cnsa` server accepts.
+#[cfg(all(test, not(feature = "cnsa")))]
 mod tests {
     use crate::Limits;
     use crate::server::shared::Shared;
@@ -328,8 +333,9 @@ mod tests {
         .expect("build tls");
         let cert_pem = built
             .store
-            .as_ref()
-            .and_then(|store| store.infos().first().map(|info| info.pem.clone()))
+            .infos()
+            .first()
+            .map(|info| info.pem.clone())
             .expect("certificate");
         let quic_server =
             super::build_quic_server(built.config, "127.0.0.1:0", limits.max_h3_streams)

@@ -21,7 +21,7 @@ use crate::server::conn::serve_connection;
 use crate::server::http::hyper_handler;
 use crate::server::shared::{Origin, Shared};
 use crate::server::stall::WriteDeadline;
-use crate::{Endpoint, Error, Network};
+use crate::{Endpoint, Error, Network, Reachability};
 
 /// The virtual port plaintext HTTP clients connect to, as a browser assumes for `http://`.
 const ONION_HTTP_PORT: u16 = 80;
@@ -41,7 +41,7 @@ enum Acceptor {}
 pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<(), Error> {
     let client = match config.client.clone() {
         Some(client) => client,
-        None => bootstrap(&shared, &config).await?,
+        None => bootstrap(&config).await?,
     };
     let service_config = OnionServiceConfigBuilder::default()
         .nickname(parse_nickname(&config.nickname)?)
@@ -60,7 +60,6 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<()
         .map(|addr| addr.display_unredacted().to_string())
         .ok_or_else(|| Error::transport("arti reported no onion address"))?
         .into();
-    wait_until_reachable(&service).await;
     shared.allow_host(&host);
 
     #[cfg(feature = "tls")]
@@ -77,9 +76,7 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<()
                 &url,
                 crate::server::alpn(false),
             )?;
-            if let Some(store) = built.store {
-                shared.info.add_certificates(store);
-            }
+            shared.info.add_certificates(built.store);
             Some(tokio_rustls::TlsAcceptor::from(built.config))
         }
         None => None,
@@ -99,18 +96,40 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<()
         shared.info.publish(endpoint(&host, ONION_HTTPS_PORT, true));
     }
 
+    // Publication (introduction points built, descriptor accepted by `HsDirs`) can take
+    // minutes and can later degrade, so it is tracked for as long as the service runs.
+    let mut status_events = service.status_events();
+    let mut last_state = None;
     let streams = tor_hsservice::handle_rend_requests(requests);
     tokio::pin!(streams);
-    while let Some(request) = streams.next().await {
-        let permit = shared.connections.acquire().await;
-        let shared = shared.clone();
-        let acceptor = acceptor.clone();
-        let host = host.clone();
-        ConnectionLimit::serve(permit, async move {
-            if let Err(e) = handle_stream(shared, request, acceptor, redirect, host).await {
-                crate::telemetry_debug!("[tor] connection error: {e}");
+    loop {
+        tokio::select! {
+            Some(status) = status_events.next() => {
+                let state = status.state();
+                if last_state != Some(state) {
+                    crate::telemetry_info!("[tor] onion service status: {state:?}");
+                    last_state = Some(state);
+                    let reachability = if state.is_fully_reachable() {
+                        Reachability::Reachable
+                    } else {
+                        Reachability::Pending
+                    };
+                    shared.info.set_reachability(&host, reachability);
+                }
             }
-        });
+            request = streams.next() => {
+                let Some(request) = request else { break };
+                let permit = shared.connections.acquire().await;
+                let shared = shared.clone();
+                let acceptor = acceptor.clone();
+                let host = host.clone();
+                ConnectionLimit::serve(permit, async move {
+                    if let Err(e) = handle_stream(shared, request, acceptor, redirect, host).await {
+                        crate::telemetry_debug!("[tor] connection error: {e}");
+                    }
+                });
+            }
+        }
     }
     drop(service);
     Err(Error::transport("the onion service stopped"))
@@ -123,13 +142,11 @@ fn endpoint(host: &str, port: u16, tls: bool) -> Endpoint {
         port,
         tls,
         http3: false,
+        reachability: Reachability::Pending,
     }
 }
 
-async fn bootstrap(
-    shared: &Shared,
-    config: &OnionConfig,
-) -> Result<Arc<TorClient<PreferredRuntime>>, Error> {
+async fn bootstrap(config: &OnionConfig) -> Result<Arc<TorClient<PreferredRuntime>>, Error> {
     let mut builder = TorClientConfigBuilder::default();
     if let Some(dir) = &config.state_dir {
         builder
@@ -146,11 +163,10 @@ async fn bootstrap(
             .vanguards()
             .mode(ExplicitOrAuto::Explicit(VanguardMode::Disabled));
     }
-    // arti's relay TLS reads rustls's process-wide provider, so install ours first.
+    // arti's relay TLS reads rustls's process-wide provider. It gets the build's default
+    // policy, not the server's: relays are clients of their own, and many lack PQ groups.
     #[cfg(feature = "tls")]
-    shared.tls_policy.install_as_process_default();
-    #[cfg(not(feature = "tls"))]
-    let _ = shared;
+    crate::tls::TlsPolicy::new().install_as_process_default();
     let client_config = builder.build().map_err(Error::transport)?;
     TorClient::create_bootstrapped(client_config)
         .await
@@ -173,30 +189,6 @@ async fn accept_onion_stream(
     .await
     .map_err(|_| "timed out accepting onion stream")?
     .map_err(Into::into)
-}
-
-/// Awaits full reachability (introduction points built, descriptor accepted by `HsDirs`). No
-/// built-in timeout: a first-run bootstrap can legitimately take minutes, so every state
-/// transition is logged instead.
-async fn wait_until_reachable(service: &tor_hsservice::RunningOnionService) {
-    let mut status_events = service.status_events();
-    let mut last_state = None;
-    loop {
-        let Some(status) = status_events.next().await else {
-            crate::telemetry_warn!(
-                "[tor] onion service status stream ended before reporting full reachability"
-            );
-            return;
-        };
-        let state = status.state();
-        if last_state != Some(state) {
-            crate::telemetry_info!("[tor] onion service status: {state:?}");
-            last_state = Some(state);
-        }
-        if state.is_fully_reachable() {
-            return;
-        }
-    }
 }
 
 /// What to do with a rendezvous request, by the virtual port it targets. A pure function so

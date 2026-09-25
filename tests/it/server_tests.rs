@@ -5,7 +5,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use bytes::Bytes;
 use std::time::Duration;
-use tachyon_web::{Limits, Network, Server, ServerInfo};
+use tachyon_web::{Limits, Network, Reachability, Server, ServerInfo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -180,10 +180,10 @@ async fn graceful_shutdown_finishes_in_flight_requests_then_returns() {
         .expect("a graceful stop is not an error");
 }
 
-/// Handlers receive `ServerInfo`, and `on_ready` sees each endpoint as it comes up.
+/// Handlers and `Server::info` see the same published endpoints.
 #[tokio::test]
-async fn handlers_and_on_ready_see_the_published_endpoints() {
-    let (ready, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+async fn handlers_and_the_server_handle_see_the_published_endpoints() {
+    let mut info = None;
     let router = Router::new().route(
         "/",
         get(|info: ServerInfo| async move {
@@ -194,15 +194,16 @@ async fn handlers_and_on_ready_see_the_published_endpoints() {
                 .join(",")
         }),
     );
-    let server = TestServer::spawn_with(router, move |server| {
-        server.on_ready(move |endpoint| {
-            let _ = ready.send(endpoint.clone());
-        })
+    let server = TestServer::spawn_with(router, |server| {
+        info = Some(server.info());
+        server
     })
     .await;
 
-    let endpoint = ready_rx.recv().await.expect("the endpoint was published");
+    let info = info.expect("the handle");
+    let endpoint = crate::common::endpoint_where(&info, Duration::from_secs(5), |_| true).await;
     assert_eq!(endpoint.network, Network::Clearnet);
+    assert_eq!(endpoint.reachability, Reachability::Reachable);
     assert_eq!(endpoint.url(), format!("http://{}", server.addr()));
     let body = server.get("/").send().await.unwrap().text().await.unwrap();
     assert_eq!(body, endpoint.url());

@@ -128,8 +128,9 @@ pub(crate) enum HostRule {
 /// confusion. By default the list is **automatic**: the names a server's certificates are for
 /// (`Tls::domains` and provided certificates' names), the IPs its
 /// listeners are specifically bound to, and each `.onion`/`.b32.i2p` address once published.
-/// A server without certificates for any clearnet name — plain HTTP, say — answers any host;
-/// use [`allowed_hosts`](Self::allowed_hosts) to restrict one. Anything else gets `421`.
+/// A server without certificates for any clearnet name — plain HTTP, or only Tor/I2P — answers
+/// any host; use [`allowed_hosts`](Self::allowed_hosts) to restrict one. Anything else gets
+/// `421`.
 #[derive(Clone, Debug)]
 pub struct SecurityPolicy {
     hosts: HostRule,
@@ -465,6 +466,17 @@ pub(crate) fn bare_host(authority: &str) -> Option<&str> {
             .and_then(|rest| rest.strip_suffix(']'))
             .unwrap_or(host),
     )
+}
+
+/// Whether `entry` can ever match a request: an IP literal, or a DNS name optionally behind one
+/// `*.` — no scheme, port, path or brackets, which would otherwise make it silently match
+/// nothing.
+pub(crate) fn valid_host_entry(entry: &str) -> bool {
+    if entry.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let name = entry.strip_prefix("*.").unwrap_or(entry);
+    !name.contains([':', '[', '*']) && authority_host(name) == Some(name)
 }
 
 /// Matches one normalized host against an allow-list entry. A wildcard follows certificate

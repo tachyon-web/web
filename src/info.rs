@@ -15,7 +15,21 @@ pub enum Network {
     I2p,
 }
 
-/// One place the app is reachable, published once it is actually serving.
+/// Whether an [`Endpoint`]'s network confirms it can be reached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum Reachability {
+    /// Serving: a bound clearnet listener, or an onion service Tor reports fully reachable.
+    Reachable,
+    /// The address is known, but Tor has not confirmed the service reachable yet — or no
+    /// longer does. A first publication can take minutes.
+    Pending,
+    /// Serving, but the network gives no reachability signal: I2P publishes the destination's
+    /// `LeaseSet` in the background.
+    Unconfirmed,
+}
+
+/// One place the app is reachable, published as soon as its address is known.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct Endpoint {
@@ -31,6 +45,8 @@ pub struct Endpoint {
     pub tls: bool,
     /// Whether HTTP/3 is served beside it on the same UDP port.
     pub http3: bool,
+    /// Whether its network confirms it can be reached.
+    pub reachability: Reachability,
 }
 
 impl Endpoint {
@@ -56,15 +72,14 @@ impl Endpoint {
     }
 }
 
-type OnReady = Arc<dyn Fn(&Endpoint) + Send + Sync>;
-
 /// Live metadata about a running [`Server`](crate::Server): its published endpoints — including
 /// `.onion` and `.b32.i2p` addresses — and, with `tls`, every certificate it serves.
 ///
-/// Every request carries it, so a handler takes it like any extractor. It is a cheap handle onto
-/// shared state: endpoints appear as each transport comes up, and certificates are replaced in
-/// place when ACME renews them. [`Server::info`](crate::Server::info) returns the same handle
-/// before the server starts.
+/// Every request carries it, so a handler or middleware takes it like any extractor. It is a
+/// cheap handle onto shared state: endpoints appear as each transport comes up — a `.onion` or
+/// `.b32.i2p` address as soon as it is known, with its [`Reachability`] updated as the network
+/// publishes it — and certificates are replaced in place when ACME renews them.
+/// [`Server::info`](crate::Server::info) returns the same handle, for code outside a handler.
 ///
 /// ```rust,no_run
 /// use tachyon_web::{Network, ServerInfo};
@@ -85,7 +100,6 @@ struct Inner {
     endpoints: RwLock<Vec<Endpoint>>,
     #[cfg(feature = "tls")]
     certificates: RwLock<Vec<Arc<crate::tls::certs::CertStore>>>,
-    on_ready: RwLock<Option<OnReady>>,
 }
 
 impl std::fmt::Debug for ServerInfo {
@@ -102,7 +116,6 @@ impl ServerInfo {
             endpoints: RwLock::new(Vec::new()),
             #[cfg(feature = "tls")]
             certificates: RwLock::new(Vec::new()),
-            on_ready: RwLock::new(None),
         }))
     }
 
@@ -128,22 +141,24 @@ impl ServerInfo {
             .unwrap_or_default()
     }
 
-    pub(crate) fn set_on_ready(&self, hook: Option<OnReady>) {
-        if let Ok(mut slot) = self.0.on_ready.write() {
-            *slot = hook;
-        }
-    }
-
     pub(crate) fn publish(&self, endpoint: Endpoint) {
-        crate::telemetry_info!("[server] serving {}", endpoint.url());
-        // Recorded first, so a hook reading `endpoints()` sees the one it is told about.
-        let announced = endpoint.clone();
+        crate::telemetry_info!(
+            "[server] serving {} ({:?})",
+            endpoint.url(),
+            endpoint.reachability
+        );
         if let Ok(mut endpoints) = self.0.endpoints.write() {
             endpoints.push(endpoint);
         }
-        let hook = self.0.on_ready.read().ok().and_then(|hook| hook.clone());
-        if let Some(hook) = hook {
-            hook(&announced);
+    }
+
+    /// Updates every endpoint published for `host`.
+    #[cfg(feature = "tor")]
+    pub(crate) fn set_reachability(&self, host: &str, reachability: Reachability) {
+        if let Ok(mut endpoints) = self.0.endpoints.write() {
+            for endpoint in endpoints.iter_mut().filter(|e| e.host == host) {
+                endpoint.reachability = reachability;
+            }
         }
     }
 
@@ -181,6 +196,7 @@ mod tests {
             port,
             tls,
             http3: false,
+            reachability: super::Reachability::Reachable,
         };
         assert_eq!(
             endpoint("example.com", 443, true).url(),

@@ -31,19 +31,40 @@ const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org
 /// endpoint with [`Tls::acme`](super::Tls::acme).
 ///
 /// ```rust,no_run
-/// use tachyon_web::tls::{Acme, KeyAlgorithm};
+/// use tachyon_web::tls::{Acme, AcmeKey};
 ///
 /// // Start on staging: its rate limits forgive a misconfiguration; production's lock you out
 /// // for a week.
 /// let acme = Acme::lets_encrypt_staging()
 ///     .contact("admin@example.com")
-///     .key(KeyAlgorithm::EcdsaP384);
+///     .key(AcmeKey::EcdsaP384);
 /// ```
 #[derive(Clone, Debug)]
 pub struct Acme {
     directory: String,
     contact: Option<String>,
-    algorithm: KeyAlgorithm,
+    key: AcmeKey,
+}
+
+/// The key algorithm of an ACME certificate: the ones public ACME CAs, Let's Encrypt among
+/// them, issue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum AcmeKey {
+    /// ECDSA over NIST P-256: what every browser verifies. The default.
+    #[default]
+    EcdsaP256,
+    /// ECDSA over NIST P-384.
+    EcdsaP384,
+}
+
+impl AcmeKey {
+    const fn algorithm(self) -> KeyAlgorithm {
+        match self {
+            Self::EcdsaP256 => KeyAlgorithm::EcdsaP256,
+            Self::EcdsaP384 => KeyAlgorithm::EcdsaP384,
+        }
+    }
 }
 
 impl Acme {
@@ -66,7 +87,7 @@ impl Acme {
         Self {
             directory: url.into(),
             contact: None,
-            algorithm: KeyAlgorithm::EcdsaP256,
+            key: AcmeKey::EcdsaP256,
         }
     }
 
@@ -77,28 +98,11 @@ impl Acme {
         self
     }
 
-    /// The certificate key's algorithm. Default [`KeyAlgorithm::EcdsaP256`]; Let's Encrypt
-    /// also issues [`KeyAlgorithm::EcdsaP384`], and nothing else this crate generates.
+    /// The certificate key's algorithm. Default [`AcmeKey::EcdsaP256`].
     #[must_use]
-    pub const fn key(mut self, algorithm: KeyAlgorithm) -> Self {
-        self.algorithm = algorithm;
+    pub const fn key(mut self, key: AcmeKey) -> Self {
+        self.key = key;
         self
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), Error> {
-        let lets_encrypt = [LETS_ENCRYPT, LETS_ENCRYPT_STAGING].contains(&self.directory.as_str());
-        if lets_encrypt
-            && !matches!(
-                self.algorithm,
-                KeyAlgorithm::EcdsaP256 | KeyAlgorithm::EcdsaP384
-            )
-        {
-            return Err(Error::config(format!(
-                "Let's Encrypt does not issue {:?} certificates; use EcdsaP256 or EcdsaP384",
-                self.algorithm
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -189,7 +193,7 @@ impl Manager {
         format!(
             "acme-{}-{}-{}",
             names_id(std::slice::from_ref(&self.acme.directory)),
-            self.acme.algorithm.tag(),
+            self.acme.key.algorithm().tag(),
             names_id(&self.domains)
         )
     }
@@ -300,7 +304,7 @@ impl Manager {
         }
 
         let key_pair =
-            rcgen::KeyPair::generate_for(self.acme.algorithm.rcgen()).map_err(acme_error)?;
+            rcgen::KeyPair::generate_for(self.acme.key.algorithm().rcgen()).map_err(acme_error)?;
         let csr = rcgen::CertificateParams::new(self.domains.clone())
             .and_then(|params| params.serialize_request(&key_pair))
             .map_err(acme_error)?;
@@ -334,11 +338,12 @@ impl Manager {
         Ok(expiry)
     }
 
-    /// An [`AccountBuilder`] whose client talks to the CA through the policy's own provider
-    /// (so `fips`/custom providers cover it) and the pinned `webpki-roots` set.
-    fn account_builder(&self) -> Result<AccountBuilder, Error> {
+    /// An [`AccountBuilder`] whose client talks to the CA with the build's default policy — the
+    /// validated module under `fips`, and never a server policy narrowed past what the CA
+    /// speaks — and the pinned `webpki-roots` set.
+    fn account_builder() -> Result<AccountBuilder, Error> {
         let connector = HttpsConnectorBuilder::new()
-            .with_provider_and_webpki_roots(self.policy.provider())
+            .with_provider_and_webpki_roots(TlsPolicy::new().provider())
             .map_err(acme_error)?
             .https_only()
             .enable_http1()
@@ -358,7 +363,7 @@ impl Manager {
         match self.store.read(&file) {
             Ok(Some(json)) => match serde_json::from_slice::<AccountCredentials>(&json) {
                 Ok(credentials) => {
-                    match self.account_builder()?.from_credentials(credentials).await {
+                    match Self::account_builder()?.from_credentials(credentials).await {
                         Ok(account) => return Ok(account),
                         Err(e) => warn!("[acme] cached account rejected, registering anew: {e}"),
                     }
@@ -377,8 +382,7 @@ impl Manager {
             .map(|email| format!("mailto:{email}"))
             .collect();
         let contact: Vec<&str> = contact.iter().map(String::as_str).collect();
-        let (account, credentials) = self
-            .account_builder()?
+        let (account, credentials) = Self::account_builder()?
             .create(
                 &NewAccount {
                     contact: &contact,
@@ -562,22 +566,5 @@ mod tests {
         assert!(validate(format!("*.{}", random_domains().remove(0))).is_err());
         let ip = std::net::Ipv4Addr::from(rand::random::<u32>());
         assert!(validate(ip.to_string()).is_err());
-    }
-
-    #[test]
-    fn lets_encrypt_refuses_keys_it_cannot_issue() {
-        assert!(Acme::lets_encrypt().validate().is_ok());
-        assert!(
-            Acme::lets_encrypt()
-                .key(KeyAlgorithm::EcdsaP521)
-                .validate()
-                .is_err()
-        );
-        assert!(
-            Acme::directory("https://ca.internal/acme")
-                .key(KeyAlgorithm::MlDsa87)
-                .validate()
-                .is_ok()
-        );
     }
 }

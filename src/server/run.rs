@@ -9,10 +9,10 @@ use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
 use super::conn::Shutdown;
-use super::security::HostRule;
+use super::security::{HostRule, valid_host_entry};
 use super::shared::Shared;
 use super::{Server, Transport};
-use crate::{Endpoint, Error, Network};
+use crate::{Endpoint, Error, Network, Reachability};
 
 type Signal = Pin<Box<dyn Future<Output = ()> + Send>>;
 
@@ -91,12 +91,18 @@ impl Server {
                 "no transports: add at least one with .http/.https/.onion/.i2p",
             ));
         }
-        if let HostRule::Only(hosts) = self.security.host_rule()
-            && hosts.is_empty()
-        {
-            return Err(Error::config(
-                "SecurityPolicy::allowed_hosts is empty, which would refuse every request",
-            ));
+        if let HostRule::Only(hosts) = self.security.host_rule() {
+            if hosts.is_empty() {
+                return Err(Error::config(
+                    "SecurityPolicy::allowed_hosts is empty, which would refuse every request",
+                ));
+            }
+            if let Some(host) = hosts.iter().find(|host| !valid_host_entry(host)) {
+                return Err(Error::config(format!(
+                    "SecurityPolicy::allowed_hosts: {host:?} is not a DNS name, `*.` wildcard or \
+                     IP literal, so it would match nothing"
+                )));
+            }
         }
         #[cfg(feature = "tls")]
         {
@@ -233,6 +239,7 @@ impl Startup {
                         port: addr.port(),
                         tls: true,
                         http3: cfg!(feature = "http3"),
+                        reachability: Reachability::Reachable,
                     };
                     let built = crate::tls::certs::build(
                         &tls,
@@ -242,7 +249,7 @@ impl Startup {
                         super::alpn(endpoint.http3),
                     )?;
                     startup.names.extend(tls.domains.iter().cloned());
-                    for info in built.store.iter().flat_map(|store| store.infos()) {
+                    for info in built.store.infos() {
                         startup.names.extend(info.names.iter().cloned());
                     }
                     #[cfg(feature = "http3")]
@@ -361,9 +368,7 @@ fn spawn_https(shared: &Arc<Shared>, tasks: &mut JoinSet<Result<(), Error>>, htt
     };
     #[cfg(not(feature = "http3"))]
     let h3_port = None;
-    if let Some(store) = https.built.store {
-        shared.info.add_certificates(store);
-    }
+    shared.info.add_certificates(https.built.store);
     #[cfg(feature = "acme")]
     for manager in https.built.acme {
         tasks.spawn(forever(manager.run()));
@@ -384,6 +389,7 @@ fn plain_endpoint(addr: SocketAddr) -> Endpoint {
         port: addr.port(),
         tls: false,
         http3: false,
+        reachability: Reachability::Reachable,
     }
 }
 

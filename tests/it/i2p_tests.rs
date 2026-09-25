@@ -43,20 +43,19 @@ async fn eepsite_round_trip_over_a_real_i2p_stream() {
         .await
         .expect("start I2pRouter");
 
-    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::unbounded_channel();
     let keys_dir = tempfile::tempdir().expect("create temp dir");
     let config = I2pConfig::new("tachyon-web-test-eepsite")
         .data_dir(keys_dir.path())
         .router(router.clone());
-    let server = Server::new(app).i2p(config).on_ready(move |endpoint| {
-        let _ = addr_tx.send(endpoint.host.clone());
-    });
+    let server = Server::new(app).i2p(config);
+    let info = server.info();
     let server_task = tokio::spawn(server.serve().into_future());
 
-    let eepsite_host = tokio::time::timeout(Duration::from_mins(3), addr_rx.recv())
-        .await
-        .expect("eepsite became reachable within 180s")
-        .expect("on_ready callback fired");
+    let eepsite_host = crate::common::endpoint_where(&info, Duration::from_mins(3), |e| {
+        e.network == tachyon_web::Network::I2p
+    })
+    .await
+    .host;
 
     let client_dest = router
         .create_transient_destination()

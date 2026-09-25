@@ -41,7 +41,7 @@ pub use security::{IpNetwork, SecurityPolicy};
 use axum::Router;
 use std::time::Duration;
 
-use crate::{Endpoint, ServerInfo};
+use crate::ServerInfo;
 
 /// Read timeout for request heads and bodies, on every transport.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -193,7 +193,7 @@ impl Server {
     }
 
     /// Sets the crypto policy for every TLS endpoint and the keys their certificates load
-    /// with. `fips` and `cnsa` builds cannot be weakened through it.
+    /// with. A `fips` or `cnsa` build cannot express a non-compliant one.
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn tls_policy(mut self, policy: crate::tls::TlsPolicy) -> Self {
@@ -201,15 +201,8 @@ impl Server {
         self
     }
 
-    /// Calls `hook` for each endpoint as it starts serving — including `.onion` and
-    /// `.b32.i2p` addresses, which are only known once published.
-    #[must_use]
-    pub fn on_ready(self, hook: impl Fn(&Endpoint) + Send + Sync + 'static) -> Self {
-        self.info.set_on_ready(Some(std::sync::Arc::new(hook)));
-        self
-    }
-
-    /// A handle onto what this server publishes once running — the same one handlers receive.
+    /// A handle onto what this server publishes once running — the same one handlers receive,
+    /// for code outside a handler, such as a task reporting the `.onion` address.
     #[must_use]
     pub fn info(&self) -> ServerInfo {
         self.info.clone()
@@ -219,8 +212,9 @@ impl Server {
     /// [graceful shutdown](Serve::with_graceful_shutdown) signal fires.
     ///
     /// Nothing is bound until the returned future is awaited. The configuration is checked
-    /// first, and every clearnet listener is bound and every certificate loaded before any
-    /// request is served, so a mistake fails the start instead of a later request.
+    /// first, and every clearnet listener is bound and its certificates loaded before any
+    /// request is served, so a mistake fails the start instead of a later request. Onion and
+    /// I2P certificates load once their address is published.
     #[must_use = "a server does nothing until `.serve()` is awaited"]
     pub fn serve(self) -> Serve {
         Serve::new(self)

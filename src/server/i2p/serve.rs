@@ -10,7 +10,7 @@ use crate::server::conn::serve_connection;
 use crate::server::http::hyper_handler;
 use crate::server::shared::{Origin, Shared};
 use crate::server::stall::WriteDeadline;
-use crate::{Endpoint, Error, Network};
+use crate::{Endpoint, Error, Network, Reachability};
 
 #[cfg(feature = "tls")]
 type Acceptor = tokio_rustls::TlsAcceptor;
@@ -53,9 +53,7 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: I2pConfig) -> Result<(), 
                 &url,
                 crate::server::alpn(false),
             )?;
-            if let Some(store) = built.store {
-                shared.info.add_certificates(store);
-            }
+            shared.info.add_certificates(built.store);
             Some(tokio_rustls::TlsAcceptor::from(built.config))
         }
         None => None,
@@ -70,6 +68,7 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: I2pConfig) -> Result<(), 
         port: if tls { 443 } else { 80 },
         tls,
         http3: false,
+        reachability: Reachability::Unconfirmed,
     });
 
     loop {

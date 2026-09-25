@@ -119,6 +119,11 @@ compile_error!(
      certificate, which public ACME services do not issue"
 );
 
+#[cfg(all(feature = "cnsa", feature = "tls12-legacy"))]
+compile_error!(
+    "the `cnsa` and `tls12-legacy` features are mutually exclusive: CNSA 2.0 is TLS 1.3 only"
+);
+
 #[cfg(not(any(feature = "http1", feature = "http2")))]
 compile_error!(
     "tachyon-web requires at least one of the \"http1\" or \"http2\" features to serve anything"
@@ -143,5 +148,5 @@ pub mod server;
 pub mod tls;
 
 pub use error::Error;
-pub use info::{Endpoint, Network, ServerInfo};
+pub use info::{Endpoint, Network, Reachability, ServerInfo};
 pub use server::{Bind, IpNetwork, Limits, SecurityPolicy, Serve, Server};

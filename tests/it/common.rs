@@ -127,6 +127,25 @@ pub(crate) async fn wait_until_listening(addr: SocketAddr) {
     panic!("nothing started listening on {addr} within {ATTEMPTS} attempts");
 }
 
+/// Polls `info` until an endpoint matches `wanted`, for up to `within`.
+pub(crate) async fn endpoint_where(
+    info: &tachyon_web::ServerInfo,
+    within: Duration,
+    wanted: impl Fn(&tachyon_web::Endpoint) -> bool + Send + Sync,
+) -> tachyon_web::Endpoint {
+    let found = async {
+        loop {
+            if let Some(endpoint) = info.endpoints().into_iter().find(|e| wanted(e)) {
+                return endpoint;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::time::timeout(within, found)
+        .await
+        .expect("the endpoint was published in time")
+}
+
 /// A `reqwest` client that accepts the self-signed certificates these tests generate.
 #[cfg(feature = "tls")]
 pub(crate) fn tls_client() -> Client {

@@ -1,233 +1,303 @@
-//! A crypto/TLS policy shared across every listener a [`Server`](crate::Server) runs.
+//! The crypto policy every TLS endpoint of a [`Server`](crate::Server) shares.
 
 use rustls::SupportedProtocolVersion;
-use rustls::crypto::CryptoProvider;
+use rustls::crypto::{CryptoProvider, SupportedKxGroup, aws_lc_rs};
 use std::sync::Arc;
 
-/// A crypto provider + protocol-version policy shared across every listener a
-/// [`Server`](crate::Server) runs.
+/// A TLS key-exchange group.
 ///
-/// Set it once via [`Server::tls_policy`](crate::Server::tls_policy) and it covers every TLS
-/// endpoint the server runs — clearnet HTTPS and HTTP/3, `.onion` and `.b32.i2p` — and the keys
-/// their certificates are loaded with.
+/// The variants a build has *are* its compliance profile: under `fips` only the groups FIPS
+/// 140-3 approves exist (NIST P-curves and the `SECP256R1MLKEM768` hybrid; no X25519, and no
+/// standalone ML-KEM, which SP 800-56C rev2 only sanctions as part of a hybrid), and under
+/// `cnsa` only ML-KEM-1024 (CNSSP-15). Naming anything else there is a compile error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum KeyExchange {
+    /// X25519 + ML-KEM-768 hybrid: what browsers offer for post-quantum key exchange.
+    #[cfg(not(feature = "fips"))]
+    X25519MlKem768,
+    /// NIST P-256 + ML-KEM-768 hybrid.
+    #[cfg(not(feature = "cnsa"))]
+    Secp256r1MlKem768,
+    /// ML-KEM-768 alone (FIPS 203).
+    #[cfg(not(feature = "fips"))]
+    MlKem768,
+    /// ML-KEM-1024 alone (FIPS 203); the only group CNSA 2.0 permits.
+    #[cfg(any(not(feature = "fips"), feature = "cnsa"))]
+    MlKem1024,
+    /// ECDHE over NIST P-384.
+    #[cfg(not(feature = "cnsa"))]
+    Secp384r1,
+    /// ECDHE over X25519.
+    #[cfg(not(feature = "fips"))]
+    X25519,
+    /// ECDHE over NIST P-256.
+    #[cfg(not(feature = "cnsa"))]
+    Secp256r1,
+}
+
+impl KeyExchange {
+    /// Every group this build permits.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[
+        #[cfg(not(feature = "fips"))]
+        Self::X25519MlKem768,
+        #[cfg(not(feature = "cnsa"))]
+        Self::Secp256r1MlKem768,
+        #[cfg(not(feature = "fips"))]
+        Self::MlKem768,
+        #[cfg(any(not(feature = "fips"), feature = "cnsa"))]
+        Self::MlKem1024,
+        #[cfg(not(feature = "cnsa"))]
+        Self::Secp384r1,
+        #[cfg(not(feature = "fips"))]
+        Self::X25519,
+        #[cfg(not(feature = "cnsa"))]
+        Self::Secp256r1,
+    ];
+
+    /// This build's default, most preferred first.
+    const DEFAULT: &[Self] = &[
+        #[cfg(not(feature = "fips"))]
+        Self::X25519MlKem768,
+        #[cfg(not(feature = "cnsa"))]
+        Self::Secp256r1MlKem768,
+        #[cfg(any(not(feature = "fips"), feature = "cnsa"))]
+        Self::MlKem1024,
+        #[cfg(not(feature = "fips"))]
+        Self::MlKem768,
+        #[cfg(not(feature = "cnsa"))]
+        Self::Secp384r1,
+        #[cfg(not(feature = "fips"))]
+        Self::X25519,
+        #[cfg(not(feature = "cnsa"))]
+        Self::Secp256r1,
+    ];
+
+    fn group(self) -> &'static dyn SupportedKxGroup {
+        match self {
+            #[cfg(not(feature = "fips"))]
+            Self::X25519MlKem768 => aws_lc_rs::kx_group::X25519MLKEM768,
+            #[cfg(not(feature = "cnsa"))]
+            Self::Secp256r1MlKem768 => aws_lc_rs::kx_group::SECP256R1MLKEM768,
+            #[cfg(not(feature = "fips"))]
+            Self::MlKem768 => aws_lc_rs::kx_group::MLKEM768,
+            #[cfg(any(not(feature = "fips"), feature = "cnsa"))]
+            Self::MlKem1024 => aws_lc_rs::kx_group::MLKEM1024,
+            #[cfg(not(feature = "cnsa"))]
+            Self::Secp384r1 => aws_lc_rs::kx_group::SECP384R1,
+            #[cfg(not(feature = "fips"))]
+            Self::X25519 => aws_lc_rs::kx_group::X25519,
+            #[cfg(not(feature = "cnsa"))]
+            Self::Secp256r1 => aws_lc_rs::kx_group::SECP256R1,
+        }
+    }
+}
+
+/// A TLS AEAD cipher.
 ///
-/// # `tls12-legacy`
+/// As with [`KeyExchange`], only the ciphers the build's profile permits exist: `fips` drops
+/// ChaCha20-Poly1305 (not FIPS-approved), `cnsa` keeps AES-256-GCM alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum Cipher {
+    /// AES-256-GCM: `TLS_AES_256_GCM_SHA384`.
+    Aes256Gcm,
+    /// ChaCha20-Poly1305: `TLS_CHACHA20_POLY1305_SHA256`.
+    #[cfg(not(feature = "fips"))]
+    ChaCha20Poly1305,
+    /// AES-128-GCM: `TLS_AES_128_GCM_SHA256`.
+    #[cfg(not(feature = "cnsa"))]
+    Aes128Gcm,
+}
+
+impl Cipher {
+    /// Every cipher this build permits.
+    #[cfg(test)]
+    pub(crate) const ALL: &[Self] = &[
+        Self::Aes256Gcm,
+        #[cfg(not(feature = "fips"))]
+        Self::ChaCha20Poly1305,
+        #[cfg(not(feature = "cnsa"))]
+        Self::Aes128Gcm,
+    ];
+
+    /// This build's default, most preferred first. `fips` keeps its historical AES-256 only.
+    const DEFAULT: &[Self] = &[
+        Self::Aes256Gcm,
+        #[cfg(not(feature = "fips"))]
+        Self::ChaCha20Poly1305,
+        #[cfg(not(feature = "fips"))]
+        Self::Aes128Gcm,
+    ];
+
+    const fn tls13(self) -> rustls::SupportedCipherSuite {
+        match self {
+            Self::Aes256Gcm => aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
+            #[cfg(not(feature = "fips"))]
+            Self::ChaCha20Poly1305 => aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+            #[cfg(not(feature = "cnsa"))]
+            Self::Aes128Gcm => aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256,
+        }
+    }
+
+    #[cfg(feature = "tls12-legacy")]
+    const fn tls12(self) -> [rustls::SupportedCipherSuite; 2] {
+        use aws_lc_rs::cipher_suite as cs;
+        match self {
+            Self::Aes256Gcm => [
+                cs::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                cs::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ],
+            #[cfg(not(feature = "fips"))]
+            Self::ChaCha20Poly1305 => [
+                cs::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                cs::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ],
+            #[cfg(not(feature = "cnsa"))]
+            Self::Aes128Gcm => [
+                cs::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                cs::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ],
+        }
+    }
+}
+
+/// The crypto policy every TLS endpoint of a [`Server`](crate::Server) shares — clearnet HTTPS
+/// and HTTP/3, `.onion` and `.b32.i2p` — set with
+/// [`Server::tls_policy`](crate::Server::tls_policy).
 ///
-/// **TLS 1.3 is the only protocol version this crate offers unless the `tls12-legacy`
-/// feature is enabled.** Every policy this type can build — default, `fips`, `cnsa`, or one
-/// wrapped around a caller's own [`CryptoProvider`] — negotiates 1.3 only and carries no TLS
-/// 1.2 cipher suite to downgrade onto.
+/// ```rust
+/// use tachyon_web::tls::{Cipher, KeyExchange, TlsPolicy};
 ///
-/// That holds even when another dependency enables `rustls/tls12` (`tor` does, via
-/// `tor-rtcompat`, for arti's relay links): TLS 1.2 then exists in the binary, but this policy
-/// never offers it. `tls12-legacy` is also what gives the FIPS profile's extended-master-secret
-/// requirement (FIPS 140-3 IG D.Q) anything to act on, since EMS is a TLS 1.2 extension.
+/// # #[cfg(not(feature = "fips"))]
+/// let policy = TlsPolicy::new()
+///     .key_exchange([KeyExchange::X25519MlKem768, KeyExchange::X25519])
+///     .ciphers([Cipher::Aes256Gcm, Cipher::ChaCha20Poly1305]);
+/// ```
 ///
-/// # `fips`
+/// # Compliance is a property of the build
 ///
-/// With the `fips` feature, [`new`](Self::new)/[`Default::default`] always build a FIPS 140-3
-/// Level 1 validated software provider in approved mode — AES-256-GCM only; NIST P-curves
-/// plus the `SECP256R1MLKEM768` hybrid, no X25519 and no standalone ML-KEM. `with_provider`
-/// doesn't compile under `fips`, so no other provider can be plugged in.
+/// Only what the build's profile permits can be named: see [`KeyExchange`] and [`Cipher`]. So
+/// a `fips` or `cnsa` server cannot be configured out of compliance, and there is no way to
+/// hand it a raw `rustls` config or provider. Under `cnsa` the profile is fixed: TLS 1.3,
+/// `TLS_AES_256_GCM_SHA384`, ML-KEM-1024, and session resumption off.
 ///
-/// # The Tor relay/channel layer is a separate concern
+/// # Preference order
 ///
-/// This policy governs TLS *termination*. arti's outbound TLS to Tor relays instead uses
-/// rustls's *process-wide* default provider; [`install_as_process_default`] sets it, and a
-/// server with an onion endpoint calls it before bootstrapping its own Tor client.
+/// Ciphers are chosen in **this server's** order, the first one the client also offers.
+/// Key-exchange groups are a set: rustls's server picks the first group, in the *client's*
+/// order, that is in it. To prefer post-quantum, leave the classical groups out rather than
+/// listing them last.
 ///
-/// A PQ-only or single-suite policy is fine for termination but can break Tor bootstrap when
-/// installed process-wide, since many relays don't support hybrid PQ groups yet. Prefer PQ;
-/// don't require it there.
+/// # TLS 1.2
 ///
-/// [`install_as_process_default`]: Self::install_as_process_default
-#[derive(Clone)]
+/// TLS 1.3 only, unless the `tls12-legacy` feature is enabled. That holds even when another
+/// dependency enables `rustls/tls12` (`tor` does): the version exists in the binary but is
+/// never offered here. `cnsa` and `tls12-legacy` cannot be combined.
+#[derive(Clone, Debug)]
 pub struct TlsPolicy {
-    provider: Arc<CryptoProvider>,
+    key_exchange: Vec<KeyExchange>,
+    ciphers: Vec<Cipher>,
     versions: Vec<&'static SupportedProtocolVersion>,
     disable_resumption: bool,
 }
 
-impl std::fmt::Debug for TlsPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut out = f.debug_struct("TlsPolicy");
-        let _ = out.field("tls13", &self.versions.contains(&&rustls::version::TLS13));
-        #[cfg(feature = "tls12-legacy")]
-        let _ = out.field("tls12", &self.versions.contains(&&rustls::version::TLS12));
-        #[cfg(not(feature = "tls12-legacy"))]
-        let _ = out.field("tls12", &"unavailable (no `tls12-legacy` feature)");
-        out.field("disable_resumption", &self.disable_resumption)
-            .finish_non_exhaustive()
-    }
-}
-
-/// TLS 1.3, plus TLS 1.2 under `tls12-legacy`. Gated on this crate's feature, not rustls's,
-/// so a dependency enabling `rustls/tls12` can't widen what these listeners offer.
-#[cfg(not(feature = "cnsa"))]
-fn default_versions() -> Vec<&'static SupportedProtocolVersion> {
-    vec![
-        &rustls::version::TLS13,
-        #[cfg(feature = "tls12-legacy")]
-        &rustls::version::TLS12,
-    ]
-}
-
 impl TlsPolicy {
-    /// Tachyon's default TLS policy.
+    /// This build's default policy.
     ///
-    /// Without the `fips` feature: hybrid post-quantum key-exchange groups preferred
-    /// (`X25519MLKEM768`, `SECP256R1MLKEM768`, `MLKEM1024`, `MLKEM768`), falling back to
-    /// classical ECDHE groups (`SECP384R1`, `X25519`, `SECP256R1`) for interoperability;
-    /// AES-256-GCM and ChaCha20-Poly1305 preferred over AES-128.
-    ///
-    /// With `fips`, this is the restricted FIPS policy. With `cnsa`, the stricter CNSA policy
-    /// takes precedence.
-    ///
-    /// **TLS 1.3 only**, unless the `tls12-legacy` feature is enabled — see the
-    /// [type docs](Self#tls12-legacy).
+    /// Without `fips`: hybrid post-quantum groups first (`X25519MLKEM768`, `SECP256R1MLKEM768`),
+    /// then ML-KEM alone and the classical ECDHE groups for interoperability; AES-256-GCM, then
+    /// ChaCha20-Poly1305, then AES-128-GCM. With `fips`: `SECP256R1MLKEM768`, P-384, P-256 and
+    /// AES-256-GCM. With `cnsa`: the fixed CNSA 2.0 profile.
     #[must_use]
     pub fn new() -> Self {
-        #[cfg(feature = "cnsa")]
-        {
-            Self::cnsa()
-        }
-        #[cfg(all(feature = "fips", not(feature = "cnsa")))]
-        {
-            Self::fips()
-        }
-        #[cfg(not(feature = "fips"))]
-        {
-            Self {
-                provider: default_provider(),
-                versions: default_versions(),
-                disable_resumption: false,
-            }
-        }
-    }
-
-    /// Builds a policy from a fully custom [`CryptoProvider`] — for example one pinned to
-    /// `TLS13_AES_256_GCM_SHA384` only.
-    ///
-    /// Negotiates TLS 1.3 only unless `tls12-legacy` is enabled. A TLS 1.2 suite in
-    /// `provider` is inert without that feature — the version is never offered, so there is
-    /// no handshake it can apply to.
-    ///
-    /// Not available with the `fips` feature enabled — see the [type docs](Self#fips).
-    #[cfg(not(feature = "fips"))]
-    #[must_use]
-    pub fn with_provider(provider: Arc<CryptoProvider>) -> Self {
         Self {
-            provider,
-            versions: default_versions(),
-            disable_resumption: false,
+            key_exchange: KeyExchange::DEFAULT.to_vec(),
+            ciphers: Cipher::DEFAULT.to_vec(),
+            versions: vec![
+                &rustls::version::TLS13,
+                #[cfg(feature = "tls12-legacy")]
+                &rustls::version::TLS12,
+            ],
+            disable_resumption: cfg!(feature = "cnsa"),
         }
     }
 
-    /// The FIPS 140-3 Level 1 approved-mode software policy: AES-256-GCM suites only, and NIST
-    /// P-curves plus the `SECP256R1MLKEM768` hybrid.
-    ///
-    /// No X25519, which isn't approved for key agreement (SP 800-56A rev3), and no standalone
-    /// ML-KEM, since SP 800-56C rev2 only sanctions a hybrid `Z' = Z || T`. That is stricter
-    /// than rustls's own `fips()` predicate; the `cnsa` profile takes rustls's reading.
-    ///
-    /// Under `fips` this is also what [`new`](Self::new) builds.
-    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
+    /// The key-exchange groups to accept. An empty list does not compile; a repeated group
+    /// counts once.
     #[must_use]
-    pub fn fips() -> Self {
-        Self {
-            provider: fips_provider(),
-            versions: default_versions(),
-            disable_resumption: false,
-        }
+    pub fn key_exchange<const N: usize>(mut self, groups: [KeyExchange; N]) -> Self {
+        const { assert!(N > 0, "TlsPolicy::key_exchange needs at least one group") };
+        self.key_exchange = unique(&groups);
+        self
     }
 
-    /// Strict CNSA 2.0 TLS profile for controlled, non-browser clients.
+    /// The ciphers to offer, most preferred first. An empty list does not compile; a repeated
+    /// cipher counts once.
     ///
-    /// This is TLS 1.3 with `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 as the sole key-exchange
-    /// group, and all session resumption disabled. A `cnsa` build accepts only ML-DSA-87
-    /// certificates, generated or provided. The feature implies `fips`, so AWS-LC also runs in its FIPS
-    /// 140-3 Level 1 approved software mode.
-    ///
-    /// # This is deliberately *not* the `fips` profile
-    ///
-    /// CNSA 2.0 (CNSSP-15) requires bare ML-KEM-1024, which the `fips` profile's reading of SP
-    /// 800-56C rejects. A `cnsa` build runs the FIPS-validated *module* but negotiates a key
-    /// exchange that profile would refuse; rustls itself counts bare ML-KEM as approved in FIPS
-    /// mode, which is why `assert_fips_server_config` accepts it. If you answer to FIPS 140-3
-    /// rather than CNSA 2.0, build with `fips` alone.
-    #[cfg(feature = "cnsa")]
+    /// ```rust,compile_fail
+    /// let policy = tachyon_web::tls::TlsPolicy::new().ciphers([]);
+    /// ```
     #[must_use]
-    pub fn cnsa() -> Self {
-        Self {
-            provider: cnsa_provider(),
-            versions: vec![&rustls::version::TLS13],
-            disable_resumption: true,
-        }
+    pub fn ciphers<const N: usize>(mut self, ciphers: [Cipher; N]) -> Self {
+        const { assert!(N > 0, "TlsPolicy::ciphers needs at least one cipher") };
+        self.ciphers = unique(&ciphers);
+        self
     }
 
-    /// Restricts this policy to TLS 1.3 only.
-    ///
-    /// Only has an effect under `tls12-legacy`; otherwise this is already the case.
+    /// Disables every session-resumption path: 0-RTT data, the stateful session cache, and
+    /// TLS 1.3 session tickets. Every reconnect pays a full handshake, but there is no replay
+    /// surface and no cross-connection linkability signal — worth it for anonymity endpoints.
+    /// Default `false`; not available under `cnsa`, which always disables resumption.
+    #[cfg(not(feature = "cnsa"))]
+    #[must_use]
+    pub const fn disable_resumption(mut self, disable: bool) -> Self {
+        self.disable_resumption = disable;
+        self
+    }
+
+    /// Stops offering TLS 1.2.
+    #[cfg(feature = "tls12-legacy")]
     #[must_use]
     pub fn tls13_only(mut self) -> Self {
         self.versions = vec![&rustls::version::TLS13];
         self
     }
 
-    /// Enables or disables the strict replay lockdown.
-    ///
-    /// When enabled, server configurations built from this policy reject TLS 0-RTT data and
-    /// disable both stateful session caching and TLS 1.3 session tickets: every reconnect pays a
-    /// full handshake, but there is no replay surface and no cross-connection linkability
-    /// signal — worth it for anonymity endpoints. The default is `false`; `cnsa` forces `true`.
-    #[must_use]
-    pub const fn disable_resumption(mut self, disable: bool) -> Self {
-        #[cfg(feature = "cnsa")]
-        {
-            let _ = disable;
-            self.disable_resumption = true;
-            self
-        }
-        #[cfg(not(feature = "cnsa"))]
-        {
-            self.disable_resumption = disable;
-            self
-        }
-    }
-
-    fn apply_to_server_config(&self, config: &mut rustls::ServerConfig) {
-        if self.disable_resumption {
-            config.max_early_data_size = 0;
-            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-            config.send_tls13_tickets = 0;
-            config.max_tls13_tickets = 0;
-        }
-    }
-
-    /// The underlying crypto provider.
-    #[must_use]
-    pub fn provider(&self) -> Arc<CryptoProvider> {
-        self.provider.clone()
-    }
-
-    /// The protocol versions this policy negotiates.
-    #[must_use]
-    pub fn versions(&self) -> &[&'static SupportedProtocolVersion] {
-        &self.versions
-    }
-
     /// Installs this policy's crypto provider as rustls's process-wide default, via
     /// [`CryptoProvider::install_default`].
     ///
-    /// Only the first call in a process installs anything; later ones, even with a different
-    /// policy, are ignored. Call it before bootstrapping an arti `TorClient` so its relay TLS
-    /// uses this provider too — see the [type docs](Self).
+    /// Only the first call in a process installs anything. Call it before bootstrapping your
+    /// own arti `TorClient` for [`OnionConfig::client`](crate::server::tor::OnionConfig), so
+    /// its relay TLS uses the build's validated module too. Keep that policy broad: many
+    /// relays don't support post-quantum groups yet.
     pub fn install_as_process_default(&self) {
-        let _ = (*self.provider).clone().install_default();
+        let _ = self.build_provider().install_default();
     }
 
-    /// The shared prefix of every `rustls::ServerConfig` built from this policy: its provider
-    /// and protocol versions, and no client auth.
+    fn build_provider(&self) -> CryptoProvider {
+        let tls13 = self.ciphers.iter().map(|cipher| cipher.tls13());
+        #[cfg(feature = "tls12-legacy")]
+        let tls13 = tls13.chain(
+            self.ciphers
+                .iter()
+                .filter(|_| self.versions.contains(&&rustls::version::TLS12))
+                .flat_map(|cipher| cipher.tls12()),
+        );
+        CryptoProvider {
+            cipher_suites: tls13.collect(),
+            kx_groups: self.key_exchange.iter().map(|kx| kx.group()).collect(),
+            ..aws_lc_rs::default_provider()
+        }
+    }
+
+    /// The provider certificates' keys load through — under `fips` the validated module.
+    pub(crate) fn provider(&self) -> Arc<CryptoProvider> {
+        Arc::new(self.build_provider())
+    }
+
+    /// The shared prefix of every `rustls::ServerConfig` built from this policy.
     pub(crate) fn config_builder(
         &self,
     ) -> Result<
@@ -237,56 +307,21 @@ impl TlsPolicy {
         rustls::ServerConfig::builder_with_provider(self.provider())
             .with_protocol_versions(&self.versions)
             .map(rustls::ConfigBuilder::<rustls::ServerConfig, _>::with_no_client_auth)
-            .map_err(|e| crate::Error::config(format!("TLS version configuration failed: {e}")))
+            .map_err(|e| crate::Error::config(format!("TLS configuration failed: {e}")))
     }
 
-    /// Applies this policy's resumption setting to a finished config and freezes it. Every
-    /// config any listener serves goes through here.
+    /// Applies the server-side preference order and resumption setting, and freezes the
+    /// config. Every config any listener serves goes through here.
     pub(crate) fn finalize(&self, mut config: rustls::ServerConfig) -> Arc<rustls::ServerConfig> {
-        self.apply_to_server_config(&mut config);
+        config.ignore_client_order = true;
+        if self.disable_resumption {
+            config.max_early_data_size = 0;
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+            config.send_tls13_tickets = 0;
+            config.max_tls13_tickets = 0;
+        }
         Arc::new(config)
     }
-}
-
-/// Rejects a config that does not itself negotiate FIPS-approved algorithms. `fips()` is
-/// rustls's own predicate: an approved provider *and* `require_ems` (FIPS 140-3 IG D.Q, which
-/// only bites under `tls12-legacy`).
-#[cfg(feature = "fips")]
-pub(crate) fn assert_fips_server_config(config: &rustls::ServerConfig) -> Result<(), crate::Error> {
-    if !config.fips() {
-        return Err(crate::Error::config(
-            "TLS config is not using the FIPS 140-3 Level 1 software module in approved mode \
-             (a non-approved cipher suite or key-exchange group is offered, or TLS 1.2 \
-             extended-master-secret isn't required) — build it via `TlsPolicy` rather than \
-             `rustls::ServerConfig::builder()` directly",
-        ));
-    }
-
-    #[cfg(feature = "cnsa")]
-    {
-        let provider = config.crypto_provider();
-        let suites_are_cnsa = provider.cipher_suites.len() == 1
-            && provider.cipher_suites.first().is_some_and(|suite| {
-                suite.suite() == rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
-            });
-        let groups_are_cnsa = provider.kx_groups.len() == 1
-            && provider
-                .kx_groups
-                .first()
-                .is_some_and(|group| group.name() == rustls::NamedGroup::MLKEM1024);
-        let resumption_is_disabled = config.send_tls13_tickets == 0
-            && config.max_tls13_tickets == 0
-            && config.max_early_data_size == 0
-            && !config.session_storage.can_cache();
-        if !suites_are_cnsa || !groups_are_cnsa || !resumption_is_disabled {
-            return Err(crate::Error::config(
-                "TLS config violates the compile-time CNSA profile: require TLS 1.3 \
-                 AES-256-GCM-SHA384, ML-KEM-1024, and disabled session resumption",
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 impl Default for TlsPolicy {
@@ -295,254 +330,135 @@ impl Default for TlsPolicy {
     }
 }
 
-/// Tachyon's default `CryptoProvider`, computed once and shared — see [`TlsPolicy::new`].
-#[cfg(not(feature = "fips"))]
-fn default_provider() -> Arc<CryptoProvider> {
-    static DEFAULT_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
-    DEFAULT_PROVIDER
-        .get_or_init(|| {
-            let kx_groups = vec![
-                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
-                rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
-                rustls::crypto::aws_lc_rs::kx_group::MLKEM1024,
-                rustls::crypto::aws_lc_rs::kx_group::MLKEM768,
-                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
-                rustls::crypto::aws_lc_rs::kx_group::X25519,
-                rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
-            ];
-
-            // TLS 1.2 suites only under `tls12-legacy` — see `default_versions`.
-            let cipher_suites = vec![
-                // TLS 1.3
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256,
-                // TLS 1.2
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            ];
-
-            Arc::new(CryptoProvider {
-                cipher_suites,
-                kx_groups,
-                ..rustls::crypto::aws_lc_rs::default_provider()
-            })
-        })
-        .clone()
-}
-
-/// Tachyon's FIPS approved-mode `CryptoProvider`, computed once and shared — see
-/// [`TlsPolicy::fips`].
-#[cfg(all(feature = "fips", not(feature = "cnsa")))]
-fn fips_provider() -> Arc<CryptoProvider> {
-    static FIPS_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
-    FIPS_PROVIDER
-        .get_or_init(|| {
-            // No standalone ML-KEM: see `TlsPolicy::fips`.
-            let kx_groups = vec![
-                rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
-                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
-                rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
-            ];
-
-            let cipher_suites = vec![
-                // TLS 1.3
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
-                // TLS 1.2 — only under `tls12-legacy`, see `default_versions`.
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                #[cfg(feature = "tls12-legacy")]
-                rustls::crypto::aws_lc_rs::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            ];
-
-            Arc::new(CryptoProvider {
-                cipher_suites,
-                kx_groups,
-                ..rustls::crypto::aws_lc_rs::default_provider()
-            })
-        })
-        .clone()
-}
-
-#[cfg(feature = "cnsa")]
-fn cnsa_provider() -> Arc<CryptoProvider> {
-    static CNSA_PROVIDER: std::sync::OnceLock<Arc<CryptoProvider>> = std::sync::OnceLock::new();
-    CNSA_PROVIDER
-        .get_or_init(|| {
-            Arc::new(CryptoProvider {
-                cipher_suites: vec![
-                    rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_256_GCM_SHA384,
-                ],
-                kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM1024],
-                ..rustls::crypto::aws_lc_rs::default_provider()
-            })
-        })
-        .clone()
+/// `items` in order, each first occurrence only.
+fn unique<T: Copy + PartialEq>(items: &[T]) -> Vec<T> {
+    let mut out = Vec::with_capacity(items.len());
+    for &item in items {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TlsPolicy;
+    use super::{Cipher, KeyExchange, TlsPolicy};
 
-    /// Without `tls12-legacy`, no policy this type can build may offer TLS 1.2 — not the
-    /// version, and not a 1.2 cipher suite to downgrade onto.
-    ///
-    /// Deliberately asserted on the *values*, not on `cfg(feature = "tls12")`: Cargo unifies
-    /// features, and `tor` enables `rustls/tls12` for arti's relay link layer. This test is
-    /// what proves that unification does not leak back into what the listeners offer, so it
-    /// must keep passing in a build where `rustls::version::TLS12` exists.
-    #[cfg(all(not(feature = "cnsa"), not(feature = "tls12-legacy")))]
+    fn config(policy: &TlsPolicy) -> std::sync::Arc<rustls::ServerConfig> {
+        let config = policy
+            .config_builder()
+            .expect("every policy builds")
+            .with_cert_resolver(std::sync::Arc::new(
+                rustls::server::ResolvesServerCertUsingSni::new(),
+            ));
+        policy.finalize(config)
+    }
+
+    fn shuffled<T: Copy>(items: &[T]) -> Vec<T> {
+        let mut items = items.to_vec();
+        rand::seq::SliceRandom::shuffle(items.as_mut_slice(), &mut rand::rng());
+        items
+    }
+
+    /// The config carries exactly the chosen groups and ciphers, in the chosen order, and
+    /// ciphers are picked in the server's order.
+    #[test]
+    fn a_policy_keeps_its_order_and_drops_repeats() {
+        let groups = shuffled(KeyExchange::ALL);
+        let ciphers = shuffled(Cipher::ALL);
+        let policy = TlsPolicy {
+            key_exchange: super::unique(&[groups.as_slice(), &groups].concat()),
+            ciphers: super::unique(&[ciphers.as_slice(), &ciphers].concat()),
+            ..TlsPolicy::new()
+        };
+
+        let config = config(&policy);
+        let provider = config.crypto_provider();
+        let names: Vec<_> = provider.kx_groups.iter().map(|g| g.name()).collect();
+        let expected: Vec<_> = groups.iter().map(|g| g.group().name()).collect();
+        assert_eq!(names, expected);
+        let suites: Vec<_> = provider
+            .cipher_suites
+            .iter()
+            .filter(|s| s.version() == &rustls::version::TLS13)
+            .map(rustls::SupportedCipherSuite::suite)
+            .collect();
+        let expected: Vec<_> = ciphers.iter().map(|c| c.tls13().suite()).collect();
+        assert_eq!(suites, expected);
+        assert!(config.ignore_client_order);
+    }
+
+    /// Without `tls12-legacy` no policy offers TLS 1.2 — not the version, and not a suite to
+    /// downgrade onto. Asserted on values: `tor` enables `rustls/tls12` through Cargo feature
+    /// unification, and this proves that doesn't leak into what listeners offer.
+    #[cfg(not(feature = "tls12-legacy"))]
     #[test]
     fn no_policy_offers_tls12_without_the_tls12_legacy_feature() {
-        let policies = [TlsPolicy::new(), TlsPolicy::new().tls13_only()];
-        for policy in policies {
-            assert_eq!(policy.versions(), &[&rustls::version::TLS13]);
-            for suite in &policy.provider().cipher_suites {
-                assert_eq!(
-                    suite.version().version,
-                    rustls::ProtocolVersion::TLSv1_3,
-                    "a non-TLS-1.3 cipher suite survived into a build without \
-                     `tls12-legacy`: {suite:?}"
-                );
+        let policy = TlsPolicy::new();
+        assert_eq!(policy.versions, [&rustls::version::TLS13]);
+        for suite in &policy.provider().cipher_suites {
+            assert_eq!(suite.version().version, rustls::ProtocolVersion::TLSv1_3);
+        }
+    }
+
+    #[cfg(feature = "tls12-legacy")]
+    #[test]
+    fn tls13_only_drops_the_tls12_version_and_suites() {
+        assert_eq!(TlsPolicy::new().versions.len(), 2);
+        let policy = TlsPolicy::new().tls13_only();
+        assert_eq!(policy.versions, [&rustls::version::TLS13]);
+        for suite in &policy.provider().cipher_suites {
+            assert_eq!(suite.version().version, rustls::ProtocolVersion::TLSv1_3);
+        }
+    }
+
+    /// Every policy a `fips` build can express is approved by rustls's own predicate — the
+    /// check that used to run at start-up, now proven for the whole type.
+    #[cfg(feature = "fips")]
+    #[test]
+    fn every_expressible_policy_is_fips_approved() {
+        let mut policy = TlsPolicy::new();
+        assert!(config(&policy).fips());
+        policy.key_exchange = shuffled(KeyExchange::ALL);
+        policy.ciphers = shuffled(Cipher::ALL);
+        assert!(config(&policy).fips());
+        for &group in KeyExchange::ALL {
+            for &cipher in Cipher::ALL {
+                assert!(config(&TlsPolicy::new().key_exchange([group]).ciphers([cipher])).fips());
             }
         }
     }
 
-    #[cfg(all(not(feature = "cnsa"), feature = "tls12-legacy"))]
-    #[test]
-    fn new_offers_both_tls_versions_under_tls12_legacy() {
-        let policy = TlsPolicy::new();
-        assert_eq!(
-            policy.versions(),
-            &[&rustls::version::TLS13, &rustls::version::TLS12]
-        );
-    }
-
-    #[test]
-    fn tls13_only_restricts_to_a_single_version() {
-        let policy = TlsPolicy::new().tls13_only();
-        assert_eq!(policy.versions(), &[&rustls::version::TLS13]);
-    }
-
-    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
-    #[test]
-    fn new_is_fips_by_default_under_the_fips_feature() {
-        assert_eq!(
-            TlsPolicy::new().provider().cipher_suites,
-            TlsPolicy::fips().provider().cipher_suites
-        );
-    }
-
-    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
-    #[test]
-    fn fips_offers_only_aes_256_cipher_suites() {
-        let provider = TlsPolicy::fips().provider();
-        for suite in &provider.cipher_suites {
-            let name = format!("{suite:?}");
-            assert!(
-                name.contains("AES_256"),
-                "non-AES-256 cipher suite offered under fips: {name}"
-            );
-            assert!(
-                !name.contains("CHACHA20") && !name.contains("AES_128"),
-                "non-compliant cipher suite offered under fips: {name}"
-            );
-        }
-    }
-
-    #[cfg(all(feature = "fips", not(feature = "cnsa")))]
-    #[test]
-    fn fips_offers_only_secp_and_hybrid_mlkem_kx_groups() {
-        let provider = TlsPolicy::fips().provider();
-        for group in &provider.kx_groups {
-            let name = format!("{:?}", group.name()).to_ascii_uppercase();
-            assert!(
-                !name.contains("X25519"),
-                "X25519 is not FIPS-140-3-approved for key agreement, but was offered: {name}"
-            );
-            assert!(
-                name == "SECP256R1MLKEM768" || !name.contains("MLKEM"),
-                "standalone ML-KEM isn't a sanctioned SP 800-56C hybrid, but was offered: {name}"
-            );
-        }
-    }
-
-    #[cfg(all(not(feature = "cnsa"), feature = "tls12-legacy"))]
-    #[test]
-    fn debug_format_reports_negotiated_versions() {
-        let both = format!("{:?}", TlsPolicy::new());
-        assert!(both.contains("tls13: true"));
-        assert!(both.contains("tls12: true"));
-
-        let tls13_only = format!("{:?}", TlsPolicy::new().tls13_only());
-        assert!(tls13_only.contains("tls13: true"));
-        assert!(tls13_only.contains("tls12: false"));
-    }
-
-    #[cfg(not(feature = "tls12-legacy"))]
-    #[test]
-    fn debug_format_says_tls12_is_unavailable() {
-        let rendered = format!("{:?}", TlsPolicy::new());
-        assert!(rendered.contains("tls13: true"));
-        assert!(rendered.contains("tls12-legacy"), "got {rendered}");
-    }
-
-    /// Idempotent by design (rustls's process-wide default can only be installed once) — this
-    /// just proves calling it repeatedly, including after another policy already raced to
-    /// install first, never panics.
-    #[test]
-    fn install_as_process_default_is_idempotent() {
-        TlsPolicy::new().install_as_process_default();
-        TlsPolicy::new().tls13_only().install_as_process_default();
-    }
-
     #[cfg(feature = "cnsa")]
     #[test]
-    fn cnsa_is_narrow_and_disables_resumption() {
-        let policy = TlsPolicy::new().disable_resumption(false);
-        assert_eq!(policy.versions(), &[&rustls::version::TLS13]);
-        assert_eq!(policy.provider().cipher_suites.len(), 1);
+    fn cnsa_is_one_fixed_profile() {
+        let config = config(&TlsPolicy::new());
+        let provider = config.crypto_provider();
         assert_eq!(
-            policy
-                .provider()
+            provider
                 .cipher_suites
-                .first()
-                .map(rustls::SupportedCipherSuite::suite),
-            Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384)
+                .iter()
+                .map(rustls::SupportedCipherSuite::suite)
+                .collect::<Vec<_>>(),
+            [rustls::CipherSuite::TLS13_AES_256_GCM_SHA384]
         );
-        assert_eq!(policy.provider().kx_groups.len(), 1);
         assert_eq!(
-            policy
-                .provider()
+            provider
                 .kx_groups
-                .first()
-                .map(|group| group.name()),
-            Some(rustls::NamedGroup::MLKEM1024)
+                .iter()
+                .map(|g| g.name())
+                .collect::<Vec<_>>(),
+            [rustls::NamedGroup::MLKEM1024]
         );
-        assert!(policy.disable_resumption);
+        assert_eq!(config.max_early_data_size, 0);
+        assert!(!config.session_storage.can_cache());
     }
 
+    #[cfg(not(feature = "cnsa"))]
     #[test]
     fn resumption_lockdown_disables_every_resumption_path() {
-        let config = TlsPolicy::new()
-            .disable_resumption(true)
-            .config_builder()
-            .expect("builder")
-            .with_cert_resolver(std::sync::Arc::new(
-                rustls::server::ResolvesServerCertUsingSni::new(),
-            ));
-        let config = TlsPolicy::new().disable_resumption(true).finalize(config);
-
+        let config = config(&TlsPolicy::new().disable_resumption(true));
         assert_eq!(config.max_early_data_size, 0);
         assert_eq!(config.send_tls13_tickets, 0);
         assert_eq!(config.max_tls13_tickets, 0);

@@ -20,7 +20,9 @@
 //!   exposing it to hostile input.
 //!
 //! Add one with [`Server::i2p`](crate::Server::i2p). The eepsite's address appears in
-//! [`ServerInfo`](crate::ServerInfo) as soon as its destination is created.
+//! [`ServerInfo`](crate::ServerInfo) as soon as its destination is created, as
+//! [`Reachability::Unconfirmed`](crate::Reachability::Unconfirmed): libi2pd publishes the
+//! `LeaseSet` in the background and reports no signal when peers can reach it.
 //!
 //! # FIPS
 //!
@@ -34,14 +36,21 @@
 //!
 //! ```rust,no_run
 //! use axum::{Router, routing::get};
-//! use tachyon_web::Server;
+//! use tachyon_web::{Network, Server, ServerInfo};
 //! use tachyon_web::server::i2p::I2pConfig;
 //!
+//! async fn address(info: ServerInfo) -> String {
+//!     info.endpoints()
+//!         .into_iter()
+//!         .find(|e| e.network == Network::I2p)
+//!         .map(|e| e.url())
+//!         .unwrap_or_default()
+//! }
+//!
 //! # async fn run() -> Result<(), tachyon_web::Error> {
-//! let app = Router::new().route("/", get(|| async { "Hello from an eepsite!" }));
+//! let app = Router::new().route("/", get(address));
 //! Server::new(app)
 //!     .i2p(I2pConfig::new("my-eepsite").data_dir("/var/lib/tachyon/i2p"))
-//!     .on_ready(|endpoint| println!("reachable at {}", endpoint.url()))
 //!     .serve()
 //!     .await
 //! # }

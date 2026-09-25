@@ -1,7 +1,7 @@
 //! The few DER/PEM operations the certificate layer needs, without a general X.509 stack.
 //!
-//! Only certificates this process generated, loaded from its own store, or received from its
-//! own ACME order pass through here. X.509 is always definite-length DER, so only short- and
+//! Caller-provided certificates pass through here too, but only after `webpki` has parsed them,
+//! and every read is bounds-checked. X.509 is always definite-length DER, so only short- and
 //! long-form lengths are handled.
 
 use std::num::Wrapping;

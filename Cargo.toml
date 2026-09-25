@@ -71,15 +71,12 @@ tower-http = { version = "0.7", default-features = false, features = ["fs"] }
 
 [features]
 default = ["http1", "http2", "tracing"]
-
 http1 = ["hyper/http1", "hyper-util/http1"]
 http2 = ["hyper/http2", "hyper-util/http2"]
-# Transport-layer `tracing` events. Nothing is emitted unless the app installs a subscriber.
+http3 = ["dep:tachyon-quic", "tls"]
 tracing = ["dep:tracing"]
-
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rcgen", "dep:webpki"]
 tls12-legacy = ["tls", "rustls?/tls12", "tokio-rustls?/tls12", "hyper-rustls?/tls12"]
-http3 = ["dep:tachyon-quic", "tls"]
 acme = [
     "tls", "dep:instant-acme", "dep:serde_json", "dep:hyper-rustls", "hyper-util/client-legacy",
 ]
@@ -88,7 +85,6 @@ fips = [
     "tachyon-i2p?/fips", "tachyon-quic?/fips",
 ]
 cnsa = ["fips"]
-
 tor = [
     "dep:arti-client", "dep:tor-hsservice", "dep:tor-proto", "dep:tor-cell",
     "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",

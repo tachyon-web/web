@@ -11,7 +11,7 @@
 use axum::Router;
 use axum::routing::get;
 use tachyon_web::server::tor::OnionConfig;
-use tachyon_web::{Network, Server, ServerInfo};
+use tachyon_web::{Network, Reachability, Server, ServerInfo};
 
 /// Publishes an onion service, fetches a page from it through a second Tor client, and checks
 /// the handler saw its own `.onion` address in `ServerInfo`.
@@ -34,21 +34,17 @@ async fn onion_service_round_trip_over_a_real_tor_circuit() {
     let serving = TorClient::create_bootstrapped(TorClientConfig::default())
         .await
         .expect("bootstrap serving TorClient");
-    let (host_tx, host_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut host_rx = host_rx;
-    let server = Server::new(app)
-        .onion(
-            OnionConfig::new(format!("tachyon-test-{:x}", rand::random::<u32>())).client(serving),
-        )
-        .on_ready(move |endpoint| {
-            let _ = host_tx.send(endpoint.host.clone());
-        });
+    let server = Server::new(app).onion(
+        OnionConfig::new(format!("tachyon-test-{:x}", rand::random::<u32>())).client(serving),
+    );
+    let info = server.info();
     let server_task = tokio::spawn(server.serve().into_future());
 
-    let onion_host = tokio::time::timeout(std::time::Duration::from_mins(3), host_rx.recv())
-        .await
-        .expect("onion service became reachable within 180s")
-        .expect("on_ready fired");
+    let onion_host = crate::common::endpoint_where(&info, std::time::Duration::from_mins(3), |e| {
+        e.network == Network::Tor && e.reachability == Reachability::Reachable
+    })
+    .await
+    .host;
 
     let fetching = TorClient::create_bootstrapped(TorClientConfig::default())
         .await

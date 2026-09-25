@@ -52,6 +52,14 @@ async fn contradictory_configurations_fail_before_binding() {
             .serve()
             .await
     ));
+    let host = format!("{:x}.example", rand::random::<u64>());
+    assert!(config_error(
+        Server::new(Router::new())
+            .security(SecurityPolicy::new().allowed_hosts([format!("https://{host}")]))
+            .http("127.0.0.1:0")
+            .serve()
+            .await
+    ));
     #[cfg(feature = "tls")]
     {
         use crate::tls::{KeyAlgorithm, Tls};
