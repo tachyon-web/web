@@ -4,51 +4,19 @@
 //! defaults/toggles and its keys-file path resolution are pure and tested there without
 //! needing any network access.
 //!
-//! This file covers one full round-trip test that actually starts the vendored `libi2pd`
-//! router, publishes an eepsite, and fetches a page from it over a real I2P stream (via a
-//! second, transient destination sharing the same router — only one [`I2pRouter`] may run per
-//! process, see [`Server::serve_i2p_config_with_router`]). It's marked `#[ignore]` since it
-//! needs I2P network egress and real tunnels have to be built, which commonly takes a few
-//! minutes; run it explicitly with:
+//! This file covers one full round-trip test that starts the vendored `libi2pd` router,
+//! publishes an eepsite, and fetches a page from it over a real I2P stream (via a second,
+//! transient destination sharing the same router — only one [`I2pRouter`] may run per
+//! process). It's marked `#[ignore]` since it needs I2P network egress and real tunnels take
+//! minutes to build; run it explicitly with:
 //!
 //! ```sh
 //! cargo test --features i2p --test it -- --ignored
 //! ```
 
+use axum::Router;
 use tachyon_i2p::I2pRouter;
-use tachyon_web::Router;
 use tachyon_web::server::i2p::I2pConfig;
-
-#[test]
-fn i2p_config_defaults_are_plaintext_no_on_ready() {
-    let config = I2pConfig::new("my-nickname");
-    assert_eq!(config.nickname(), "my-nickname");
-    assert!(!config.tls_enabled());
-}
-
-#[cfg(feature = "cert-gen")]
-#[test]
-fn i2p_config_self_signed_tls_enables_https() {
-    let config = I2pConfig::new("my-nickname").self_signed_tls();
-    assert!(config.tls_enabled());
-}
-
-#[cfg(feature = "cert-gen")]
-#[test]
-fn i2p_config_no_tls_disables_https_again() {
-    let config = I2pConfig::new("my-nickname").self_signed_tls().no_tls();
-    assert!(!config.tls_enabled());
-}
-
-#[cfg(feature = "cert-gen")]
-#[test]
-fn i2p_config_builder_methods_chain_in_any_order() {
-    let config = I2pConfig::new("chained")
-        .data_dir("/tmp/tachyon-i2p-test-data")
-        .self_signed_tls();
-    assert_eq!(config.nickname(), "chained");
-    assert!(config.tls_enabled());
-}
 
 /// Publishes a real eepsite serving a tiny [`Router`], connects to it from a second, transient
 /// destination sharing the same [`I2pRouter`], and asserts the HTTP response round-trips
@@ -60,8 +28,9 @@ fn i2p_config_builder_methods_chain_in_any_order() {
 #[tokio::test]
 #[ignore = "needs live I2P network egress; run explicitly with `-- --ignored`"]
 async fn eepsite_round_trip_over_a_real_i2p_stream() {
+    use axum::routing::get;
     use std::time::Duration;
-    use tachyon_web::{Server, routing::get};
+    use tachyon_web::Server;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn hello() -> &'static str {
@@ -74,26 +43,17 @@ async fn eepsite_round_trip_over_a_real_i2p_stream() {
         .await
         .expect("start I2pRouter");
 
-    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel::<String>();
-    let mut addr_tx = Some(addr_tx);
-
+    let (addr_tx, mut addr_rx) = tokio::sync::mpsc::unbounded_channel();
     let keys_dir = tempfile::tempdir().expect("create temp dir");
     let config = I2pConfig::new("tachyon-web-test-eepsite")
         .data_dir(keys_dir.path())
-        .on_ready(move |addr| {
-            if let Some(tx) = addr_tx.take() {
-                let _ = tx.send(addr.to_string());
-            }
-        });
-
-    let serve_router = router.clone();
-    let server_task = tokio::spawn(async move {
-        Server::new(app)
-            .serve_i2p_config_with_router(&serve_router, config)
-            .await
+        .router(router.clone());
+    let server = Server::new(app).i2p(config).on_ready(move |endpoint| {
+        let _ = addr_tx.send(endpoint.host.clone());
     });
+    let server_task = tokio::spawn(server.serve().into_future());
 
-    let eepsite_host = tokio::time::timeout(Duration::from_mins(3), addr_rx)
+    let eepsite_host = tokio::time::timeout(Duration::from_mins(3), addr_rx.recv())
         .await
         .expect("eepsite became reachable within 180s")
         .expect("on_ready callback fired");

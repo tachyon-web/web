@@ -69,8 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
     println!("listening on http://{addr}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tachyon_web::Server::new(app).serve_http(listener).await?;
+    tachyon_web::Server::new(app)
+        .http(addr)
+        .serve()
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
 
     Ok(())
 }

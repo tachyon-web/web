@@ -1,161 +1,92 @@
-//! `Server::serve_i2p*` entry points and per-stream dispatch.
+//! Publishing an eepsite and dispatching its streams.
+
+use std::sync::Arc;
+
+use tachyon_i2p::I2pRouter;
 
 use super::I2pConfig;
-use super::config::validate_nickname;
-use crate::server::Server;
 use crate::server::accept::ConnectionLimit;
-#[cfg(feature = "tls")]
-use crate::server::anon_tls::AnonTls;
 use crate::server::conn::serve_connection;
 use crate::server::http::hyper_handler;
-use std::sync::Arc;
-use tachyon_i2p::I2pRouter;
+use crate::server::shared::{Origin, Shared};
+use crate::server::stall::WriteDeadline;
+use crate::{Endpoint, Error, Network};
+
 #[cfg(feature = "tls")]
-use tokio_rustls::TlsAcceptor;
+type Acceptor = tokio_rustls::TlsAcceptor;
+/// Uninhabited: without `tls` there is never an acceptor.
+#[cfg(not(feature = "tls"))]
+#[derive(Clone)]
+enum Acceptor {}
 
-impl Server {
-    /// Publishes this router as an I2P eepsite and serves requests arriving over it, blocking
-    /// indefinitely — the accept loop retries forever on error and has no graceful-stop
-    /// mechanism today; abort the surrounding task (e.g. via `JoinHandle::abort`) to end it.
-    ///
-    /// Starts a fresh [`I2pRouter`] and a persistent destination under
-    /// `./.tachyon-i2p/<nickname>.keys` — plaintext only, no other configuration. For a custom
-    /// data directory, TLS, or an `on_ready` hook, use [`serve_i2p_config`](Self::serve_i2p_config)
-    /// instead.
-    ///
-    /// **See the [module docs](crate::server::i2p) for why this feature does not honor
-    /// `tachyon-web`'s `forbid(unsafe_code)` guarantee.**
-    ///
-    /// # Errors
-    /// Returns an error if the I2P router fails to start (most commonly:
-    /// [`tachyon_i2p::I2pError::AlreadyRunning`] if another [`I2pRouter`] is already running in
-    /// this process — only one may exist per process) or the destination fails to load/create.
-    pub async fn serve_i2p(
-        self,
-        nickname: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.serve_i2p_config(I2pConfig::new(nickname)).await
-    }
+/// Publishes `config`'s eepsite and serves it until the future is dropped.
+pub(crate) async fn serve(shared: Arc<Shared>, config: I2pConfig) -> Result<(), Error> {
+    let router = match &config.router {
+        Some(router) => router.clone(),
+        None => I2pRouter::start(config.nickname.clone())
+            .await
+            .map_err(Error::transport)?,
+    };
+    let mut destination = router
+        .destination_from_keys_file(
+            config.keys_path(),
+            true,
+            config.sig_type,
+            &config.encryption_types,
+        )
+        .await
+        .map_err(Error::transport)?;
+    let host = destination.b32_address().to_string();
+    shared.allow_host(&host);
 
-    /// Publishes this router as an I2P eepsite according to `config`, starting a fresh
-    /// [`I2pRouter`], and serves requests arriving over it, blocking indefinitely — the accept
-    /// loop retries forever on error and has no graceful-stop mechanism today; abort the
-    /// surrounding task (e.g. via `JoinHandle::abort`) to end it.
-    ///
-    /// **See the [module docs](crate::server::i2p) for why this feature does not honor
-    /// `tachyon-web`'s `forbid(unsafe_code)` guarantee.**
-    ///
-    /// # Errors
-    /// Returns an error if the I2P router fails to start (most commonly:
-    /// [`tachyon_i2p::I2pError::AlreadyRunning`] if another [`I2pRouter`] is already running in
-    /// this process — only one may exist per process; use
-    /// [`serve_i2p_config_with_router`](Self::serve_i2p_config_with_router) to reuse one instead),
-    /// the destination fails to load/create, or (when TLS is enabled) the TLS configuration is
-    /// invalid.
-    pub async fn serve_i2p_config(
-        self,
-        config: I2pConfig,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        validate_nickname(&config.nickname)?;
-        let router = I2pRouter::start(config.nickname.clone()).await?;
-        self.serve_i2p_config_with_router(&router, config).await
-    }
-
-    /// Publishes this router as an I2P eepsite according to `config`, using an already-started
-    /// [`I2pRouter`] (only one may run per process — this is how a second eepsite, or a second
-    /// destination used purely as an outbound client, shares the same router instead of hitting
-    /// [`tachyon_i2p::I2pError::AlreadyRunning`]), and serves requests arriving over it, blocking
-    /// indefinitely — the accept loop retries forever on error and has no graceful-stop
-    /// mechanism today; abort the surrounding task (e.g. via `JoinHandle::abort`) to end it.
-    ///
-    /// **See the [module docs](crate::server::i2p) for why this feature does not honor
-    /// `tachyon-web`'s `forbid(unsafe_code)` guarantee.**
-    ///
-    /// TLS, when enabled, uses this server's TLS policy.
-    ///
-    /// # Errors
-    /// Returns an error if `nickname` contains path separators or `..` (it's used verbatim to
-    /// build the destination keys file path, as `<data_dir>/<nickname>.keys`), the destination
-    /// fails to load/create, or (when TLS is enabled) the TLS configuration is invalid.
-    pub async fn serve_i2p_config_with_router(
-        self,
-        router: &I2pRouter,
-        config: I2pConfig,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        crate::server::enforce_fips_compliance()?;
-        #[cfg(all(feature = "tls", feature = "fips"))]
-        if let AnonTls::Custom(server_config) = &config.tls {
-            #[cfg(feature = "cnsa")]
-            {
-                let _ = server_config;
-                return Err("CNSA mode rejects caller-supplied I2P TLS configurations".into());
+    #[cfg(feature = "tls")]
+    let acceptor: Option<Acceptor> = match &config.tls {
+        Some(tls) => {
+            let url = format!("https://{host}");
+            let names: Vec<String> = std::iter::once(host.clone())
+                .chain(tls.domains.iter().cloned())
+                .collect();
+            let built = crate::tls::certs::build(
+                tls,
+                &shared.tls_policy,
+                &names,
+                &url,
+                crate::server::alpn(false),
+            )?;
+            if let Some(store) = built.store {
+                shared.info.add_certificates(store);
             }
-            #[cfg(not(feature = "cnsa"))]
-            crate::server::assert_fips_server_config(server_config)?;
+            Some(tokio_rustls::TlsAcceptor::from(built.config))
         }
-        validate_nickname(&config.nickname)?;
+        None => None,
+    };
+    #[cfg(not(feature = "tls"))]
+    let acceptor: Option<Acceptor> = None;
 
-        let keys_path = config.keys_path();
-        let is_public = true;
-        let mut destination = router
-            .destination_from_keys_file(
-                keys_path,
-                is_public,
-                config.sig_type,
-                &config.encryption_types,
-            )
-            .await?;
+    let tls = acceptor.is_some();
+    shared.info.publish(Endpoint {
+        network: Network::I2p,
+        host,
+        port: if tls { 443 } else { 80 },
+        tls,
+        http3: false,
+    });
 
-        let address = destination.b32_address().to_string();
-        crate::telemetry_info!("[i2p] eepsite published at {address}");
-        if let Some(on_ready) = config.on_ready {
-            on_ready(&address);
-        }
-
-        // Without the `tls` feature `config.tls` can only ever be `AnonTls::None` (the only
-        // variant that exists in that build), so there is no acceptor to build and the loop
-        // below is unconditionally plaintext.
-        #[cfg(feature = "tls")]
-        let tls_acceptor = match &config.tls {
-            AnonTls::None => None,
-            #[cfg(feature = "cert-gen")]
-            AnonTls::SelfSigned => {
-                let cert = crate::tls::generate_self_signed_cert(vec![address.clone()])?;
-                let server_config = self
-                    .effective_tls_policy()
-                    .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())?;
-                Some(TlsAcceptor::from(Arc::new(server_config)))
+    loop {
+        let stream = accept_i2p_forever(&mut destination).await;
+        let permit = shared.connections.acquire().await;
+        let shared = shared.clone();
+        let acceptor = acceptor.clone();
+        ConnectionLimit::serve(permit, async move {
+            if let Err(e) = handle_stream(shared, stream, acceptor).await {
+                crate::telemetry_debug!("[i2p] connection error: {e}");
             }
-            AnonTls::Custom(server_config) => Some(TlsAcceptor::from(
-                self.finalize_tls_config((**server_config).clone()),
-            )),
-        };
-
-        let state = Arc::new(self);
-        let limit = state.connection_limit.clone();
-        loop {
-            let stream = accept_i2p_forever(&mut destination).await;
-            let permit = limit.acquire().await;
-            let state = state.clone();
-            #[cfg(feature = "tls")]
-            let tls_acceptor = tls_acceptor.clone();
-            ConnectionLimit::serve(permit, async move {
-                #[cfg(feature = "tls")]
-                let result = handle_i2p_stream(state, stream, tls_acceptor).await;
-                #[cfg(not(feature = "tls"))]
-                let result = handle_i2p_stream_plaintext(state, stream).await;
-                if let Err(e) = result {
-                    crate::telemetry_debug!("[i2p] connection error: {e}");
-                }
-            });
-        }
+        });
     }
 }
 
-/// Accepts the next I2P stream, retrying after recoverable errors.
-///
-/// Mirrors [`crate::server::http::accept_forever`]: a failed accept is logged and retried
-/// after a short back-off rather than ending the eepsite.
+/// Accepts the next I2P stream, retrying after a short back-off: one failed accept must not
+/// end the eepsite.
 async fn accept_i2p_forever(destination: &mut tachyon_i2p::Destination) -> tachyon_i2p::I2pStream {
     loop {
         match destination.accept().await {
@@ -168,54 +99,33 @@ async fn accept_i2p_forever(destination: &mut tachyon_i2p::Destination) -> tachy
     }
 }
 
-/// Handles a single accepted I2P stream when the `tls` feature is off: plaintext HTTP dispatch
-/// only, sharing the same [`serve_connection`] helper (and thus HTTP/1.1-vs-HTTP/2 negotiation
-/// logic) `tor`'s serve module uses.
-#[cfg(not(feature = "tls"))]
-async fn handle_i2p_stream_plaintext(
-    state: Arc<Server>,
+async fn handle_stream(
+    shared: Arc<Shared>,
     stream: tachyon_i2p::I2pStream,
+    acceptor: Option<Acceptor>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let http2 = state.security_policy.allows_h2c();
-    let svc = hyper::service::service_fn(move |req| hyper_handler(state.clone(), req, None, false));
-    serve_connection(stream, svc, http2).await
-}
-
-/// Handles a single accepted I2P stream: TLS (if configured) then HTTP dispatch, sharing the
-/// same [`serve_connection`] helper (and thus HTTP/1.1-vs-HTTP/2 negotiation logic) `tor`'s
-/// serve module uses. Requires the `tls` feature (see [`handle_i2p_stream_plaintext`] for the
-/// non-TLS build).
-#[cfg(feature = "tls")]
-async fn handle_i2p_stream(
-    state: Arc<Server>,
-    stream: tachyon_i2p::I2pStream,
-    tls_acceptor: Option<TlsAcceptor>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match tls_acceptor {
+    let stream = WriteDeadline::new(stream);
+    let handler = shared.clone();
+    match acceptor {
         None => {
-            let http2 = state.security_policy.allows_h2c();
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, None, false)
+                hyper_handler(handler.clone(), req, Origin::plain(None))
             });
-            serve_connection(stream, svc, http2).await
+            let http2 = shared.security.allows_h2c();
+            serve_connection(stream, svc, http2, &shared.shutdown).await
         }
+        #[cfg(feature = "tls")]
         Some(acceptor) => {
-            let handshake_permit = state
-                .tls_handshake_limit
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| "TLS handshake concurrency limit reached")?;
-            let tls_stream = tokio::time::timeout(
-                crate::server::TLS_HANDSHAKE_TIMEOUT,
-                acceptor.accept(stream),
-            )
-            .await
-            .map_err(|_| "TLS handshake timed out")??;
-            drop(handshake_permit);
+            let Some(tls) = crate::server::http::tls_handshake(&shared, &acceptor, stream).await
+            else {
+                return Ok(());
+            };
             let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(state.clone(), req, None, true)
+                hyper_handler(handler.clone(), req, Origin::tls(None))
             });
-            serve_connection(tls_stream, svc, true).await
+            serve_connection(tls, svc, true, &shared.shutdown).await
         }
+        #[cfg(not(feature = "tls"))]
+        Some(never) => match never {},
     }
 }

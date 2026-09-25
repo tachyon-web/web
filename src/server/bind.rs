@@ -1,35 +1,52 @@
-use std::future::Future;
+//! [`Bind`]: where a clearnet listener listens.
 
 use tokio::net::TcpListener;
 
-use super::redirect::RedirectInfo;
-use super::{Server, enforce_fips_compliance};
-
-/// Binds `addr`, then the redirect listener if any, then hands the bound listener to `serve`.
+/// Where a clearnet transport listens: an address to bind when the server starts, or a
+/// listener the caller already bound.
 ///
-/// The primary listener binds first so its failure cannot briefly bring up the redirect one,
-/// and the redirect listener is up before `serve` runs — `serve_all_acme` relies on that to
-/// answer HTTP-01 before its first order.
-pub(super) async fn bind_and_serve<F, Fut>(
-    server: Server,
-    addr: std::net::SocketAddr,
-    redirect: Option<RedirectInfo>,
-    serve: F,
-) -> Result<(), std::io::Error>
-where
-    F: FnOnce(Server, TcpListener) -> Fut,
-    Fut: Future<Output = Result<(), std::io::Error>>,
-{
-    enforce_fips_compliance()?;
-    let listener = TcpListener::bind(addr).await?;
+/// Built implicitly from `&str`/`String` (`"0.0.0.0:443"`, `"localhost:8080"`), a
+/// [`SocketAddr`](std::net::SocketAddr), or a [`TcpListener`].
+#[derive(Debug)]
+pub struct Bind(Inner);
 
-    #[cfg(feature = "cert-gen")]
-    let _redirect_task = match redirect {
-        Some(info) => Some(info.spawn().await?),
-        None => None,
-    };
-    #[cfg(not(feature = "cert-gen"))]
-    let _ = redirect;
+#[derive(Debug)]
+enum Inner {
+    Addr(String),
+    Listener(TcpListener),
+}
 
-    serve(server, listener).await
+impl Bind {
+    pub(crate) async fn listen(self) -> Result<TcpListener, crate::Error> {
+        match self.0 {
+            Inner::Listener(listener) => Ok(listener),
+            Inner::Addr(addr) => TcpListener::bind(&addr)
+                .await
+                .map_err(|source| crate::Error::Bind { addr, source }),
+        }
+    }
+}
+
+impl From<&str> for Bind {
+    fn from(addr: &str) -> Self {
+        Self(Inner::Addr(addr.to_string()))
+    }
+}
+
+impl From<String> for Bind {
+    fn from(addr: String) -> Self {
+        Self(Inner::Addr(addr))
+    }
+}
+
+impl From<std::net::SocketAddr> for Bind {
+    fn from(addr: std::net::SocketAddr) -> Self {
+        Self(Inner::Addr(addr.to_string()))
+    }
+}
+
+impl From<TcpListener> for Bind {
+    fn from(listener: TcpListener) -> Self {
+        Self(Inner::Listener(listener))
+    }
 }

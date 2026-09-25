@@ -34,7 +34,6 @@ const FORWARDED_HEADERS: [&str; 26] = [
     "x-original-url",
     "x-rewrite-url",
 ];
-const ENFORCE_AUTHORITY: u8 = 1;
 const STRIP_UNTRUSTED_FORWARDING: u8 = 2;
 const REJECT_CONNECT: u8 = 4;
 const ALLOW_H2C: u8 = 8;
@@ -113,35 +112,63 @@ impl std::str::FromStr for IpNetwork {
     }
 }
 
+/// Which `Host`/`:authority` values a server answers.
+#[derive(Clone, Debug)]
+pub(crate) enum HostRule {
+    Auto,
+    Any,
+    Only(Arc<[String]>),
+}
+
 /// Security controls applied before a request reaches the Axum router.
+///
+/// # Host allow-list
+///
+/// Answering only the names a deployment owns closes DNS rebinding and `Host`-header
+/// confusion. By default the list is **automatic**: the names a server's certificates are for
+/// (`Tls::domains` and provided certificates' names), the IPs its
+/// listeners are specifically bound to, and each `.onion`/`.b32.i2p` address once published.
+/// A server without certificates for any clearnet name — plain HTTP, say — answers any host;
+/// use [`allowed_hosts`](Self::allowed_hosts) to restrict one. Anything else gets `421`.
 #[derive(Clone, Debug)]
 pub struct SecurityPolicy {
-    allowed_hosts: Arc<[String]>,
+    hosts: HostRule,
     trusted_proxies: Arc<[IpNetwork]>,
     flags: u8,
 }
 
 impl SecurityPolicy {
-    /// Creates the default fail-safe request policy.
+    /// The default fail-safe request policy: automatic host allow-list, forwarding headers
+    /// stripped, `CONNECT` and h2c refused, hardened response headers.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            allowed_hosts: Arc::from([]),
+            hosts: HostRule::Auto,
             trusted_proxies: Arc::from([]),
             flags: STRIP_UNTRUSTED_FORWARDING | REJECT_CONNECT | HARDEN_RESPONSES,
         }
     }
 
-    /// Restricts requests to these case-insensitive DNS names or IP literals. A leading `*.`
-    /// matches exactly one DNS label, mirroring a wildcard certificate SAN.
-    ///
-    /// An empty explicit list rejects every authority. Authority enforcement is disabled only
-    /// when this builder is never called.
+    /// Answers only these case-insensitive DNS names or IP literals, instead of the automatic
+    /// list. A leading `*.` matches exactly one DNS label, like a wildcard certificate SAN.
+    /// Published `.onion`/`.b32.i2p` addresses are still added: they are bound to the service
+    /// by the network itself. An empty list is a configuration error.
     #[must_use]
     pub fn allowed_hosts(mut self, hosts: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.allowed_hosts = hosts.into_iter().map(Into::into).collect::<Vec<_>>().into();
-        self.flags |= ENFORCE_AUTHORITY;
+        self.hosts = HostRule::Only(hosts.into_iter().map(Into::into).collect());
         self
+    }
+
+    /// Answers any `Host`. Only for servers reachable exclusively through a proxy that
+    /// already enforces one.
+    #[must_use]
+    pub fn allow_any_host(mut self) -> Self {
+        self.hosts = HostRule::Any;
+        self
+    }
+
+    pub(crate) const fn host_rule(&self) -> &HostRule {
+        &self.hosts
     }
 
     /// Sets the networks allowed to supply forwarding headers. Tor and I2P peers are never
@@ -199,35 +226,20 @@ impl SecurityPolicy {
         self
     }
 
-    /// Seeds the allow-list from a source the caller derived rather than stated — a
-    /// certificate's SANs, or the ACME `domains` list — leaving an explicitly configured one
-    /// untouched.
-    ///
-    /// An empty `hosts` leaves enforcement *off*. Deriving nothing means the caller learned
-    /// nothing about which names this deployment answers to (a certificate with only IP SANs,
-    /// say), which is not the same statement as [`allowed_hosts`](Self::allowed_hosts) with an
-    /// empty list — and turning it into one would silently `421` every request the server ever
-    /// receives.
-    #[cfg(feature = "cert-gen")]
-    pub(super) fn set_default_allowed_hosts(&mut self, hosts: Arc<[String]>) {
-        if self.flags & ENFORCE_AUTHORITY == 0 && !hosts.is_empty() {
-            self.allowed_hosts = hosts;
-            self.flags |= ENFORCE_AUTHORITY;
-        }
-    }
-
     /// Whether plaintext listeners should speak HTTP/2 at all — see
     /// [`allow_h2c`](Self::allow_h2c).
-    pub(super) const fn allows_h2c(&self) -> bool {
+    pub(crate) const fn allows_h2c(&self) -> bool {
         self.flags & ALLOW_H2C != 0
     }
 
     /// `peer` is `None` for an anonymity transport, which can never be a trusted proxy.
-    pub(super) fn inspect(
+    /// `allowed` is the resolved host allow-list; `None` answers any host.
+    pub(crate) fn inspect(
         &self,
         req: &mut Request<Body>,
         peer: Option<std::net::SocketAddr>,
         secure_transport: bool,
+        allowed: Option<&[String]>,
     ) -> Option<Response<Body>> {
         // Plaintext listeners stop offering HTTP/2 when h2c is off, so this only still fires in
         // an `http2`-only build, which has no HTTP/1.1 to fall back to.
@@ -275,7 +287,9 @@ impl SecurityPolicy {
             return Some(empty_response(StatusCode::METHOD_NOT_ALLOWED));
         }
 
-        if self.flags & ENFORCE_AUTHORITY != 0 && !self.authority_allowed(req) {
+        if let Some(allowed) = allowed
+            && !authority_allowed(req, allowed)
+        {
             return Some(empty_response(StatusCode::MISDIRECTED_REQUEST));
         }
 
@@ -292,37 +306,6 @@ impl SecurityPolicy {
         None
     }
 
-    /// Every authority a handler could read must be allowed — the request target's *and* the
-    /// `Host` header's — and, when both exist, their hosts and effective ports must agree.
-    /// Checking whichever came first let `GET http://allowed/` with `Host: evil` (or two
-    /// conflicting authorities) reach an app that builds links from the other value.
-    fn authority_allowed(&self, req: &Request<Body>) -> bool {
-        // Both spellings go through `bare_host` — see its docs for why that matters.
-        let is_allowed = |authority: &str| {
-            bare_host(authority).is_some_and(|host| {
-                self.allowed_hosts
-                    .iter()
-                    .any(|allowed| host_allowed(allowed, host))
-            })
-        };
-        let target = req
-            .uri()
-            .authority()
-            .map(hyper::http::uri::Authority::as_str);
-        let header = req
-            .headers()
-            .get(hyper::header::HOST)
-            .map(|value| value.to_str().unwrap_or_default());
-        if let (Some(target), Some(header)) = (target, header)
-            && !authorities_match(target, header, req.uri().scheme_str())
-        {
-            return false;
-        }
-        (target.is_some() || header.is_some())
-            && target.is_none_or(is_allowed)
-            && header.is_none_or(is_allowed)
-    }
-
     /// Finalizes a response immediately before its transport encodes it.
     ///
     /// Application values win, but singleton security fields are collapsed to exactly one
@@ -334,7 +317,7 @@ impl SecurityPolicy {
     /// would either be wrong for any app that uses one of the features it denies, or so
     /// permissive it is worth nothing. The same reasoning applies to `Content-Security-Policy`.
     /// Set those in your own middleware; nothing here touches or overwrites them.
-    pub(super) fn finalize_response<B>(&self, response: &mut Response<B>, secure_transport: bool) {
+    pub(crate) fn finalize_response<B>(&self, response: &mut Response<B>, secure_transport: bool) {
         if self.flags & HARDEN_RESPONSES == 0 {
             return;
         }
@@ -364,6 +347,34 @@ impl SecurityPolicy {
         }
         headers.remove(hyper::header::SERVER);
     }
+}
+
+/// Every authority a handler could read must be allowed — the request target's *and* the
+/// `Host` header's — and, when both exist, their hosts and effective ports must agree.
+/// Checking whichever came first let `GET http://allowed/` with `Host: evil` (or two
+/// conflicting authorities) reach an app that builds links from the other value.
+fn authority_allowed(req: &Request<Body>, allowed: &[String]) -> bool {
+    // Both spellings go through `bare_host` — see its docs for why that matters.
+    let is_allowed = |authority: &str| {
+        bare_host(authority)
+            .is_some_and(|host| allowed.iter().any(|entry| host_allowed(entry, host)))
+    };
+    let target = req
+        .uri()
+        .authority()
+        .map(hyper::http::uri::Authority::as_str);
+    let header = req
+        .headers()
+        .get(hyper::header::HOST)
+        .map(|value| value.to_str().unwrap_or_default());
+    if let (Some(target), Some(header)) = (target, header)
+        && !authorities_match(target, header, req.uri().scheme_str())
+    {
+        return false;
+    }
+    (target.is_some() || header.is_some())
+        && target.is_none_or(is_allowed)
+        && header.is_none_or(is_allowed)
 }
 
 /// Compares every part of two authorities that can affect URL construction. Omitting a
@@ -414,7 +425,7 @@ impl Default for SecurityPolicy {
 /// valid spliced into a URL. [`crate::server::redirect`] builds `Location` values from this.
 ///
 /// Returns `None` for any malformed authority, including an invalid port or bracket suffix.
-pub(super) fn authority_host(authority: &str) -> Option<&str> {
+pub(crate) fn authority_host(authority: &str) -> Option<&str> {
     if authority.contains('@') {
         return None;
     }
@@ -447,7 +458,7 @@ pub(super) fn authority_host(authority: &str) -> Option<&str> {
 /// The two spellings both reach [`SecurityPolicy::inspect`] — `Authority::host` keeps the
 /// brackets, a `Host` header never has them — so both must come through here or one address
 /// gets different answers over HTTP/1.1 and HTTP/2.
-pub(super) fn bare_host(authority: &str) -> Option<&str> {
+pub(crate) fn bare_host(authority: &str) -> Option<&str> {
     let host = authority_host(authority)?;
     Some(
         host.strip_prefix('[')
@@ -458,7 +469,7 @@ pub(super) fn bare_host(authority: &str) -> Option<&str> {
 
 /// Matches one normalized host against an allow-list entry. A wildcard follows certificate
 /// rules and covers exactly one label; all other entries are exact and case-insensitive.
-pub(super) fn host_allowed(allowed: &str, host: &str) -> bool {
+pub(crate) fn host_allowed(allowed: &str, host: &str) -> bool {
     let Some(suffix) = allowed.strip_prefix("*.") else {
         return allowed.eq_ignore_ascii_case(host);
     };
@@ -476,7 +487,7 @@ pub(super) fn host_allowed(allowed: &str, host: &str) -> bool {
 
 /// Parses `Content-Length`, accepting repeated or comma-joined values only when every value
 /// is identical, as required by RFC 9110 section 8.6.
-pub(super) fn content_length(headers: &hyper::HeaderMap) -> Result<Option<u64>, ()> {
+pub(crate) fn content_length(headers: &hyper::HeaderMap) -> Result<Option<u64>, ()> {
     let mut parsed = None;
     for value in headers.get_all(hyper::header::CONTENT_LENGTH) {
         let value = value.to_str().map_err(|_| ())?;
@@ -495,7 +506,7 @@ pub(super) fn content_length(headers: &hyper::HeaderMap) -> Result<Option<u64>, 
     Ok(parsed)
 }
 
-pub(super) fn empty_response(status: StatusCode) -> Response<Body> {
+pub(crate) fn empty_response(status: StatusCode) -> Response<Body> {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = status;
     response
@@ -538,43 +549,21 @@ mod tests {
         };
 
         let mut anonymous = request();
-        assert!(policy.inspect(&mut anonymous, None, false).is_none());
+        assert!(policy.inspect(&mut anonymous, None, false, None).is_none());
         assert!(!anonymous.headers().contains_key("x-forwarded-for"));
         assert!(!anonymous.headers().contains_key("x-forwarded-client-cert"));
 
         let mut proxied = request();
         let proxy = Some("0.0.0.0:0".parse().expect("valid peer"));
-        assert!(policy.inspect(&mut proxied, proxy, false).is_none());
+        assert!(policy.inspect(&mut proxied, proxy, false, None).is_none());
         assert!(proxied.headers().contains_key("x-forwarded-for"));
         assert!(proxied.headers().contains_key("x-forwarded-client-cert"));
     }
 
-    /// Deriving no hostnames (a certificate with only IP SANs, say) means "nothing was
-    /// learned", not "deny everything" — the latter would `421` every request forever.
-    #[cfg(feature = "cert-gen")]
-    #[test]
-    fn an_empty_derived_allow_list_leaves_authority_enforcement_off() {
-        let mut policy = SecurityPolicy::new();
-        policy.set_default_allowed_hosts(Arc::from([]));
-        let mut request = Request::builder()
-            .uri("/")
-            .header("host", "anything.example")
-            .body(Body::empty())
-            .expect("valid request");
-        assert!(
-            policy
-                .inspect(
-                    &mut request,
-                    Some("203.0.113.1:1".parse().expect("valid peer")),
-                    false,
-                )
-                .is_none()
-        );
-    }
-
     #[test]
     fn policy_rejects_unknown_authorities_and_strips_spoofed_forwarding() {
-        let policy = SecurityPolicy::new().allowed_hosts(["example.com"]);
+        let policy = SecurityPolicy::new();
+        let hosts = ["example.com".to_string()];
         let mut request = Request::builder()
             .uri("/")
             .header("host", "example.com:443")
@@ -587,6 +576,7 @@ mod tests {
                     &mut request,
                     Some("203.0.113.1:1".parse().expect("valid peer")),
                     false,
+                    Some(&hosts),
                 )
                 .is_none()
         );
@@ -602,21 +592,9 @@ mod tests {
                     &mut request,
                     Some("203.0.113.1:1".parse().expect("valid peer")),
                     false,
+                    Some(&hosts),
                 )
                 .expect("request rejected")
-                .status(),
-            StatusCode::MISDIRECTED_REQUEST
-        );
-
-        let deny_all = SecurityPolicy::new().allowed_hosts(Vec::<String>::new());
-        assert_eq!(
-            deny_all
-                .inspect(
-                    &mut request,
-                    Some("203.0.113.1:1".parse().expect("valid peer")),
-                    true,
-                )
-                .expect("empty allow-list rejects every host")
                 .status(),
             StatusCode::MISDIRECTED_REQUEST
         );
@@ -626,7 +604,8 @@ mod tests {
     /// every spelling present must pass, and a second `Host` is malformed outright.
     #[test]
     fn every_authority_a_handler_could_read_must_be_allowed() {
-        let policy = SecurityPolicy::new().allowed_hosts(["example.com"]);
+        let policy = SecurityPolicy::new();
+        let allowed = ["example.com".to_string()];
         let peer = Some("203.0.113.1:1".parse().expect("valid peer"));
         let inspect = |uri: &str, hosts: &[&str]| {
             let mut builder = Request::builder().uri(uri);
@@ -635,7 +614,7 @@ mod tests {
             }
             let mut request = builder.body(Body::empty()).expect("valid request");
             policy
-                .inspect(&mut request, peer, false)
+                .inspect(&mut request, peer, false, Some(&allowed))
                 .map(|response| response.status())
         };
 
@@ -663,7 +642,7 @@ mod tests {
             Some(StatusCode::BAD_REQUEST)
         );
 
-        let policy = SecurityPolicy::new().allowed_hosts(["a.example", "b.example"]);
+        let hosts = ["a.example".to_string(), "b.example".to_string()];
         let mut conflicting = Request::builder()
             .uri("http://a.example/")
             .header("host", "b.example")
@@ -671,7 +650,7 @@ mod tests {
             .expect("valid request");
         assert_eq!(
             policy
-                .inspect(&mut conflicting, peer, false)
+                .inspect(&mut conflicting, peer, false, Some(&hosts))
                 .expect("conflicting authorities are rejected")
                 .status(),
             StatusCode::MISDIRECTED_REQUEST
@@ -724,7 +703,7 @@ mod tests {
             .expect("valid request");
         assert_eq!(
             policy
-                .inspect(&mut tunnel, peer, true)
+                .inspect(&mut tunnel, peer, true, None)
                 .expect("tunnel rejected")
                 .status(),
             StatusCode::METHOD_NOT_ALLOWED
@@ -736,7 +715,7 @@ mod tests {
             .extension(hyper::ext::Protocol::from_static("websocket"))
             .body(Body::empty())
             .expect("valid request");
-        assert!(policy.inspect(&mut websocket, peer, true).is_none());
+        assert!(policy.inspect(&mut websocket, peer, true, None).is_none());
     }
 
     /// `Authority::host` keeps an IPv6 literal's brackets, a `Host` header does not. Both
@@ -744,21 +723,30 @@ mod tests {
     /// HTTP/1.1 and HTTP/2 differently for one address.
     #[test]
     fn ipv6_literal_matches_whether_it_arrives_as_authority_or_host_header() {
-        let policy = SecurityPolicy::new().allowed_hosts(["::1"]);
+        let policy = SecurityPolicy::new();
+        let hosts = ["::1".to_string()];
         let peer = Some("203.0.113.1:1".parse().expect("valid peer"));
 
         let mut via_authority = Request::builder()
             .uri("http://[::1]:8443/")
             .body(Body::empty())
             .expect("valid request");
-        assert!(policy.inspect(&mut via_authority, peer, false).is_none());
+        assert!(
+            policy
+                .inspect(&mut via_authority, peer, false, Some(&hosts))
+                .is_none()
+        );
 
         let mut via_host = Request::builder()
             .uri("/")
             .header("host", "[::1]:8443")
             .body(Body::empty())
             .expect("valid request");
-        assert!(policy.inspect(&mut via_host, peer, false).is_none());
+        assert!(
+            policy
+                .inspect(&mut via_host, peer, false, Some(&hosts))
+                .is_none()
+        );
 
         let mut wrong = Request::builder()
             .uri("http://[::2]:8443/")
@@ -766,7 +754,7 @@ mod tests {
             .expect("valid request");
         assert_eq!(
             policy
-                .inspect(&mut wrong, peer, false)
+                .inspect(&mut wrong, peer, false, Some(&hosts))
                 .expect("rejected")
                 .status(),
             StatusCode::MISDIRECTED_REQUEST

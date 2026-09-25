@@ -1,15 +1,15 @@
-//! A crypto/TLS policy shared across every listener a [`Server`](crate::server::Server) runs.
+//! A crypto/TLS policy shared across every listener a [`Server`](crate::Server) runs.
 
 use rustls::SupportedProtocolVersion;
 use rustls::crypto::CryptoProvider;
 use std::sync::Arc;
 
 /// A crypto provider + protocol-version policy shared across every listener a
-/// [`Server`](crate::server::Server) runs.
+/// [`Server`](crate::Server) runs.
 ///
-/// Set it once via [`Server::tls_policy`](crate::server::Server::tls_policy) and it covers
-/// clearnet HTTPS (static cert or Let's Encrypt), `.onion` HTTPS termination, and the I2P
-/// eepsite's optional TLS layer, including the self-signed certificates those generate.
+/// Set it once via [`Server::tls_policy`](crate::Server::tls_policy) and it covers every TLS
+/// endpoint the server runs — clearnet HTTPS and HTTP/3, `.onion` and `.b32.i2p` — and the keys
+/// their certificates are loaded with.
 ///
 /// # `tls12-legacy`
 ///
@@ -28,22 +28,19 @@ use std::sync::Arc;
 /// With the `fips` feature, [`new`](Self::new)/[`Default::default`] always build a FIPS 140-3
 /// Level 1 validated software provider in approved mode — AES-256-GCM only; NIST P-curves
 /// plus the `SECP256R1MLKEM768` hybrid, no X25519 and no standalone ML-KEM. `with_provider`
-/// and `Server::crypto_provider` don't compile under `fips`, so no other provider can be
-/// plugged in.
+/// doesn't compile under `fips`, so no other provider can be plugged in.
 ///
 /// # The Tor relay/channel layer is a separate concern
 ///
 /// This policy governs TLS *termination*. arti's outbound TLS to Tor relays instead uses
-/// rustls's *process-wide* default provider; [`install_as_process_default`] sets it, and
-/// `Server::serve_tor`/`serve_onion` call it before bootstrapping.
+/// rustls's *process-wide* default provider; [`install_as_process_default`] sets it, and a
+/// server with an onion endpoint calls it before bootstrapping its own Tor client.
 ///
 /// A PQ-only or single-suite policy is fine for termination but can break Tor bootstrap when
 /// installed process-wide, since many relays don't support hybrid PQ groups yet. Prefer PQ;
 /// don't require it there.
 ///
 /// [`install_as_process_default`]: Self::install_as_process_default
-///
-/// *Tachyon extension: no `axum` equivalent.*
 #[derive(Clone)]
 pub struct TlsPolicy {
     provider: Arc<CryptoProvider>,
@@ -147,8 +144,8 @@ impl TlsPolicy {
     /// Strict CNSA 2.0 TLS profile for controlled, non-browser clients.
     ///
     /// This is TLS 1.3 with `TLS_AES_256_GCM_SHA384`, ML-KEM-1024 as the sole key-exchange
-    /// group, and all session resumption disabled. Certificate constructors in a `cnsa` build
-    /// generate ML-DSA-87 keys. The feature implies `fips`, so AWS-LC also runs in its FIPS
+    /// group, and all session resumption disabled. A `cnsa` build accepts only ML-DSA-87
+    /// certificates, generated or provided. The feature implies `fips`, so AWS-LC also runs in its FIPS
     /// 140-3 Level 1 approved software mode.
     ///
     /// # This is deliberately *not* the `fips` profile
@@ -180,8 +177,9 @@ impl TlsPolicy {
     /// Enables or disables the strict replay lockdown.
     ///
     /// When enabled, server configurations built from this policy reject TLS 0-RTT data and
-    /// disable both stateful session caching and TLS 1.3 session tickets. The default is
-    /// `false` so callers can choose the interoperability/performance tradeoff explicitly.
+    /// disable both stateful session caching and TLS 1.3 session tickets: every reconnect pays a
+    /// full handshake, but there is no replay surface and no cross-connection linkability
+    /// signal — worth it for anonymity endpoints. The default is `false`; `cnsa` forces `true`.
     #[must_use]
     pub const fn disable_resumption(mut self, disable: bool) -> Self {
         #[cfg(feature = "cnsa")]
@@ -197,7 +195,7 @@ impl TlsPolicy {
         }
     }
 
-    pub(crate) fn apply_to_server_config(&self, config: &mut rustls::ServerConfig) {
+    fn apply_to_server_config(&self, config: &mut rustls::ServerConfig) {
         if self.disable_resumption {
             config.max_early_data_size = 0;
             config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
@@ -229,93 +227,65 @@ impl TlsPolicy {
     }
 
     /// The shared prefix of every `rustls::ServerConfig` built from this policy: its provider
-    /// and protocol versions, and no client auth. Finish it with `with_single_cert` or
-    /// `with_cert_resolver`.
+    /// and protocol versions, and no client auth.
     pub(crate) fn config_builder(
         &self,
     ) -> Result<
         rustls::ConfigBuilder<rustls::ServerConfig, rustls::server::WantsServerCert>,
-        std::io::Error,
+        crate::Error,
     > {
         rustls::ServerConfig::builder_with_provider(self.provider())
             .with_protocol_versions(&self.versions)
             .map(rustls::ConfigBuilder::<rustls::ServerConfig, _>::with_no_client_auth)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("TLS version configuration failed: {e}"),
-                )
-            })
+            .map_err(|e| crate::Error::config(format!("TLS version configuration failed: {e}")))
     }
 
-    /// Builds a finished `rustls::ServerConfig` from a PEM cert chain + key: this policy's
-    /// provider, versions and resumption setting, and ALPN for HTTP/1.1 and HTTP/2.
-    ///
-    /// Under `cnsa` it also rejects anything but an ML-DSA-87 identity.
-    ///
-    /// A missing key is `NotFound`; any other malformed input is `InvalidData`/`InvalidInput`.
-    pub(crate) fn server_config_from_pem(
-        &self,
-        cert: &[u8],
-        key: &[u8],
-    ) -> Result<rustls::ServerConfig, std::io::Error> {
-        let cert_chain = crate::tls::pem::certs(cert);
-        let key_der =
-            crate::tls::pem::private_key(key).map_err(|e| crate::tls::pem::key_io_error(&e))?;
-
-        #[cfg(feature = "cnsa")]
-        assert_cnsa_identity(&cert_chain, &key_der)?;
-
-        let mut config = self
-            .config_builder()?
-            .with_single_cert(cert_chain, key_der)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Invalid certificate or key: {e}"),
-                )
-            })?;
-        config.alpn_protocols = crate::server::tls_config::alpn_protocols(false);
+    /// Applies this policy's resumption setting to a finished config and freezes it. Every
+    /// config any listener serves goes through here.
+    pub(crate) fn finalize(&self, mut config: rustls::ServerConfig) -> Arc<rustls::ServerConfig> {
         self.apply_to_server_config(&mut config);
-        Ok(config)
+        Arc::new(config)
     }
 }
 
-/// Rejects anything but an ML-DSA-87 leaf certificate with a matching ML-DSA-87 key.
-#[cfg(feature = "cnsa")]
-fn assert_cnsa_identity(
-    certs: &[rustls::pki_types::CertificateDer<'static>],
-    key: &rustls::pki_types::PrivateKeyDer<'static>,
-) -> Result<(), std::io::Error> {
-    const ML_DSA_87_OID: [u8; 11] = [
-        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13,
-    ];
-    let leaf_is_ml_dsa_87 = certs.first().is_some_and(|cert| {
-        cert.as_ref()
-            .windows(ML_DSA_87_OID.len())
-            .any(|window| window == ML_DSA_87_OID)
-    });
-    if !leaf_is_ml_dsa_87 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "CNSA mode requires an ML-DSA-87 leaf certificate",
+/// Rejects a config that does not itself negotiate FIPS-approved algorithms. `fips()` is
+/// rustls's own predicate: an approved provider *and* `require_ems` (FIPS 140-3 IG D.Q, which
+/// only bites under `tls12-legacy`).
+#[cfg(feature = "fips")]
+pub(crate) fn assert_fips_server_config(config: &rustls::ServerConfig) -> Result<(), crate::Error> {
+    if !config.fips() {
+        return Err(crate::Error::config(
+            "TLS config is not using the FIPS 140-3 Level 1 software module in approved mode \
+             (a non-approved cipher suite or key-exchange group is offered, or TLS 1.2 \
+             extended-master-secret isn't required) — build it via `TlsPolicy` rather than \
+             `rustls::ServerConfig::builder()` directly",
         ));
     }
 
-    let signing_key = TlsPolicy::new()
-        .provider
-        .key_provider
-        .load_private_key(key.clone_key())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    if signing_key
-        .choose_scheme(&[rustls::SignatureScheme::ML_DSA_87])
-        .is_none()
+    #[cfg(feature = "cnsa")]
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "CNSA mode requires an ML-DSA-87 private key",
-        ));
+        let provider = config.crypto_provider();
+        let suites_are_cnsa = provider.cipher_suites.len() == 1
+            && provider.cipher_suites.first().is_some_and(|suite| {
+                suite.suite() == rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
+            });
+        let groups_are_cnsa = provider.kx_groups.len() == 1
+            && provider
+                .kx_groups
+                .first()
+                .is_some_and(|group| group.name() == rustls::NamedGroup::MLKEM1024);
+        let resumption_is_disabled = config.send_tls13_tickets == 0
+            && config.max_tls13_tickets == 0
+            && config.max_early_data_size == 0
+            && !config.session_storage.can_cache();
+        if !suites_are_cnsa || !groups_are_cnsa || !resumption_is_disabled {
+            return Err(crate::Error::config(
+                "TLS config violates the compile-time CNSA profile: require TLS 1.3 \
+                 AES-256-GCM-SHA384, ML-KEM-1024, and disabled session resumption",
+            ));
+        }
     }
+
     Ok(())
 }
 
@@ -562,58 +532,20 @@ mod tests {
         assert!(policy.disable_resumption);
     }
 
-    #[cfg(feature = "cert-gen")]
-    #[test]
-    fn server_config_from_pem_builds_a_working_config_from_a_self_signed_cert() {
-        let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
-            .expect("generate self-signed cert");
-
-        let config = TlsPolicy::new()
-            .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
-            .expect("build server config from valid PEM");
-
-        assert_eq!(
-            config.alpn_protocols,
-            crate::server::tls_config::alpn_protocols(false)
-        );
-    }
-
-    #[cfg(feature = "cert-gen")]
     #[test]
     fn resumption_lockdown_disables_every_resumption_path() {
-        let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
-            .expect("generate self-signed cert");
         let config = TlsPolicy::new()
             .disable_resumption(true)
-            .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
-            .expect("build server config");
+            .config_builder()
+            .expect("builder")
+            .with_cert_resolver(std::sync::Arc::new(
+                rustls::server::ResolvesServerCertUsingSni::new(),
+            ));
+        let config = TlsPolicy::new().disable_resumption(true).finalize(config);
 
         assert_eq!(config.max_early_data_size, 0);
         assert_eq!(config.send_tls13_tickets, 0);
         assert_eq!(config.max_tls13_tickets, 0);
         assert!(!config.session_storage.can_cache());
-    }
-
-    #[cfg(feature = "cert-gen")]
-    #[test]
-    fn server_config_from_pem_rejects_garbage_input() {
-        let err = TlsPolicy::new()
-            .server_config_from_pem(b"not a certificate", b"not a key")
-            .expect_err("garbage PEM must not build a config");
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-    }
-
-    #[cfg(feature = "cert-gen")]
-    #[test]
-    fn server_config_from_pem_rejects_a_key_that_does_not_match_the_cert() {
-        let cert_a = crate::tls::generate_self_signed_cert(vec!["a.example".to_string()])
-            .expect("generate cert a");
-        let cert_b = crate::tls::generate_self_signed_cert(vec!["b.example".to_string()])
-            .expect("generate cert b");
-
-        let err = TlsPolicy::new()
-            .server_config_from_pem(cert_a.cert_pem.as_bytes(), cert_b.key_pem.as_bytes())
-            .expect_err("mismatched cert/key pair must not build a config");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

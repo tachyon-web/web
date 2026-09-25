@@ -1,6 +1,6 @@
 use crate::common::TestServer;
+use axum::Router;
 use std::fs;
-use tachyon_web::Router;
 use tower_http::services::ServeDir;
 
 #[tokio::test]

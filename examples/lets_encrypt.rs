@@ -1,10 +1,10 @@
 //! Production HTTPS with certificates issued and renewed in-process by Let's Encrypt.
 //!
-//! `serve_all_acme` owns the whole certificate lifecycle: it loads a cached certificate if one
-//! is still valid, otherwise places an ACME order, answers the HTTP-01 challenge on the
-//! cleartext listener itself, caches the result, renews 30 days before expiry, and hot-swaps
-//! the new certificate into the running TLS stack without dropping connections. There is no
-//! certbot, no cron job, and no reload signal.
+//! The server owns the whole certificate lifecycle: it loads a cached certificate if one is
+//! still valid, otherwise places an ACME order, answers the HTTP-01 challenge on the redirect
+//! listener itself, caches the result, renews 30 days before expiry, and hot-swaps the new
+//! certificate into the running TLS stack without dropping connections. There is no certbot,
+//! no cron job, and no reload signal.
 //!
 //! # What this needs before it will work
 //!
@@ -14,39 +14,35 @@
 //!   HTTP-01 challenge is answered. Port 443 must be reachable for anyone to use the result.
 //! - **Binding 80 and 443 needs privilege.** Prefer a capability or a socket-activation unit
 //!   over running as root: `sudo setcap 'cap_net_bind_service=+ep' ./target/debug/examples/lets_encrypt`
-//! - **`CACHE_DIR` must persist across restarts and be owner-only.** It holds the account key
-//!   and the certificate's private key; the manager refuses to start if the directory is group-
-//!   or world-accessible, or is not owned by the running user. Losing it means re-registering
-//!   and re-issuing, which is how deployments walk into Let's Encrypt's rate limits.
+//! - **`STORE` must persist across restarts and be owner-only.** It holds the account key and
+//!   the certificate's private key; the server refuses to start if the directory is group- or
+//!   world-accessible, or is not owned by the running user. Losing it means re-registering and
+//!   re-issuing, which is how deployments walk into Let's Encrypt's rate limits.
 //!
 //! # Use staging first
 //!
-//! The `STAGING` flag below points at Let's Encrypt's staging environment: certificates no
-//! browser will trust, but rate limits high enough to iterate against. Production limits are
-//! low enough that a misconfigured retry loop can lock you out of issuance for a week. Get a
-//! successful staging issuance, *then* flip the flag.
+//! `Acme::lets_encrypt_staging()` issues certificates no browser trusts, but with rate limits
+//! high enough to iterate against. Production limits are low enough that a misconfigured retry
+//! loop can lock you out of issuance for a week. Get a successful staging issuance, *then*
+//! switch to `Acme::lets_encrypt()`.
 //!
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example lets_encrypt --features lets-encrypt,telemetry
+//! cargo run --example lets_encrypt --features acme
 //! ```
 //!
-//! `telemetry` is worth enabling here: without it the ACME progress and renewal events are
-//! compiled out, and a failing order is silent.
+//! ACME runs in the background, so progress and failures are reported as `tracing` events —
+//! install a subscriber (as below) or a failing order is silent.
 
 use axum::{Router, routing::get};
-use tachyon_web::Server;
-use tachyon_web::server::SecurityPolicy;
+use tachyon_web::tls::{Acme, Tls};
+use tachyon_web::{Limits, Server};
 
 /// Every name the certificate will cover. All of them must resolve here.
 const DOMAINS: [&str; 2] = ["example.com", "www.example.com"];
-/// Contact address for expiry warnings and CA policy notices.
-const EMAIL: &str = "admin@example.com";
-/// Account key + certificate cache. Must survive restarts and stay owner-only (`0700`).
-const CACHE_DIR: &str = "/var/cache/tachyon/certs";
-/// `true` = staging (untrusted certs, generous limits). Start here.
-const STAGING: bool = true;
+/// Account key + certificate store. Must survive restarts and stay owner-only (`0700`).
+const STORE: &str = "/var/lib/tachyon/tls";
 
 async fn index() -> &'static str {
     "hello over a real certificate\n"
@@ -57,35 +53,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
     let app = Router::new().route("/", get(index));
+    // The domains also become the host allow-list; anything else gets `421`.
+    let tls = Tls::new()
+        .domains(DOMAINS)
+        .store(STORE)
+        .acme(Acme::lets_encrypt_staging().contact("admin@example.com"));
 
-    let server = Server::new(app)
-        // `serve_all_acme` already defaults the host allow-list to `DOMAINS`. Setting it
-        // explicitly is how you serve a *narrower* set than the certificate covers — or, as
-        // here, simply make the intent visible at the call site.
-        .security_policy(SecurityPolicy::new().allowed_hosts(DOMAINS))
-        .max_body_size(2 * 1024 * 1024)
-        .max_connections(4_096)
-        .max_active_requests(512)
-        .max_tls_handshakes(512);
-
-    println!(
-        "requesting certificates for {DOMAINS:?} ({})",
-        if STAGING { "staging" } else { "production" }
-    );
-
-    // Blocks on the HTTPS listener. The port-80 listener and the renewal loop run as spawned
-    // tasks alongside it. Startup waits up to a minute for a first certificate, then binds
-    // anyway — so a slow order delays early connections instead of hanging the process.
-    server
-        .serve_all_acme(
-            "0.0.0.0:443",
-            "0.0.0.0:80",
-            DOMAINS.iter().map(|d| (*d).to_string()).collect(),
-            EMAIL.to_string(),
-            CACHE_DIR,
-            STAGING,
+    Server::new(app)
+        .limits(
+            Limits::default()
+                .max_body_size(2 * 1024 * 1024)
+                .max_connections(4_096)
+                .max_active_requests(512)
+                .max_tls_handshakes(512),
         )
+        .https("0.0.0.0:443", tls)
+        // Answers HTTP-01 challenges, and redirects everything else to HTTPS.
+        .redirect("0.0.0.0:80")
+        .serve()
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
         .await?;
-
     Ok(())
 }

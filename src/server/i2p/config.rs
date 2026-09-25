@@ -1,36 +1,41 @@
-//! [`I2pConfig`]: the builder for
-//! [`Server::serve_i2p_config`](crate::server::Server::serve_i2p_config)/
-//! [`Server::serve_i2p_config_with_router`](crate::server::Server::serve_i2p_config_with_router).
+//! [`I2pConfig`]: how [`Server::i2p`](crate::Server::i2p) publishes the app.
 
-use crate::server::anon_tls::{AnonTls, OnReadyHook};
 use std::path::PathBuf;
-#[cfg(feature = "tls")]
-use std::sync::Arc;
-use tachyon_i2p::{CryptoType, SigType};
+use tachyon_i2p::{CryptoType, I2pRouter, SigType};
 
-/// Configuration for publishing an I2P eepsite via
-/// [`Server::serve_i2p_config`](crate::server::Server::serve_i2p_config).
+use crate::Error;
+
+/// An I2P eepsite publishing the app, added with [`Server::i2p`](crate::Server::i2p).
 ///
-/// See the [module docs](super) for a full example, and — importantly — for the
-/// `forbid(unsafe_code)` disclosure that applies to this whole feature.
+/// Plaintext by default — I2P already encrypts and authenticates the connection to the
+/// `.b32.i2p` address. I2P streaming has no ports, so a destination serves one mode: with
+/// [`tls`](Self::tls) it serves HTTPS only. The same `nickname` and
+/// [`data_dir`](Self::data_dir) keep the same address across restarts.
+///
+/// See the [module docs](super) for the `forbid(unsafe_code)` disclosure that applies to this
+/// whole feature.
 pub struct I2pConfig {
     pub(super) nickname: String,
     pub(super) data_dir: Option<PathBuf>,
     pub(super) sig_type: SigType,
     pub(super) encryption_types: Vec<CryptoType>,
-    pub(super) tls: AnonTls,
-    pub(super) on_ready: Option<OnReadyHook>,
+    pub(super) router: Option<I2pRouter>,
+    #[cfg(feature = "tls")]
+    pub(super) tls: Option<crate::tls::Tls>,
 }
 
 impl std::fmt::Debug for I2pConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("I2pConfig")
+        let mut out = f.debug_struct("I2pConfig");
+        let _ = out
             .field("nickname", &self.nickname)
             .field("data_dir", &self.data_dir)
             .field("sig_type", &self.sig_type)
             .field("encryption_types", &self.encryption_types)
-            .field("tls", &self.tls)
-            .finish_non_exhaustive()
+            .field("router", &self.router.is_some());
+        #[cfg(feature = "tls")]
+        let _ = out.field("tls", &self.tls);
+        out.finish()
     }
 }
 
@@ -39,7 +44,7 @@ impl I2pConfig {
     /// seeds libi2pd's own default data directory name (its router keys/netDb cache, separate
     /// from this eepsite's own persistent destination keys — see [`data_dir`](Self::data_dir)).
     ///
-    /// Defaults: plaintext only, no `on_ready` hook, keys at `./.tachyon-i2p/<nickname>.keys`,
+    /// Defaults: plaintext, keys at `./.tachyon-i2p/<nickname>.keys`,
     /// [`SigType::default`], and libi2pd's automatic encryption set (see
     /// [`crypto_type`](Self::crypto_type)).
     #[must_use]
@@ -49,8 +54,9 @@ impl I2pConfig {
             data_dir: None,
             sig_type: SigType::default(),
             encryption_types: Vec::new(),
-            tls: AnonTls::None,
-            on_ready: None,
+            router: None,
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 
@@ -106,56 +112,30 @@ impl I2pConfig {
         self
     }
 
-    /// Enables TLS using a caller-supplied `rustls::ServerConfig` — e.g. the same one passed to
-    /// [`Server::serve_https_config`](crate::server::Server::serve_https_config). Requires the
-    /// `tls` feature.
+    /// Publishes through an already-started router. Only one may run per process, so this is
+    /// how a second eepsite shares it.
+    #[must_use]
+    pub fn router(mut self, router: I2pRouter) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    /// Serves HTTPS instead of plaintext, with these certificates. Their names always include
+    /// the `.b32.i2p` address.
     #[cfg(feature = "tls")]
     #[must_use]
-    pub fn tls_config(mut self, config: rustls::ServerConfig) -> Self {
-        self.tls = AnonTls::Custom(Arc::new(config));
+    pub fn tls(mut self, tls: crate::tls::Tls) -> Self {
+        self.tls = Some(tls);
         self
     }
 
-    /// Enables TLS using a freshly generated self-signed certificate for the eepsite's
-    /// `.b32.i2p` address, instead of the plaintext default. Requires the `cert-gen` feature.
-    #[cfg(feature = "cert-gen")]
-    #[must_use]
-    pub fn self_signed_tls(mut self) -> Self {
-        self.tls = AnonTls::SelfSigned;
-        self
-    }
-
-    /// Disables TLS (the default) after a prior `tls_config`/`self_signed_tls` call.
-    // `const`-eligible only without `tls`, where `AnonTls` has no drop glue.
-    #[cfg_attr(not(feature = "tls"), allow(clippy::missing_const_for_fn))]
-    #[must_use]
-    pub fn no_tls(mut self) -> Self {
-        self.tls = AnonTls::None;
-        self
-    }
-
-    /// Registers a callback invoked once with the `.b32.i2p` address (no scheme) as soon as the
-    /// destination is created — not necessarily reachable yet — before requests are served.
-    /// This is the only way to observe the address programmatically, since
-    /// [`serve_i2p_config`](crate::server::Server::serve_i2p_config) blocks for the lifetime of
-    /// the service; with the `telemetry` feature the address is also logged at `info` level.
-    #[must_use]
-    pub fn on_ready(mut self, f: impl FnOnce(&str) + Send + 'static) -> Self {
-        self.on_ready = Some(Box::new(f));
-        self
-    }
-
-    /// The nickname this service will be published under.
-    #[must_use]
-    pub fn nickname(&self) -> &str {
-        &self.nickname
-    }
-
-    /// Whether TLS is enabled — `false` (the default) unless `tls_config`/`self_signed_tls`
-    /// was called.
-    #[must_use]
-    pub const fn tls_enabled(&self) -> bool {
-        !matches!(self.tls, AnonTls::None)
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        validate_nickname(&self.nickname)?;
+        #[cfg(feature = "tls")]
+        if let Some(tls) = &self.tls {
+            crate::tls::certs::validate(tls, true)?;
+        }
+        Ok(())
     }
 
     /// The keys-file path this configuration resolves to (`<data_dir>/<nickname>.keys`).
@@ -168,9 +148,7 @@ impl I2pConfig {
 }
 
 /// Rejects nicknames that could escape [`I2pConfig::data_dir`] in `<data_dir>/<nickname>.keys`.
-pub(super) fn validate_nickname(
-    nickname: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn validate_nickname(nickname: &str) -> Result<(), Error> {
     // Both separators by hand on every platform; `components()` covers empty, `.`, `..`, and
     // Windows drive prefixes like `C:`, which `Path::join` treats as absolute.
     let mut components = std::path::Path::new(nickname).components();
@@ -178,7 +156,9 @@ pub(super) fn validate_nickname(
         && matches!(components.next(), Some(std::path::Component::Normal(_)))
         && components.next().is_none();
     if !is_plain_name {
-        return Err(format!("invalid I2P eepsite nickname {nickname:?}").into());
+        return Err(Error::config(format!(
+            "invalid I2P eepsite nickname {nickname:?}"
+        )));
     }
     Ok(())
 }
@@ -188,125 +168,34 @@ mod tests {
     use super::{I2pConfig, validate_nickname};
 
     #[test]
-    fn validate_nickname_accepts_a_normal_name() {
+    fn nicknames_cannot_escape_the_data_dir() {
         assert!(validate_nickname("my-eepsite").is_ok());
-    }
-
-    #[test]
-    fn validate_nickname_rejects_path_traversal() {
-        assert!(validate_nickname("..").is_err());
-        assert!(validate_nickname(".").is_err());
-        assert!(validate_nickname("").is_err());
-        assert!(validate_nickname("../../etc/passwd").is_err());
-        assert!(validate_nickname("a/b").is_err());
-        assert!(validate_nickname("a\\b").is_err());
+        for bad in ["..", ".", "", "../../etc/passwd", "a/b", "a\\b"] {
+            assert!(validate_nickname(bad).is_err(), "{bad:?} accepted");
+        }
         // Drive-relative on Windows, where `Path::join` would drop `data_dir` entirely.
         #[cfg(windows)]
         assert!(validate_nickname("C:keys").is_err());
-    }
 
-    #[test]
-    fn i2p_config_defaults_are_sensible() {
-        let config = I2pConfig::new("test-nickname");
-        assert_eq!(config.nickname(), "test-nickname");
-        assert!(!config.tls_enabled());
+        let nickname = format!("site-{:x}", rand::random::<u64>());
         assert_eq!(
-            config.keys_path(),
-            std::path::Path::new(".tachyon-i2p/test-nickname.keys")
+            I2pConfig::new(nickname.clone())
+                .data_dir("/srv/i2p")
+                .keys_path(),
+            std::path::Path::new(&format!("/srv/i2p/{nickname}.keys"))
         );
     }
 
-    #[cfg(feature = "cert-gen")]
     #[test]
-    fn i2p_config_builder_methods_are_chainable() {
+    fn encryption_types_keep_preference_order_and_replace_each_other() {
+        use tachyon_i2p::CryptoType;
         let config = I2pConfig::new("nick")
-            .data_dir("/tmp/i2p-data")
-            .self_signed_tls();
-        assert_eq!(
-            config.keys_path(),
-            std::path::Path::new("/tmp/i2p-data/nick.keys")
-        );
-        assert!(config.tls_enabled());
-
-        let config = config.no_tls();
-        assert!(!config.tls_enabled());
-    }
-
-    #[cfg(not(feature = "cert-gen"))]
-    #[test]
-    fn i2p_config_data_dir_is_chainable_without_cert_gen() {
-        let config = I2pConfig::new("nick").data_dir("/tmp/i2p-data");
-        assert_eq!(
-            config.keys_path(),
-            std::path::Path::new("/tmp/i2p-data/nick.keys")
-        );
-        assert!(!config.tls_enabled());
-    }
-
-    #[test]
-    fn i2p_config_signature_and_crypto_type_defaults_and_overrides() {
-        let config = I2pConfig::new("nick");
-        assert_eq!(config.sig_type, tachyon_i2p::SigType::default());
-        assert!(
-            config.encryption_types.is_empty(),
-            "no explicit crypto_type() call should mean \"use libi2pd's automatic hybrid set\""
-        );
-
-        let config = config
-            .signature_type(tachyon_i2p::SigType::EcdsaP521)
-            .crypto_type(tachyon_i2p::CryptoType::EciesMlkem768X25519);
-        assert_eq!(config.sig_type, tachyon_i2p::SigType::EcdsaP521);
+            .encryption_types(&[CryptoType::EciesMlkem1024X25519, CryptoType::EciesX25519]);
         assert_eq!(
             config.encryption_types,
-            vec![tachyon_i2p::CryptoType::EciesMlkem768X25519]
+            [CryptoType::EciesMlkem1024X25519, CryptoType::EciesX25519]
         );
-    }
-
-    #[test]
-    fn i2p_config_encryption_types_preserves_preference_order() {
-        let config = I2pConfig::new("nick").encryption_types(&[
-            tachyon_i2p::CryptoType::EciesMlkem1024X25519,
-            tachyon_i2p::CryptoType::EciesX25519,
-        ]);
-        assert_eq!(
-            config.encryption_types,
-            vec![
-                tachyon_i2p::CryptoType::EciesMlkem1024X25519,
-                tachyon_i2p::CryptoType::EciesX25519,
-            ],
-            "the preferred type must stay first -- it's what libi2pd publishes as preferred"
-        );
-
-        // A later crypto_type()/encryption_types() call replaces, rather than appends to, the
-        // previous one -- confirms these two builder methods share one underlying field.
-        let config = config.crypto_type(tachyon_i2p::CryptoType::EciesX25519);
-        assert_eq!(
-            config.encryption_types,
-            vec![tachyon_i2p::CryptoType::EciesX25519]
-        );
-    }
-
-    #[cfg(all(feature = "tls", feature = "cert-gen"))]
-    #[test]
-    fn tls_config_switches_to_a_custom_server_config() {
-        let policy = crate::tls::TlsPolicy::new();
-        let cert = crate::tls::generate_self_signed_cert(vec!["nick.b32.i2p".to_string()])
-            .expect("generate self-signed cert");
-        let server_config = policy
-            .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
-            .expect("build server config");
-
-        let config = I2pConfig::new("nick").tls_config(server_config);
-        assert!(matches!(
-            config.tls,
-            crate::server::anon_tls::AnonTls::Custom(_)
-        ));
-        assert!(config.tls_enabled());
-    }
-
-    #[test]
-    fn on_ready_stores_the_callback() {
-        let config = I2pConfig::new("nick").on_ready(|_addr| {});
-        assert!(config.on_ready.is_some());
+        let config = config.crypto_type(CryptoType::EciesX25519);
+        assert_eq!(config.encryption_types, [CryptoType::EciesX25519]);
     }
 }

@@ -1,6 +1,5 @@
-//! Shared hyper connection-dispatch helper for transports that aren't plain TCP (currently Tor
-//! `.onion` and I2P `.b32.i2p` streams) — factored out so the HTTP/1.1-vs-HTTP/2 protocol
-//! negotiation logic exists exactly once instead of being duplicated per transport.
+//! Serving one HTTP connection over any byte stream — TCP, TLS, a Tor stream or an I2P stream —
+//! so HTTP/1.1-vs-HTTP/2 negotiation and graceful shutdown exist exactly once.
 
 #[cfg(feature = "http1")]
 use crate::server::tuning::tune_http1;
@@ -11,20 +10,53 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::server::stall::WriteDeadline;
+/// A signal every connection watches: once it fires, each finishes its in-flight requests,
+/// refuses new ones (HTTP/1.1 closes after the current response, HTTP/2 sends `GOAWAY`), and
+/// ends. It also fires if the server future is dropped.
+#[derive(Clone, Debug)]
+pub(crate) struct Shutdown(tokio::sync::watch::Receiver<bool>);
+
+impl Shutdown {
+    pub(crate) fn new() -> (tokio::sync::watch::Sender<bool>, Self) {
+        let (trigger, signal) = tokio::sync::watch::channel(false);
+        (trigger, Self(signal))
+    }
+
+    pub(crate) async fn requested(&self) {
+        let _ = self.0.clone().wait_for(|stop| *stop).await;
+    }
+}
+
+/// Drives a hyper connection future, switching it to graceful shutdown when `shutdown` fires.
+/// A macro because the connection types share `graceful_shutdown` by name, not by trait.
+macro_rules! serve_gracefully {
+    ($shutdown:expr, $conn:expr) => {{
+        let conn = $conn;
+        tokio::pin!(conn);
+        tokio::select! {
+            result = conn.as_mut() => result,
+            () = $shutdown.requested() => {
+                conn.as_mut().graceful_shutdown();
+                conn.await
+            }
+        }
+    }};
+}
 
 /// Serves one hyper connection over `io`, using whichever of `http1`/`http2` are enabled.
 ///
-/// `http2` offers HTTP/2 beside HTTP/1.1. Pass `false` on a plaintext stream whose
-/// [`SecurityPolicy`](crate::server::SecurityPolicy) refuses h2c, so the HTTP/2 stack is not
-/// reachable there at all. An `http2`-only build has nothing else to speak and ignores it.
+/// `http2` offers HTTP/2 beside HTTP/1.1 (by connection preface, which also covers TLS with
+/// ALPN `h2`). Pass `false` on a plaintext stream whose
+/// [`SecurityPolicy`](crate::SecurityPolicy) refuses h2c, so the HTTP/2 stack is not reachable
+/// there at all. An `http2`-only build has nothing else to speak and ignores it.
 ///
-/// Tuning comes from [`tuning`](crate::server::tuning), the same place the TCP and TLS
-/// listeners get theirs, so a limit added there applies to every transport at once.
-pub(super) async fn serve_connection<IO, Svc>(
+/// `io` should already be wrapped in [`WriteDeadline`](crate::server::stall::WriteDeadline) at
+/// its lowest layer — under TLS, not over it.
+pub(crate) async fn serve_connection<IO, Svc>(
     io: IO,
     svc: Svc,
     http2: bool,
+    shutdown: &Shutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -36,7 +68,7 @@ where
         + 'static,
     Svc::Future: Send,
 {
-    let io = TokioIo::new(WriteDeadline::new(io));
+    let io = TokioIo::new(io);
 
     // Exactly one of these three is compiled — see the crate-level `compile_error!` in `lib.rs`.
     // `auto`'s own `http1_only` is ignored by `serve_connection_with_upgrades`, so HTTP/1.1
@@ -47,7 +79,7 @@ where
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
         tune_http1!(builder.http1());
         tune_http2!(builder.http2());
-        return builder.serve_connection_with_upgrades(io, svc).await;
+        return serve_gracefully!(shutdown, builder.serve_connection_with_upgrades(io, svc));
     }
 
     #[cfg(feature = "http1")]
@@ -56,7 +88,7 @@ where
         let _ = http2;
         let mut builder = hyper::server::conn::http1::Builder::new();
         tune_http1!(builder);
-        builder.serve_connection(io, svc).with_upgrades().await?;
+        serve_gracefully!(shutdown, builder.serve_connection(io, svc).with_upgrades())?;
     }
 
     #[cfg(all(feature = "http2", not(feature = "http1")))]
@@ -65,22 +97,21 @@ where
         let mut builder =
             hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
         tune_http2!(builder);
-        builder.serve_connection(io, svc).await?;
+        serve_gracefully!(shutdown, builder.serve_connection(io, svc))?;
     }
 
     Ok(())
 }
 
-// Each test needs a protocol it can drive: HTTP/1.1, or HTTP/2 with `ws`.
-#[cfg(all(test, any(feature = "http1", feature = "ws")))]
+// Both tests drive the connection with HTTP/1.1 first.
+#[cfg(all(test, feature = "http1"))]
 mod tests {
     use super::*;
     use hyper::service::service_fn;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Drives `serve_connection` over an in-memory duplex pipe (no real socket, no Tor/I2P
-    /// network needed) — this is the same helper both transports call, so exercising it once
-    /// here covers the HTTP1-vs-HTTP2 negotiation logic those transports share.
+    /// Drives `serve_connection` over an in-memory duplex pipe — the helper every transport
+    /// calls, so this covers the negotiation they share.
     #[cfg(feature = "http1")]
     #[tokio::test]
     async fn serve_connection_round_trips_a_request_over_a_duplex_pipe() {
@@ -92,7 +123,9 @@ mod tests {
             ))))
         });
 
-        let server = tokio::spawn(async move { serve_connection(server_io, svc, true).await });
+        let (_trigger, shutdown) = Shutdown::new();
+        let server =
+            tokio::spawn(async move { serve_connection(server_io, svc, true, &shutdown).await });
 
         client_io
             .write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
@@ -118,9 +151,9 @@ mod tests {
             .expect("serve_connection ok");
     }
 
-    /// The Tor/I2P path must use `tune_http2!`. Its window/frame/stream values match hyper's
+    /// Every transport must use `tune_http2!`. Its window/frame/stream values match hyper's
     /// defaults, so `enable_connect_protocol` (off in hyper) is what tells the two apart.
-    #[cfg(all(feature = "http2", feature = "ws"))]
+    #[cfg(all(feature = "http1", feature = "http2"))]
     #[tokio::test]
     async fn serve_connection_applies_the_shared_http2_tuning() {
         // RFC 9113 §6.5.2 and RFC 8441 §3 setting identifiers.
@@ -134,8 +167,9 @@ mod tests {
         let svc = service_fn(|_req: Request<hyper::body::Incoming>| async {
             Ok::<_, std::io::Error>(Response::new(Body::empty()))
         });
+        let (_trigger, shutdown) = Shutdown::new();
         drop(tokio::spawn(async move {
-            serve_connection(server_io, svc, true).await
+            serve_connection(server_io, svc, true, &shutdown).await
         }));
 
         // Client connection preface + an empty SETTINGS frame, so the server finishes its

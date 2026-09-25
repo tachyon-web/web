@@ -6,10 +6,10 @@ rust-version = "1.92"
 readme = "README.md"
 authors = ["Hacer-Bark <hacer.bark@proton.me>"]
 license = "0BSD"
-description = "A fast, Axum-compatible async web framework with native TLS, HTTP/3, Tor (.onion), and I2P (.i2p) support"
+description = "A hardened multi-transport server for Axum apps: TLS 1.3, HTTP/3, ACME, Tor (.onion) and I2P (.i2p)"
 repository = "https://github.com/tachyon-web/web"
 documentation = "https://docs.rs/tachyon-web"
-keywords = ["web", "framework", "server", "routing"]
+keywords = ["web", "server", "axum", "tls", "tor"]
 categories = ["web-programming::http-server", "network-programming"]
 
 [dependencies]
@@ -17,11 +17,14 @@ categories = ["web-programming::http-server", "network-programming"]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "io-util", "fs"] }
 pin-project-lite = "0.2"
 
-# HTTP & Web
+# HTTP & Web. Only the app-facing types are taken from `axum`; the app's own `axum` 0.8
+# dependency decides which extractors and features exist.
 axum = { version = "0.8", default-features = false, features = ["tokio"] }
 hyper = { version = "1", default-features = false, features = ["server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
+bytes = "1"
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 # QUIC & HTTP/3
 tachyon-quic = { version = "0.3", optional = true }
@@ -31,19 +34,12 @@ rustls = { version = "0.23", default-features = false, features = ["std", "aws_l
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "logging"], optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
 aws-lc-rs = { version = "1.17", optional = true }
-instant-acme = { version = "0.8", default-features = false, features = ["aws-lc-rs"], optional = true }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"], optional = true }
+instant-acme = { version = "0.8", default-features = false, features = ["aws-lc-rs"], optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "webpki-tokio"], optional = true }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 
-# Utilities & Performance
-bytes = "1"
 tracing = { version = "0.1", optional = true }
-tower = { version = "0.5", default-features = false, features = ["util"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 
 # Optional native .onion hidden-service support (see the `tor` feature).
 arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls", "onion-service-service", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
@@ -54,15 +50,19 @@ tor-rtcompat = { version = "0.46", default-features = false, features = ["tokio"
 tor-guardmgr = { version = "0.46", default-features = false, features = ["vanguards"], optional = true }
 tor-config = { version = "0.46", default-features = false, optional = true }
 safelog = { version = "0.9", default-features = false, optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 
 # Optional native .i2p eepsite support.
 tachyon-i2p = { version = "0.0.5", optional = true, default-features = false }
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["tokio", "json", "query", "ws"] }
+rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "cookies", "form"] }
+serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 tokio-stream = "0.1"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["test-util", "signal"] }
 futures = "0.3"
 hyper = { version = "1", features = ["client", "http2"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -70,41 +70,25 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 tower-http = { version = "0.7", default-features = false, features = ["fs"] }
 
 [features]
-default = [
-    "json", "matched-path", "original-uri",
-    "http1", "http2", "tower-log", "form", "query", "tokio", "tracing",
-]
+default = ["http1", "http2", "tracing"]
 
-# Axum-parity features
-http1 = ["axum/http1", "hyper/http1", "hyper-util/http1"]
-http2 = ["axum/http2", "hyper/http2", "hyper-util/http2"]
-json = ["axum/json", "dep:serde_json"]
-matched-path = ["axum/matched-path"]
-original-uri = ["axum/original-uri"]
-tower-log = ["axum/tower-log", "tower/log"]
-ws = ["axum/ws"]
-form = ["axum/form"]
-query = ["axum/query"]
-multipart = ["axum/multipart"]
-tokio = [] # no-op, kept for axum parity
-tracing = ["axum/tracing"]
-macros = ["axum/macros"]
+http1 = ["hyper/http1", "hyper-util/http1"]
+http2 = ["hyper/http2", "hyper-util/http2"]
+# Transport-layer `tracing` events. Nothing is emitted unless the app installs a subscriber.
+tracing = ["dep:tracing"]
 
-# Tachyon-only additions
-telemetry = ["dep:tracing"]
-tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rcgen", "dep:webpki"]
 tls12-legacy = ["tls", "rustls?/tls12", "tokio-rustls?/tls12", "hyper-rustls?/tls12"]
-cert-gen = ["dep:rcgen", "dep:webpki", "tls"]
 http3 = ["dep:tachyon-quic", "tls"]
+acme = [
+    "tls", "dep:instant-acme", "dep:serde_json", "dep:hyper-rustls", "hyper-util/client-legacy",
+]
 fips = [
     "tls", "aws-lc-rs?/fips", "rustls?/fips", "instant-acme?/fips", "rcgen?/fips",
     "tachyon-i2p?/fips", "tachyon-quic?/fips",
 ]
-cnsa = ["fips", "cert-gen", "rcgen/aws_lc_rs_unstable"]
-lets-encrypt = [
-    "dep:instant-acme", "dep:serde_json", "dep:hyper-rustls", "tls", "cert-gen",
-    "hyper-util/client-legacy",
-]
+cnsa = ["fips"]
+
 tor = [
     "dep:arti-client", "dep:tor-hsservice", "dep:tor-proto", "dep:tor-cell",
     "dep:futures-util", "dep:safelog", "dep:tor-rtcompat", "dep:tor-guardmgr", "dep:tor-config",
@@ -135,10 +119,6 @@ dbg_macro = "deny"
 indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 as_conversions = "deny"
-# The lint assumes an item's own module chain is the only path to it; it
-# misses cases where a `pub use` elsewhere re-exports a `pub(crate)` item
-# into a public module, which is exactly the pattern used to keep internal
-# types out of the public API while flattening submodules away.
 redundant_pub_crate = "allow"
 
 [lints.rustdoc]
@@ -146,26 +126,28 @@ all = "deny"
 broken_intra_doc_links = "deny"
 
 [[example]]
-name = "onion_i2p_server"
-required-features = ["tor", "i2p"]
-
-[[example]]
 name = "hello_world"
-required-features = ["json", "query"]
 
 [[example]]
 name = "hardened_server"
-required-features = ["json"]
 
 [[example]]
 name = "self_signed_https"
-required-features = ["cert-gen"]
+required-features = ["tls"]
 
 [[example]]
 name = "lets_encrypt"
-required-features = ["lets-encrypt"]
+required-features = ["acme"]
+
+[[example]]
+name = "multi_cert"
+required-features = ["acme"]
+
+[[example]]
+name = "onion_i2p_server"
+required-features = ["tor", "i2p", "tls"]
 
 [package.metadata.docs.rs]
-# `cnsa` deliberately conflicts with `lets-encrypt`; public ACME CAs do not issue ML-DSA-87
+# `cnsa` deliberately conflicts with `acme`; public ACME CAs do not issue ML-DSA-87
 # certificates. Build the ordinary complete API on docs.rs and document CNSA separately.
-features = ["json", "matched-path", "original-uri", "http1", "http2", "tower-log", "ws", "form", "query", "tracing", "tls", "tls12-legacy", "cert-gen", "http3", "lets-encrypt", "tor", "i2p"]
+features = ["http1", "http2", "tracing", "tls", "tls12-legacy", "http3", "acme", "tor", "i2p"]

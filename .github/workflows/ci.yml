@@ -41,7 +41,7 @@ jobs:
         run: cargo clippy --locked -p tachyon-web --all-targets
       - uses: dtolnay/rust-toolchain@1.92
       - name: msrv (1.92)
-        run: cargo +1.92 check --locked -p tachyon-web --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
+        run: cargo +1.92 check --locked -p tachyon-web --features tls,acme,http3
 
   build:
     name: "${{ matrix.name }}"
@@ -56,12 +56,12 @@ jobs:
             flags: --no-default-features --features http1
           - name: http2 only (h2c, no HTTP/1.1 fallback)
             flags: --no-default-features --features http2
-          - name: extractors (no default features)
-            flags: --no-default-features --features http1,json,form,query,matched-path,original-uri
-          - name: transports + interop (ws, tower-log, tls, acme, http/3)
-            flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3
+          - name: transports (tls, acme, http/3)
+            flags: --features tls,acme,http3
           - name: tls12-legacy (opt-in TLS 1.2 fallback)
-            flags: --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tls12-legacy
+            flags: --features tls,acme,http3,tls12-legacy
+          - name: fips
+            flags: --features tls,http3,fips
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -94,11 +94,11 @@ jobs:
       # The same feature list as `[package.metadata.docs.rs]`, so a docs.rs build failure shows
       # up here first. Keep the two in sync.
       - name: rustdoc (docs.rs features)
-        run: cargo doc --locked -p tachyon-web --features json,matched-path,original-uri,http1,http2,tower-log,ws,form,query,tracing,tls,tls12-legacy,cert-gen,http3,lets-encrypt,tor,i2p --no-deps
+        run: cargo doc --locked -p tachyon-web --features http1,http2,tracing,tls,tls12-legacy,http3,acme,tor,i2p --no-deps
       - name: rustdoc (default features)
         run: cargo doc --locked -p tachyon-web --no-deps
       - name: doctests
-        run: cargo test --locked -p tachyon-web --features json,matched-path,original-uri,http1,http2,tower-log,ws,form,query,tracing,tls,tls12-legacy,cert-gen,http3,lets-encrypt,tor,i2p --doc
+        run: cargo test --locked -p tachyon-web --features http1,http2,tracing,tls,tls12-legacy,http3,acme,tor,i2p --doc
 
   cnsa:
     name: strict CNSA 2.0 profile
@@ -113,12 +113,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,cnsa --all-targets
       - run: cargo test --locked -p tachyon-web --no-default-features --features http1,cnsa --lib
-      # CNSA is only ever exercised above without an anonymity transport, and `transports`
-      # only ever with `telemetry`. Both of those cfg combinations have broken the build
-      # before while every other job stayed green, so they get their own check here.
+      # CNSA is only ever exercised above without an anonymity transport, and the anonymity
+      # transports never without TLS. Both combinations have broken the build before while
+      # every other job stayed green, so they get their own checks here.
       - run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,http2,cnsa,tor,i2p --all-targets
-      - run: cargo clippy --locked -p tachyon-web --all-targets --features tls,cert-gen,http3,tor,i2p
-      # `tls` without `cert-gen`: the self-signed arms drop out and anything only they used
-      # becomes dead. Never built before, and it was broken.
+      - run: cargo clippy --locked -p tachyon-web --all-targets --features tls,acme,http3,tor,i2p
+      - run: cargo clippy --locked -p tachyon-web --all-targets --no-default-features --features http1,tor,i2p
+      # Each anonymity transport on its own with TLS, where no other transport keeps shared
+      # code alive.
       - run: cargo check --locked -p tachyon-web --features tls,tor
       - run: cargo check --locked -p tachyon-web --features tls,i2p

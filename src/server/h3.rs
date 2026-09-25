@@ -6,12 +6,11 @@ use std::time::Duration;
 
 use crate::server::accept::ConnectionLimit;
 use crate::server::http::body_time_earned;
-use crate::server::{REQUEST_TIMEOUT, RESPONSE_WRITE_TIMEOUT, Server};
+use crate::server::shared::{Origin, Shared};
+use crate::server::{REQUEST_TIMEOUT, RESPONSE_WRITE_TIMEOUT};
 
 /// Builds the QUIC endpoint HTTP/3 is served over, from a rustls config and a bind address.
-///
-/// Shared by every `http3` entry point so their limits can't drift apart.
-pub(super) fn build_quic_server(
+pub(crate) fn build_quic_server(
     config: Arc<rustls::ServerConfig>,
     io: impl tachyon_quic::s2n_quic::provider::io::TryInto<
         Error: std::error::Error + Send + Sync + 'static,
@@ -48,31 +47,6 @@ pub(super) fn build_quic_server(
         .start()?)
 }
 
-/// Spawns [`Server::serve_h3`] on the UDP twin of an already-bound HTTPS listener.
-///
-/// Only callable once TCP is bound, so a failed bind can't leave a detached QUIC endpoint
-/// behind, and UDP lands on the port TCP actually got (which differs for port `0`).
-pub(super) fn spawn_h3_beside(
-    server: &Server,
-    config: Arc<rustls::ServerConfig>,
-    listener: &tokio::net::TcpListener,
-) -> Result<crate::server::BackgroundTask, std::io::Error> {
-    let quic_server = build_quic_server(
-        config,
-        listener.local_addr()?,
-        server.limits.max_h3_concurrent_streams,
-    )
-    .map_err(std::io::Error::other)?;
-    let server = server.clone();
-    Ok(crate::server::BackgroundTask::new(tokio::spawn(
-        async move {
-            if let Err(error) = server.serve_h3(quic_server).await {
-                crate::telemetry_error!("[h3] server stopped: {error}");
-            }
-        },
-    )))
-}
-
 /// Bounds one response-write await by [`RESPONSE_WRITE_TIMEOUT`], collapsing a stall into the
 /// same `Err` the caller already handles by abandoning the stream.
 async fn write_within<T, E>(
@@ -100,46 +74,31 @@ async fn send_head_only(
     let _ = write_within(stream.finish()).await;
 }
 
-impl Server {
-    /// Serve HTTP/3 over QUIC using the given s2n-quic server, until it stops accepting.
-    ///
-    /// Under `fips` this can only check the crypto backend, not `quic_server`'s TLS config:
-    /// `s2n_quic::Server` doesn't expose it. Prefer
-    /// [`start_https_and_h3_with_config`](Server::start_https_and_h3_with_config), which checks
-    /// the config before building the endpoint.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if FIPS compliance enforcement fails. Per-connection errors are
-    /// logged and never end the accept loop.
-    pub async fn serve_h3(
-        self,
-        mut quic_server: tachyon_quic::s2n_quic::Server,
-    ) -> Result<(), std::io::Error> {
-        #[cfg(feature = "cnsa")]
-        if !self.cnsa_identity_verified {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "CNSA mode refuses an opaque caller-supplied QUIC server because its TLS identity cannot be verified",
-            ));
-        }
-        crate::server::enforce_fips_compliance()?;
-        let state = Arc::new(self);
-        let limit = state.connection_limit.clone();
-
-        while let Some(conn) = quic_server.accept().await {
-            let permit = limit.acquire().await;
-            let state = state.clone();
-            ConnectionLimit::serve(permit, async move {
-                state.handle_h3_connection(conn).await;
-            });
-        }
-        Ok(())
+/// Serves HTTP/3 on `quic_server` until the future is dropped.
+pub(crate) async fn serve_h3(shared: Arc<Shared>, mut quic_server: tachyon_quic::s2n_quic::Server) {
+    let port = quic_server.local_addr().ok().map(|addr| addr.port());
+    while let Some(conn) = quic_server.accept().await {
+        let permit = shared.connections.acquire().await;
+        let shared = shared.clone();
+        ConnectionLimit::serve(permit, async move {
+            shared.handle_h3_connection(conn, port).await;
+        });
     }
+}
 
-    async fn handle_h3_connection(self: Arc<Self>, conn: tachyon_quic::s2n_quic::Connection) {
+impl Shared {
+    async fn handle_h3_connection(
+        self: Arc<Self>,
+        conn: tachyon_quic::s2n_quic::Connection,
+        port: Option<u16>,
+    ) {
         let Ok(peer) = conn.remote_addr() else {
             return;
+        };
+        let origin = Origin {
+            peer: Some(peer),
+            secure: true,
+            h3_port: port,
         };
 
         // Bounded because this holds a connection permit: a peer could otherwise complete the
@@ -153,20 +112,31 @@ impl Server {
             return;
         };
 
-        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(
-            self.limits.max_h3_concurrent_streams,
-        ));
+        let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(self.limits.max_h3_streams));
 
+        let mut draining = false;
         loop {
             // `accept()` also drives the control stream, QPACK and GOAWAY, so it must run every
             // iteration rather than wait behind the stream semaphore — otherwise a peer holding
             // every stream open would stall the connection's control plane.
-            match h3_server.accept().await {
+            let accepted = tokio::select! {
+                accepted = h3_server.accept() => accepted,
+                () = self.shutdown.requested(), if !draining => {
+                    draining = true;
+                    // GOAWAY: in-flight streams finish, new ones are refused, and `accept`
+                    // then returns `None`.
+                    if h3_server.shutdown(0).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match accepted {
                 Ok(Some(resolver)) => {
                     if let Ok(stream_permit) = stream_semaphore.clone().try_acquire_owned() {
                         let state = self.clone();
                         tokio::spawn(async move {
-                            state.handle_h3_request(resolver, peer).await;
+                            state.handle_h3_request(resolver, origin).await;
                             drop(stream_permit);
                         });
                     } else {
@@ -255,7 +225,7 @@ impl Server {
     async fn handle_h3_request(
         self: Arc<Self>,
         resolver: tachyon_quic::h3::server::RequestResolver<tachyon_quic::Connection, Bytes>,
-        peer: std::net::SocketAddr,
+        origin: Origin,
     ) {
         let resolve_res = tokio::time::timeout(REQUEST_TIMEOUT, resolver.resolve_request()).await;
 
@@ -266,7 +236,7 @@ impl Server {
         // Judged on its head before its body is buffered: a request the policy refuses must not
         // cost up to `max_body_size` of memory first.
         let mut req = req.map(|()| axum::body::Body::empty());
-        if let Some(response) = self.reject(&mut req, Some(peer), true) {
+        if let Some(response) = self.reject(&mut req, origin) {
             send_head_only(&mut stream, response.map(|_| ())).await;
             return;
         }
@@ -279,14 +249,14 @@ impl Server {
                     .status(status)
                     .body(())
                     .unwrap_or_else(|_| Response::new(()));
-                self.security_policy.finalize_response(&mut response, true);
+                self.finalize(&mut response, origin);
                 send_head_only(&mut stream, response).await;
                 return;
             }
         };
 
         let req = Request::from_parts(parts, axum::body::Body::from(body_bytes));
-        let full_resp = self.route(req, Some(peer), true).await;
+        let full_resp = self.route(req, origin).await;
 
         let (resp_parts, body) = full_resp.into_parts();
         let resp = Response::from_parts(resp_parts, ());
@@ -319,9 +289,10 @@ impl Server {
     }
 }
 
-#[cfg(all(test, feature = "cert-gen"))]
+#[cfg(test)]
 mod tests {
-    use crate::server::Server;
+    use crate::Limits;
+    use crate::server::shared::Shared;
     use axum::{
         Router,
         routing::{get, post},
@@ -337,36 +308,50 @@ mod tests {
         body.to_vec()
     }
 
-    /// Starts a real `Server::serve_h3` on loopback (OS-assigned port) serving `app`. Returns the
-    /// bound address and the self-signed cert's PEM (for the client to trust).
+    /// Serves `app` over HTTP/3 on loopback (OS-assigned port) with a fresh self-signed
+    /// certificate. Returns the bound address and the certificate's PEM for the client.
     fn start_h3_server(
         app: Router<()>,
-        configure: impl FnOnce(Server) -> Server,
+        limits: Limits,
+        hosts: Option<Vec<String>>,
     ) -> (std::net::SocketAddr, String) {
-        let cert = crate::tls::generate_self_signed_cert(vec!["localhost".to_string()])
-            .expect("generate self-signed cert");
-        let mut config = crate::tls::TlsPolicy::new()
-            .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
-            .expect("build server config");
-        config.alpn_protocols = vec![b"h3".to_vec()];
-
-        let quic_tls =
-            tachyon_quic::s2n_quic::provider::tls::rustls::Server::from(Arc::new(config));
-        let quic_server = tachyon_quic::s2n_quic::Server::builder()
-            .with_tls(quic_tls)
-            .expect("with_tls")
-            .with_io("127.0.0.1:0")
-            .expect("with_io")
-            .start()
-            .expect("start quic server");
+        let tls = crate::tls::Tls::new()
+            .domains(["localhost"])
+            .self_signed(crate::tls::KeyAlgorithm::EcdsaP256);
+        let built = crate::tls::certs::build(
+            &tls,
+            &crate::tls::TlsPolicy::new(),
+            &["localhost".to_string()],
+            "https://localhost",
+            vec![b"h3".to_vec()],
+        )
+        .expect("build tls");
+        let cert_pem = built
+            .store
+            .as_ref()
+            .and_then(|store| store.infos().first().map(|info| info.pem.clone()))
+            .expect("certificate");
+        let quic_server =
+            super::build_quic_server(built.config, "127.0.0.1:0", limits.max_h3_streams)
+                .expect("start quic server");
         let addr = quic_server.local_addr().expect("local addr");
 
-        let server = configure(Server::new(app));
+        let (trigger, shutdown) = crate::server::conn::Shutdown::new();
+        let shared = Arc::new(Shared::new(
+            app,
+            limits,
+            crate::SecurityPolicy::new(),
+            crate::ServerInfo::new(),
+            shutdown,
+            crate::tls::TlsPolicy::new(),
+        ));
+        shared.set_hosts(hosts);
         drop(tokio::spawn(async move {
-            let _ = server.serve_h3(quic_server).await;
+            let _trigger = trigger;
+            super::serve_h3(shared, quic_server).await;
         }));
 
-        (addr, cert.cert_pem)
+        (addr, cert_pem)
     }
 
     /// Connects a real HTTP/3 client (over loopback UDP) to `addr`, trusting `cert_pem`. The
@@ -429,7 +414,7 @@ mod tests {
     }
 
     /// Full loopback HTTP/3 round trip: a real `s2n-quic`/`h3` client speaking QUIC to a real
-    /// `Server::serve_h3`. Exercises `handle_h3_connection`'s setup and accept loop,
+    /// `serve_h3`. Exercises `handle_h3_connection`'s setup and accept loop,
     /// `read_h3_body` for both a bodyless GET and a Content-Length-driven POST, and
     /// `handle_h3_request`'s full response path (`send_response`, the `frame()`/`send_data()`
     /// loop, and `finish()`).
@@ -438,7 +423,7 @@ mod tests {
         let app = Router::new()
             .route("/", get(hello))
             .route("/echo", post(echo));
-        let (addr, cert_pem) = start_h3_server(app, |server| server);
+        let (addr, cert_pem) = start_h3_server(app, Limits::default(), None);
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -508,7 +493,8 @@ mod tests {
     async fn h3_content_length_mismatch_is_rejected_in_both_directions() {
         let app = Router::new().route("/echo", post(echo));
         // Generous body limit, so it's the declared length doing the rejecting, not `413`.
-        let (addr, cert_pem) = start_h3_server(app, |server| server.max_body_size(1024 * 1024));
+        let (addr, cert_pem) =
+            start_h3_server(app, Limits::default().max_body_size(1024 * 1024), None);
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -546,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn h3_exact_content_length_still_round_trips() {
         let app = Router::new().route("/echo", post(echo));
-        let (addr, cert_pem) = start_h3_server(app, |server| server);
+        let (addr, cert_pem) = start_h3_server(app, Limits::default(), None);
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -580,7 +566,7 @@ mod tests {
     #[tokio::test]
     async fn h3_post_over_max_body_size_is_rejected() {
         let app = Router::new().route("/echo", post(echo));
-        let (addr, cert_pem) = start_h3_server(app, |server| server.max_body_size(8));
+        let (addr, cert_pem) = start_h3_server(app, Limits::default().max_body_size(8), None);
 
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
@@ -612,8 +598,8 @@ mod tests {
     #[tokio::test]
     async fn h3_policy_rejects_before_reading_the_body() {
         let app = Router::new().route("/echo", post(echo));
-        let policy = crate::server::SecurityPolicy::new().allowed_hosts(["example.invalid"]);
-        let (addr, cert_pem) = start_h3_server(app, |server| server.security_policy(policy));
+        let hosts = Some(vec!["example.invalid".to_string()]);
+        let (addr, cert_pem) = start_h3_server(app, Limits::default(), hosts);
         let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
 
         let req = hyper::Request::builder()

@@ -5,12 +5,14 @@ on:
     branches: [main]
     paths:
       - 'src/server/**'
+      - 'src/tls/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/transports.yml'
   pull_request:
     paths:
       - 'src/server/**'
+      - 'src/tls/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/transports.yml'
@@ -43,5 +45,5 @@ jobs:
         with:
           prefix-key: v1-rust
           key: all-features
-      - run: cargo clippy --locked -p tachyon-web --all-targets --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tor,i2p,telemetry
-      - run: cargo test --locked -p tachyon-web --features ws,tower-log,tls,cert-gen,lets-encrypt,http3,tor,i2p,telemetry
+      - run: cargo clippy --locked -p tachyon-web --all-targets --features tls,acme,http3,tor,i2p
+      - run: cargo test --locked -p tachyon-web --features tls,acme,http3,tor,i2p

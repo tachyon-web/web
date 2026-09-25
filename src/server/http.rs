@@ -1,12 +1,10 @@
+use crate::server::REQUEST_TIMEOUT;
 #[cfg(feature = "tls")]
 use crate::server::TLS_HANDSHAKE_TIMEOUT;
 use crate::server::accept::ConnectionLimit;
+use crate::server::conn::{Shutdown, serve_connection};
+use crate::server::shared::{Origin, Shared};
 use crate::server::stall::WriteDeadline;
-#[cfg(feature = "http1")]
-use crate::server::tuning::tune_http1;
-#[cfg(feature = "http2")]
-use crate::server::tuning::tune_http2;
-use crate::server::{REQUEST_TIMEOUT, Server};
 use axum::body::Body;
 use axum::response::IntoResponse as _;
 use bytes::Bytes;
@@ -33,7 +31,7 @@ const BODY_FAILED: u8 = 2;
 /// A fixed window failed every upload slower than `max_body_size / 30s`; a bare per-chunk
 /// timeout would let a peer drip one byte just under it forever. Earning time per byte asks
 /// for a floor rate instead — shared with HTTP/3's body reader.
-pub(super) fn body_time_earned(bytes: usize) -> std::time::Duration {
+pub(crate) fn body_time_earned(bytes: usize) -> std::time::Duration {
     let micros = u64::try_from(bytes)
         .unwrap_or(u64::MAX)
         .saturating_mul(1_000_000)
@@ -150,17 +148,22 @@ const ACCEPT_EXHAUSTION_BACKOFF: std::time::Duration = std::time::Duration::from
 /// that isn't resource pressure is usually broken for good.
 const ACCEPT_FAULT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Accepts the next connection, retrying until one arrives.
+/// Accepts the next connection, retrying until one arrives, or `None` once shutdown is
+/// requested — so the listener closes then rather than queueing clients during the drain.
 ///
 /// A failed accept is logged (and backed off) and then retried, so a single bad connection
 /// never tears the listener down.
-pub(super) async fn accept_forever(
+pub(crate) async fn accept_next(
     listener: &TcpListener,
     log_tag: &str,
-) -> (tokio::net::TcpStream, std::net::SocketAddr) {
+    shutdown: &Shutdown,
+) -> Option<(tokio::net::TcpStream, std::net::SocketAddr)> {
     loop {
-        if let Some(conn) = accept_tuned(listener, log_tag).await {
-            return conn;
+        tokio::select! {
+            accepted = accept_tuned(listener, log_tag) => if accepted.is_some() {
+                return accepted;
+            },
+            () = shutdown.requested() => return None,
         }
     }
 }
@@ -188,7 +191,7 @@ async fn accept_tuned(
             }
             crate::telemetry_error!("[{log_tag}] accept error: {e}");
             // Everything else fails again immediately on retry, so without a pause
-            // `accept_forever` would spin a core flat and flood the log for as long as the
+            // `accept_next` would spin a core flat and flood the log for as long as the
             // condition lasts.
             let backoff = if crate::server::is_resource_exhaustion(&e) {
                 ACCEPT_EXHAUSTION_BACKOFF
@@ -201,198 +204,91 @@ async fn accept_tuned(
     }
 }
 
-impl Server {
-    /// Serve HTTP/1.1 over plaintext TCP on the given listener — plus HTTP/2 over cleartext
-    /// ("h2c", detected via the connection preface with no ALPN needed) when the `http2`
-    /// feature is on *and* [`SecurityPolicy::allow_h2c`](crate::server::SecurityPolicy::allow_h2c)
-    /// is set. With h2c off (the default) the HTTP/2 stack isn't reachable on this port at all.
-    ///
-    /// h2c has no browser support but is what gRPC, `curl --http2-prior-knowledge` and most
-    /// service meshes speak when TLS is terminated upstream.
-    ///
-    /// Serves until the future is dropped.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only if FIPS compliance enforcement fails. Per-connection errors are
-    /// logged and never end the accept loop.
-    pub async fn serve_http(self, listener: TcpListener) -> Result<(), std::io::Error> {
-        crate::server::enforce_fips_compliance()?;
-        let state = Arc::new(self);
-
-        // Built once and cloned per connection. At least one of `http1`/`http2` is always on.
-        #[cfg(feature = "http1")]
-        let http1 = {
-            let mut b = hyper::server::conn::http1::Builder::new();
-            tune_http1!(b);
-            let _ = b.writev(true);
-            b
+/// Serves plaintext HTTP/1.1 on `listener` — plus h2c when
+/// [`SecurityPolicy::allow_h2c`](crate::SecurityPolicy::allow_h2c) is set; otherwise the HTTP/2
+/// stack isn't reachable on this port at all. Accepts until shutdown.
+pub(crate) async fn serve_plain(shared: Arc<Shared>, listener: TcpListener) {
+    let http2 = shared.security.allows_h2c();
+    loop {
+        let Some((stream, peer)) = accept_next(&listener, "http", &shared.shutdown).await else {
+            return;
         };
-        // HTTP/2 here only when h2c is allowed, so otherwise its parser isn't reachable at all.
-        // A separate builder rather than `auto`'s `http1_only`, which
-        // `serve_connection_with_upgrades` ignores.
-        #[cfg(all(feature = "http1", feature = "http2"))]
-        let auto = state.security_policy.allows_h2c().then(|| {
-            let mut b =
-                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-            tune_http1!(b.http1());
-            let _ = b.http1().writev(true);
-            tune_http2!(b.http2());
-            b
+        let permit = shared.connections.acquire().await;
+        let shared = shared.clone();
+        ConnectionLimit::serve(permit, async move {
+            let origin = Origin::plain(Some(peer));
+            let handler = shared.clone();
+            let svc = service_fn(move |req| hyper_handler(handler.clone(), req, origin));
+            let io = WriteDeadline::new(stream);
+            if let Err(e) = serve_connection(io, svc, http2, &shared.shutdown).await {
+                crate::telemetry_debug!("[http] connection error: {e}");
+            }
         });
-        #[cfg(all(feature = "http2", not(feature = "http1")))]
-        let http2 = {
-            // No HTTP/1.1 fallback: only prior-knowledge HTTP/2 clients can connect.
-            let mut b =
-                hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new());
-            tune_http2!(b);
-            b
+    }
+}
+
+/// Serves HTTPS (HTTP/1.1 and HTTP/2 by ALPN) on `listener`. `h3_port` advertises HTTP/3
+/// served beside it. Accepts until shutdown.
+#[cfg(feature = "tls")]
+pub(crate) async fn serve_tls(
+    shared: Arc<Shared>,
+    listener: TcpListener,
+    config: Arc<rustls::ServerConfig>,
+    h3_port: Option<u16>,
+) {
+    let acceptor = TlsAcceptor::from(config);
+    loop {
+        let Some((stream, peer)) = accept_next(&listener, "https", &shared.shutdown).await else {
+            return;
         };
-
-        let limit = state.connection_limit.clone();
-        loop {
-            let (stream, peer) = accept_forever(&listener, "http").await;
-            let permit = limit.acquire().await;
-            let state = state.clone();
-            #[cfg(feature = "http1")]
-            let http1 = http1.clone();
-            #[cfg(all(feature = "http1", feature = "http2"))]
-            let auto = auto.clone();
-            #[cfg(all(feature = "http2", not(feature = "http1")))]
-            let http2 = http2.clone();
-
-            ConnectionLimit::serve(permit, async move {
-                let io = hyper_util::rt::TokioIo::new(WriteDeadline::new(stream));
-                let svc =
-                    service_fn(move |req| hyper_handler(state.clone(), req, Some(peer), false));
-                #[cfg(all(feature = "http1", feature = "http2"))]
-                let result = match auto {
-                    Some(auto) => auto.serve_connection_with_upgrades(io, svc).await,
-                    None => http1
-                        .serve_connection(io, svc)
-                        .with_upgrades()
-                        .await
-                        .map_err(Into::into),
-                };
-                #[cfg(all(feature = "http1", not(feature = "http2")))]
-                let result = http1.serve_connection(io, svc).with_upgrades().await;
-                #[cfg(all(feature = "http2", not(feature = "http1")))]
-                let result = http2.serve_connection(io, svc).await;
-                if let Err(e) = result {
-                    crate::telemetry_debug!("[http] connection error: {}", e);
-                }
-            });
-        }
+        let permit = shared.connections.acquire().await;
+        let shared = shared.clone();
+        let acceptor = acceptor.clone();
+        ConnectionLimit::serve(permit, async move {
+            let Some(tls) = tls_handshake(&shared, &acceptor, WriteDeadline::new(stream)).await
+            else {
+                return;
+            };
+            let origin = Origin {
+                peer: Some(peer),
+                secure: true,
+                h3_port,
+            };
+            let handler = shared.clone();
+            let svc = service_fn(move |req| hyper_handler(handler.clone(), req, origin));
+            if let Err(e) = serve_connection(tls, svc, true, &shared.shutdown).await {
+                crate::telemetry_debug!("[https] connection error: {e}");
+            }
+        });
     }
+}
 
-    /// Serve HTTP/1.1 and HTTP/2 over TLS (HTTPS) on the given listener and acceptor, until
-    /// the future is dropped.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error only at startup: if FIPS compliance enforcement fails, if under `fips`
-    /// `acceptor`'s config offers non-approved algorithms, or if under `cnsa` the config's
-    /// certificate identity wasn't verified by this crate. Per-connection errors are logged
-    /// and never end the accept loop.
-    #[cfg(feature = "tls")]
-    pub async fn serve_https(
-        self,
-        listener: TcpListener,
-        acceptor: TlsAcceptor,
-    ) -> Result<(), std::io::Error> {
-        #[cfg(feature = "cnsa")]
-        if !self.cnsa_identity_verified {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "CNSA mode refuses an opaque caller-supplied TLS config because its certificate identity cannot be verified",
-            ));
+/// A TLS handshake bounded in concurrency and time: excess handshakes are shed before any
+/// asymmetric crypto runs, and a stalled one gives its connection permit back. Shared by every
+/// TLS transport.
+#[cfg(feature = "tls")]
+pub(crate) async fn tls_handshake<IO>(
+    shared: &Shared,
+    acceptor: &TlsAcceptor,
+    io: IO,
+) -> Option<tokio_rustls::server::TlsStream<IO>>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Ok(_permit) = shared.tls_handshakes.clone().try_acquire_owned() else {
+        crate::telemetry_debug!("[tls] handshake shed at concurrency limit");
+        return None;
+    };
+    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(io)).await {
+        Ok(Ok(stream)) => Some(stream),
+        Ok(Err(e)) => {
+            crate::telemetry_debug!("[tls] handshake error: {e}");
+            None
         }
-        crate::server::enforce_fips_compliance()?;
-        #[cfg(feature = "fips")]
-        crate::server::assert_fips_server_config(acceptor.config())?;
-        let state = Arc::new(self);
-        let limit = state.connection_limit.clone();
-        loop {
-            let (tcp_stream, peer) = accept_forever(&listener, "https").await;
-            let permit = limit.acquire().await;
-            let acceptor = acceptor.clone();
-            let state = state.clone();
-
-            ConnectionLimit::serve(permit, async move {
-                let Ok(handshake_permit) = state.tls_handshake_limit.clone().try_acquire_owned()
-                else {
-                    crate::telemetry_debug!("[https] tls handshake shed at concurrency limit");
-                    return;
-                };
-                let tls_stream = match tokio::time::timeout(
-                    TLS_HANDSHAKE_TIMEOUT,
-                    acceptor.accept(WriteDeadline::new(tcp_stream)),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(e)) => {
-                        crate::telemetry_debug!("[https] tls handshake error: {}", e);
-                        return;
-                    }
-                    Err(_) => {
-                        crate::telemetry_debug!("[https] tls handshake timed out");
-                        return;
-                    }
-                };
-                drop(handshake_permit);
-
-                #[cfg(feature = "http2")]
-                let is_h2 = {
-                    let (_, connection) = tls_stream.get_ref();
-                    connection.alpn_protocol() == Some(b"h2")
-                };
-
-                let io = hyper_util::rt::TokioIo::new(tls_stream);
-                let svc =
-                    service_fn(move |req| hyper_handler(state.clone(), req, Some(peer), true));
-
-                #[cfg(feature = "http2")]
-                if is_h2 {
-                    let mut builder = hyper::server::conn::http2::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    );
-                    tune_http2!(builder);
-                    if let Err(e) = builder.serve_connection(io, svc).await {
-                        crate::telemetry_debug!("[https] http/2 connection error: {}", e);
-                    }
-                    // Without `http1` this is already the tail, and a `return` would be flagged.
-                    #[cfg(feature = "http1")]
-                    return;
-                }
-
-                // Without `http1`, ALPN only offered "h2", so a non-h2 peer is simply dropped.
-                #[cfg(feature = "http1")]
-                {
-                    let mut builder = hyper::server::conn::http1::Builder::new();
-                    tune_http1!(builder);
-                    if let Err(e) = builder.serve_connection(io, svc).with_upgrades().await {
-                        crate::telemetry_debug!("[https] http/1.1 connection error: {}", e);
-                    }
-                }
-            });
+        Err(_) => {
+            crate::telemetry_debug!("[tls] handshake timed out");
+            None
         }
-    }
-
-    /// [`serve_https`](Self::serve_https) with a `rustls::ServerConfig`, after applying this
-    /// server's [`TlsPolicy`](crate::tls::TlsPolicy).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`serve_https`](Self::serve_https).
-    #[cfg(feature = "tls")]
-    pub async fn serve_https_config(
-        self,
-        listener: TcpListener,
-        config: rustls::ServerConfig,
-    ) -> Result<(), std::io::Error> {
-        let acceptor = TlsAcceptor::from(self.finalize_tls_config(config));
-        self.serve_https(listener, acceptor).await
     }
 }
 
@@ -416,11 +312,10 @@ fn body_with_deadline(
     }
 }
 
-pub(super) async fn hyper_handler(
-    state: Arc<Server>,
+pub(crate) async fn hyper_handler(
+    state: Arc<Shared>,
     req: Request<hyper::body::Incoming>,
-    peer: Option<std::net::SocketAddr>,
-    secure_transport: bool,
+    origin: Origin,
 ) -> Result<Response<Body>, std::io::Error> {
     let (parts, incoming_body) = req.into_parts();
     if incoming_body.size_hint().upper().is_some_and(|size| {
@@ -430,9 +325,7 @@ pub(super) async fn hyper_handler(
         // skipping it would leave the one reply a peer can trigger cheapest as the only one
         // without `nosniff`/HSTS and with whatever `Server` header the stack added.
         let mut response = (hyper::StatusCode::PAYLOAD_TOO_LARGE, Body::empty()).into_response();
-        state
-            .security_policy
-            .finalize_response(&mut response, secure_transport);
+        state.finalize(&mut response, origin);
         if matches!(
             parts.version,
             hyper::Version::HTTP_10 | hyper::Version::HTTP_11
@@ -452,7 +345,7 @@ pub(super) async fn hyper_handler(
     let (body, body_status) = body_with_deadline(incoming_body, state.limits.max_body_size);
 
     let mut response = state
-        .dispatch(Request::from_parts(parts, body), peer, secure_transport)
+        .dispatch(Request::from_parts(parts, body), origin)
         .await;
     if is_http1 && body_status.is_some_and(|status| status.load(Ordering::Acquire) != BODY_COMPLETE)
     {

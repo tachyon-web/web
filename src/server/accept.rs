@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Applies the per-connection socket tuning every TCP accept path shares.
-pub(super) fn tune_tcp_stream(stream: &tokio::net::TcpStream) {
+pub(crate) fn tune_tcp_stream(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
 }
 
@@ -16,7 +16,7 @@ pub(super) fn tune_tcp_stream(stream: &tokio::net::TcpStream) {
 ///
 /// Routine and remote-triggerable, so it must not be logged at `error!`: any peer could drive
 /// unbounded log volume.
-pub(super) fn is_connection_error(e: &std::io::Error) -> bool {
+pub(crate) fn is_connection_error(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::ConnectionRefused
@@ -29,37 +29,46 @@ pub(super) fn is_connection_error(e: &std::io::Error) -> bool {
 ///
 /// A limiter may carry a *share*: a sub-budget one transport alone draws from, on top of the
 /// pool every transport uses. The port-80 redirect listener runs on one (see
-/// [`Server::redirect_connection_share`](crate::server::Server::redirect_connection_share)), so
-/// cheap plaintext connections can't hold permits the TLS listener needs. A shared connection
+/// [`Limits::redirect_share`](crate::Limits::redirect_share)), so cheap plaintext connections
+/// can't hold permits the TLS listener needs. A shared connection
 /// holds *both* permits, so the share never raises the process-wide ceiling.
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionLimit {
     pool: Arc<Semaphore>,
+    size: usize,
     share: Option<Arc<Semaphore>>,
 }
 
 /// The permits one connection holds for its lifetime.
 #[derive(Debug)]
-pub(super) struct ConnectionPermit {
+pub(crate) struct ConnectionPermit {
     _pool: OwnedSemaphorePermit,
     _share: Option<OwnedSemaphorePermit>,
 }
 
 impl ConnectionLimit {
     /// A limiter allowing `max_conns` connections in flight at once.
-    pub(super) fn new(max_conns: usize) -> Self {
+    pub(crate) fn new(max_conns: usize) -> Self {
         Self {
             pool: Arc::new(Semaphore::new(max_conns)),
+            size: max_conns,
             share: None,
         }
     }
 
+    /// Waits until every connection has ended, by holding the whole pool.
+    pub(crate) async fn drain(&self) {
+        let permits = u32::try_from(self.size).unwrap_or(u32::MAX);
+        let _ = self.pool.acquire_many(permits).await;
+    }
+
     /// The same pool, additionally capped at `permits` connections for the one transport that
     /// uses the returned limiter.
-    #[cfg(feature = "cert-gen")]
-    pub(super) fn with_share(&self, permits: usize) -> Self {
+    #[cfg(feature = "tls")]
+    pub(crate) fn with_share(&self, permits: usize) -> Self {
         Self {
             pool: Arc::clone(&self.pool),
+            size: self.size,
             share: Some(Arc::new(Semaphore::new(permits))),
         }
     }
@@ -69,7 +78,7 @@ impl ConnectionLimit {
     /// Callers acquire after accepting, so an idle listener never reserves a pool permit
     /// another transport needs. The share is taken first for the same reason: waiting on it
     /// while holding a pool permit would starve everyone else.
-    pub(super) async fn acquire(&self) -> ConnectionPermit {
+    pub(crate) async fn acquire(&self) -> ConnectionPermit {
         let share = match &self.share {
             Some(share) => Some(acquire(share).await),
             None => None,
@@ -81,7 +90,7 @@ impl ConnectionLimit {
     }
 
     /// Serves one connection on its own task, holding `permit` until it finishes.
-    pub(super) fn serve(permit: ConnectionPermit, conn: impl Future<Output = ()> + Send + 'static) {
+    pub(crate) fn serve(permit: ConnectionPermit, conn: impl Future<Output = ()> + Send + 'static) {
         drop(tokio::spawn(async move {
             conn.await;
             drop(permit);
@@ -97,7 +106,7 @@ async fn acquire(semaphore: &Arc<Semaphore>) -> OwnedSemaphorePermit {
     }
 }
 
-#[cfg(all(test, feature = "cert-gen"))]
+#[cfg(all(test, feature = "tls"))]
 mod tests {
     use super::ConnectionLimit;
     use std::time::Duration;

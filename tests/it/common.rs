@@ -15,10 +15,11 @@
 #![allow(dead_code)]
 #![allow(clippy::redundant_pub_crate)]
 
+use axum::Router;
 use reqwest::{Client, RequestBuilder};
 use std::net::SocketAddr;
 use std::time::Duration;
-use tachyon_web::{Router, Server};
+use tachyon_web::Server;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -45,7 +46,7 @@ impl TestServer {
     }
 
     /// As [`spawn`](Self::spawn), with a chance to configure the [`Server`] first (e.g.
-    /// `.max_body_size(..)`).
+    /// `.limits(..)`).
     pub(crate) async fn spawn_with(
         router: Router<()>,
         configure: impl FnOnce(Server) -> Server,
@@ -69,9 +70,9 @@ impl TestServer {
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let server = configure(Server::new(router));
+        let server = configure(Server::new(router)).http(listener);
         let task = tokio::spawn(async move {
-            let _ = server.serve_http(listener).await;
+            let _ = server.serve().await;
         });
         Self { addr, client, task }
     }

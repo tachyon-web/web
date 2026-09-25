@@ -1,259 +1,175 @@
-//! [`OnionConfig`]: the builder for [`Server::serve_onion`](crate::server::Server::serve_onion)/
-//! [`Server::serve_onion_with_client`](crate::server::Server::serve_onion_with_client).
+//! [`OnionConfig`]: how [`Server::onion`](crate::Server::onion) publishes the app.
 
-use crate::server::anon_tls::{AnonTls, OnReadyHook};
 use std::path::PathBuf;
-#[cfg(feature = "tls")]
 use std::sync::Arc;
-use tor_hsservice::HsNickname;
 
-/// Configuration for publishing a Tor `.onion` hidden service.
+use arti_client::TorClient;
+use tor_hsservice::HsNickname;
+use tor_rtcompat::PreferredRuntime;
+
+use crate::Error;
+
+/// A Tor v3 onion service publishing the app, added with
+/// [`Server::onion`](crate::Server::onion).
 ///
-/// Passed to [`Server::serve_onion`](crate::server::Server::serve_onion)/
-/// [`Server::serve_onion_with_client`](crate::server::Server::serve_onion_with_client) — see the
-/// [module docs](super) for a full example.
+/// Serves plaintext HTTP on virtual port 80 by default — Tor already encrypts and
+/// authenticates the connection to the `.onion` address. With [`tls`](Self::tls), HTTPS is
+/// also served on virtual port 443.
+///
+/// The same `nickname` and [`state_dir`](Self::state_dir) keep the same `.onion` address
+/// across restarts.
 pub struct OnionConfig {
     pub(super) nickname: String,
     pub(super) state_dir: Option<PathBuf>,
     pub(super) cache_dir: Option<PathBuf>,
-    pub(super) tls: AnonTls,
-    pub(super) redirect_http: bool,
     pub(super) vanguards: bool,
-    pub(super) on_ready: Option<OnReadyHook>,
+    pub(super) client: Option<Arc<TorClient<PreferredRuntime>>>,
+    #[cfg(feature = "tls")]
+    pub(super) tls: Option<crate::tls::Tls>,
+    #[cfg(feature = "tls")]
+    pub(super) redirect_http: bool,
 }
 
 impl std::fmt::Debug for OnionConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OnionConfig")
+        let mut out = f.debug_struct("OnionConfig");
+        let _ = out
             .field("nickname", &self.nickname)
             .field("state_dir", &self.state_dir)
             .field("cache_dir", &self.cache_dir)
-            .field("tls", &self.tls)
-            .field("redirect_http", &self.redirect_http)
             .field("vanguards", &self.vanguards)
-            .finish_non_exhaustive()
+            .field("client", &self.client.is_some());
+        #[cfg(feature = "tls")]
+        let _ = out
+            .field("tls", &self.tls)
+            .field("redirect_http", &self.redirect_http);
+        out.finish()
     }
 }
 
 impl OnionConfig {
-    /// Creates a new configuration for a service published under `nickname`.
-    ///
-    /// Defaults: with `cert-gen`, HTTPS on virtual port 443 from a self-signed certificate
-    /// beside plaintext on port 80; otherwise plaintext only. No forced redirect, vanguards on.
-    /// `nickname` is validated (as an [`HsNickname`]) when the service is launched.
+    /// A service published under `nickname`, plaintext, with vanguards on and Arti's default
+    /// state and cache directories.
     #[must_use]
     pub fn new(nickname: impl Into<String>) -> Self {
         Self {
             nickname: nickname.into(),
             state_dir: None,
             cache_dir: None,
-            #[cfg(feature = "cert-gen")]
-            tls: AnonTls::SelfSigned,
-            #[cfg(not(feature = "cert-gen"))]
-            tls: AnonTls::None,
-            redirect_http: false,
             vanguards: true,
-            on_ready: None,
+            client: None,
+            #[cfg(feature = "tls")]
+            tls: None,
+            #[cfg(feature = "tls")]
+            redirect_http: false,
         }
     }
 
-    /// Overrides the directory Arti uses for persistent state — including this service's onion
-    /// keys. Reusing the same directory (and `nickname`) across restarts keeps the same `.onion`
-    /// address. Defaults to Arti's own platform-specific state directory.
+    /// Where Arti keeps persistent state, including this service's onion keys.
     #[must_use]
     pub fn state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(dir.into());
         self
     }
 
-    /// Overrides the directory Arti uses for cached network directory information. Defaults to
-    /// Arti's own platform-specific cache directory.
+    /// Where Arti caches Tor network directory information.
     #[must_use]
     pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self
     }
 
-    /// Disables HTTPS entirely — only plaintext HTTP on virtual port 80 is served, matching
-    /// [`Server::serve_tor`](crate::server::Server::serve_tor).
-    // `const`-eligible only without `tls`, where `AnonTls` has no drop glue.
-    #[cfg_attr(not(feature = "tls"), allow(clippy::missing_const_for_fn))]
-    #[must_use]
-    pub fn no_tls(mut self) -> Self {
-        self.tls = AnonTls::None;
-        self
-    }
-
-    /// Re-enables HTTPS with a freshly generated self-signed certificate (the default with
-    /// `cert-gen`), after a prior [`no_tls`](Self::no_tls) or `tls_config` call.
-    #[cfg(feature = "cert-gen")]
-    #[must_use]
-    pub fn self_signed_tls(mut self) -> Self {
-        self.tls = AnonTls::SelfSigned;
-        self
-    }
-
-    /// Enables HTTPS using a caller-supplied `rustls::ServerConfig` — e.g. the same one passed
-    /// to [`Server::serve_https_config`](crate::server::Server::serve_https_config) for the
-    /// clearnet listener. Requires the `tls` feature.
-    #[cfg(feature = "tls")]
-    #[must_use]
-    pub fn tls_config(mut self, config: rustls::ServerConfig) -> Self {
-        self.tls = AnonTls::Custom(Arc::new(config));
-        self
-    }
-
-    /// With TLS enabled, `true` makes virtual port 80 `308`-redirect to the `https://` URL;
-    /// `false` (the default) serves both. No effect without TLS.
-    #[must_use]
-    pub const fn redirect_http(mut self, enable: bool) -> Self {
-        self.redirect_http = enable;
-        self
-    }
-
-    /// Controls whether [vanguards](https://blog.torproject.org/vanguards-onion-services/) are
-    /// used for this service. Defaults to `true`.
+    /// Whether [vanguards](https://blog.torproject.org/vanguards-onion-services/) harden the
+    /// service against guard discovery. Default `true` (Arti's "lite" mode).
     #[must_use]
     pub const fn vanguards(mut self, enabled: bool) -> Self {
         self.vanguards = enabled;
         self
     }
 
-    /// Registers a callback invoked at most once — with the published `.onion` address (no
-    /// scheme, e.g. `"abcd...xyz.onion"`) — as soon as the service is fully reachable, just
-    /// before requests start being served. It is skipped if arti never reports an address.
-    /// This is the only way to observe the address programmatically, since
-    /// [`serve_onion`](crate::server::Server::serve_onion) blocks for the lifetime of
-    /// the service; with the `telemetry` feature the address is also logged at `info` level.
+    /// Publishes through an already-bootstrapped client — to share one across services, or
+    /// to configure bridges. The client's own configuration then governs, so combining this
+    /// with `state_dir`, `cache_dir` or `vanguards(false)` is a configuration error.
+    ///
+    /// Arti's relay TLS uses the process-wide rustls provider installed when it bootstrapped;
+    /// call [`TlsPolicy::install_as_process_default`](crate::tls::TlsPolicy::install_as_process_default)
+    /// first if it should match the server's policy.
     #[must_use]
-    pub fn on_ready(mut self, f: impl FnOnce(&str) + Send + 'static) -> Self {
-        self.on_ready = Some(Box::new(f));
+    pub fn client(mut self, client: Arc<TorClient<PreferredRuntime>>) -> Self {
+        self.client = Some(client);
         self
     }
 
-    /// The nickname this service will be published under.
+    /// Also serves HTTPS on virtual port 443 with these certificates. Their names always
+    /// include the `.onion` address.
+    #[cfg(feature = "tls")]
     #[must_use]
-    pub fn nickname(&self) -> &str {
-        &self.nickname
+    pub fn tls(mut self, tls: crate::tls::Tls) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
-    /// Whether HTTPS is enabled — `false` after [`no_tls`](Self::no_tls), and always without
-    /// the `tls` feature.
+    /// Makes virtual port 80 `308`-redirect to HTTPS instead of serving the app. Needs
+    /// [`tls`](Self::tls).
+    #[cfg(feature = "tls")]
     #[must_use]
-    pub const fn tls_enabled(&self) -> bool {
-        !matches!(self.tls, AnonTls::None)
+    pub const fn redirect_http(mut self, enable: bool) -> Self {
+        self.redirect_http = enable;
+        self
     }
 
-    /// Whether plaintext HTTP is forced to redirect to HTTPS — see
-    /// [`redirect_http`](Self::redirect_http).
-    #[must_use]
-    pub const fn redirect_http_enabled(&self) -> bool {
-        self.redirect_http
-    }
-
-    /// Whether vanguards will be requested for this service — see
-    /// [`vanguards`](Self::vanguards).
-    #[must_use]
-    pub const fn vanguards_enabled(&self) -> bool {
-        self.vanguards
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        let _ = parse_nickname(&self.nickname)?;
+        if self.client.is_some()
+            && (self.state_dir.is_some() || self.cache_dir.is_some() || !self.vanguards)
+        {
+            return Err(Error::config(
+                "OnionConfig::client already carries its configuration; drop state_dir, \
+                 cache_dir and vanguards",
+            ));
+        }
+        #[cfg(feature = "tls")]
+        {
+            if self.redirect_http && self.tls.is_none() {
+                return Err(Error::config(
+                    "OnionConfig::redirect_http needs OnionConfig::tls",
+                ));
+            }
+            if let Some(tls) = &self.tls {
+                crate::tls::certs::validate(tls, true)?;
+            }
+        }
+        Ok(())
     }
 }
 
-/// Validates `nickname` as an [`HsNickname`], wrapping the error with the offending value —
-/// [`HsNickname::from_str`]'s own error doesn't otherwise echo it back.
-pub(super) fn parse_nickname(
-    nickname: &str,
-) -> Result<HsNickname, Box<dyn std::error::Error + Send + Sync>> {
+/// Validates `nickname` as an [`HsNickname`], naming the offending value — its own error
+/// doesn't.
+pub(super) fn parse_nickname(nickname: &str) -> Result<HsNickname, Error> {
     nickname
         .parse()
-        .map_err(|e| format!("invalid onion service nickname {nickname:?}: {e}").into())
+        .map_err(|e| Error::config(format!("invalid onion service nickname {nickname:?}: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OnionConfig, parse_nickname};
-
-    #[cfg(all(feature = "tls", feature = "cert-gen"))]
-    #[test]
-    fn tls_config_switches_to_a_custom_server_config() {
-        let policy = crate::tls::TlsPolicy::new();
-        let cert = crate::tls::generate_self_signed_cert(vec!["nick.onion".to_string()])
-            .expect("generate self-signed cert");
-        let server_config = policy
-            .server_config_from_pem(cert.cert_pem.as_bytes(), cert.key_pem.as_bytes())
-            .expect("build server config");
-
-        let config = OnionConfig::new("nick").tls_config(server_config);
-        assert!(matches!(
-            config.tls,
-            crate::server::anon_tls::AnonTls::Custom(_)
-        ));
-        // `AnonTls`'s `Debug` impl deliberately doesn't dump the whole `rustls::ServerConfig` —
-        // just proves the variant is reachable and formats.
-        assert!(format!("{config:?}").contains("nickname"));
-    }
-
-    #[cfg(feature = "cert-gen")]
-    #[test]
-    fn onion_config_defaults_to_self_signed_tls_when_cert_gen_is_enabled() {
-        let config = OnionConfig::new("test-nickname");
-        assert_eq!(config.nickname, "test-nickname");
-        assert!(config.vanguards);
-        assert!(!config.redirect_http);
-        assert!(matches!(
-            config.tls,
-            crate::server::anon_tls::AnonTls::SelfSigned
-        ));
-    }
-
-    #[cfg(not(feature = "cert-gen"))]
-    #[test]
-    fn onion_config_defaults_to_no_tls_without_cert_gen() {
-        let config = OnionConfig::new("test-nickname");
-        assert_eq!(config.nickname, "test-nickname");
-        assert!(config.vanguards);
-        assert!(!config.redirect_http);
-        assert!(matches!(config.tls, crate::server::anon_tls::AnonTls::None));
-    }
+    use super::OnionConfig;
 
     #[test]
-    fn onion_config_builder_methods_are_chainable() {
-        let config = OnionConfig::new("nick")
-            .state_dir("/tmp/state")
-            .cache_dir("/tmp/cache")
-            .redirect_http(true)
-            .vanguards(false)
-            .no_tls();
-        assert_eq!(
-            config.state_dir.as_deref(),
-            Some(std::path::Path::new("/tmp/state"))
+    fn invalid_or_contradictory_configs_are_refused() {
+        assert!(OnionConfig::new("valid-nickname").validate().is_ok());
+        let err = OnionConfig::new("not a nickname!!")
+            .validate()
+            .expect_err("spaces are not allowed");
+        assert!(err.to_string().contains("not a nickname!!"));
+
+        #[cfg(feature = "tls")]
+        assert!(
+            OnionConfig::new("svc")
+                .redirect_http(true)
+                .validate()
+                .is_err(),
+            "a redirect to HTTPS without HTTPS must not be silently ignored"
         );
-        assert_eq!(
-            config.cache_dir.as_deref(),
-            Some(std::path::Path::new("/tmp/cache"))
-        );
-        assert!(config.redirect_http);
-        assert!(!config.vanguards);
-        assert!(matches!(config.tls, crate::server::anon_tls::AnonTls::None));
-    }
-
-    #[test]
-    fn parse_nickname_accepts_a_valid_name() {
-        assert!(parse_nickname("valid-nickname").is_ok());
-    }
-
-    #[test]
-    fn parse_nickname_rejects_an_invalid_name_and_echoes_it_back() {
-        // Onion service nicknames are restricted (e.g. no spaces) — `HsNickname::from_str`
-        // rejects this, and `parse_nickname` wraps that error with the offending value since
-        // the underlying error doesn't otherwise include it.
-        let err = parse_nickname("not a valid nickname!!").unwrap_err();
-        assert!(err.to_string().contains("not a valid nickname!!"));
-    }
-
-    #[test]
-    fn on_ready_stores_the_callback() {
-        let config = OnionConfig::new("nick").on_ready(|_addr| {});
-        assert!(config.on_ready.is_some());
     }
 }

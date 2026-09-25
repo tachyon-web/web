@@ -1,145 +1,79 @@
 //! # Tachyon-Web
 //!
-//! A multi-protocol web framework: HTTP/1.1, h2c, HTTP/2, HTTP/3, Tor and I2P, with
-//! built-in Let's Encrypt certificate management.
-//!
-//! Routing, extraction, responses, middleware, and Tower integration are provided directly by
-//! `axum`. Tachyon adds hardened multi-protocol serving without wrapping Axum's application API.
-//!
-//! ## Plain HTTP
+//! A hardened server for [Axum](https://docs.rs/axum) apps. Write the app with your own
+//! `axum` 0.8 dependency, then publish it over any mix of plain HTTP, HTTPS, HTTP/3, a Tor
+//! `.onion` service and an I2P eepsite — with in-process Let's Encrypt, several certificates per
+//! endpoint, and one set of limits, security policy and graceful shutdown shared by all of them.
 //!
 //! ```rust,no_run
 //! use axum::{Router, routing::get};
-//! use axum::response::Html;
-//! use tokio::net::TcpListener;
-//!
-//! async fn hello_world() -> Html<&'static str> {
-//!     Html("<h1>Hello from Axum!</h1>")
-//! }
+//! use tachyon_web::Server;
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     let app = Router::new()
-//!         .route("/", get(hello_world));
-//!
-//!     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-//!     tachyon_web::Server::new(app).serve_http(listener).await?;
-//!     Ok(())
+//! async fn main() -> Result<(), tachyon_web::Error> {
+//!     let app = Router::new().route("/", get(|| async { "hello" }));
+//!     Server::new(app).http("0.0.0.0:8080").serve().await
 //! }
 //! ```
 //!
-//! ## HTTPS with automatic Let's Encrypt certificates
+//! Compared with `axum::serve`, every connection gets read, handshake and write-stall
+//! timeouts, body and concurrency limits, Slowloris and HTTP/2 flow-control mitigations, host
+//! allow-listing, and forwarding-header hygiene — identically on every transport.
 //!
-//! `Server::serve_all_acme` (`lets-encrypt`) issues the certificate on first startup, answers the HTTP-01
-//! challenge in-process, caches account credentials and the certificate to disk, renews 30
-//! days before expiry, and hot-swaps the result into the running TLS stack.
+//! ## HTTPS, several certificates, and the metadata handlers see
 //!
 //! ```rust,no_run
+//! # #[cfg(feature = "acme")] {
 //! use axum::{Router, routing::get};
+//! use tachyon_web::tls::{Acme, KeyAlgorithm, Tls};
+//! use tachyon_web::{Server, ServerInfo};
 //!
-//! async fn hello() -> &'static str { "Hello, secure world!" }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     #[cfg(feature = "lets-encrypt")]
-//!     {
-//!         let app = Router::new().route("/", get(hello));
-//!
-//!         tachyon_web::Server::new(app)
-//!             .serve_all_acme(
-//!                 "0.0.0.0:443",                   // HTTPS / HTTP/2 / HTTP/3
-//!                 "0.0.0.0:80",                    // HTTP redirect + ACME challenges
-//!                 vec!["example.com".to_string()], // domains (must resolve to this server)
-//!                 "admin@example.com".to_string(), // Let's Encrypt contact email
-//!                 "/var/cache/tachyon/certs",      // persistent cert cache (survives restarts)
-//!                 false,                           // false = production LE, true = staging
-//!             )
-//!             .await?;
-//!     }
-//!     Ok(())
+//! async fn pins(info: ServerInfo) -> String {
+//!     info.certificates()
+//!         .iter()
+//!         .map(|cert| format!("{:?} {}", cert.algorithm, cert.sha256_hex()))
+//!         .collect::<Vec<_>>()
+//!         .join("\n")
 //! }
+//!
+//! # async fn run() -> Result<(), tachyon_web::Error> {
+//! let tls = Tls::new()
+//!     .domains(["example.com"])
+//!     .store("/var/lib/tachyon/tls")
+//!     .acme(Acme::lets_encrypt().contact("admin@example.com"))
+//!     .self_signed(KeyAlgorithm::MlDsa87);
+//!
+//! Server::new(Router::new().route("/pins", get(pins)))
+//!     .https("0.0.0.0:443", tls)
+//!     .redirect("0.0.0.0:80")
+//!     .serve()
+//!     .await
+//! # }
+//! # }
 //! ```
 //!
-//! ## HTTPS with a pre-loaded certificate (self-signed or CA-issued)
+//! See the `tls` module for how one certificate is chosen per handshake, and [`ServerInfo`] for what a
+//! handler can read: every endpoint (including `.onion`/`.b32.i2p` addresses) and every
+//! certificate with its SHA-256 fingerprints, names, issuer and expiry.
 //!
-//! For development or when you manage certificates externally:
+//! ## Feature flags
 //!
-//! ```rust,no_run
-//! use axum::{Router, routing::get};
+//! | Flag | Default | Enables |
+//! |---|---|---|
+//! | `http1` | on | HTTP/1.1 |
+//! | `http2` | on | HTTP/2 (over TLS, and h2c when allowed) |
+//! | `tracing` | on | `tracing` events from the transport layer; nothing is emitted without a subscriber |
+//! | `tls` | | TLS 1.3 via `rustls` + `aws-lc-rs`, and self-signed certificate generation |
+//! | `tls12-legacy` | | additionally offer TLS 1.2 |
+//! | `http3` | | HTTP/3 beside every HTTPS endpoint |
+//! | `acme` | | in-process ACME (Let's Encrypt) issuance and renewal |
+//! | `fips` | | AWS-LC's FIPS 140-3 module in approved mode, and the restricted TLS policy |
+//! | `cnsa` | | the CNSA 2.0 profile: `fips`, ML-KEM-1024, ML-DSA-87 only; excludes `acme` |
+//! | `tor` | | Tor v3 onion services via `arti-client` |
+//! | `i2p` | | I2P eepsites via an embedded `libi2pd` — links C++, see `server::i2p` |
 //!
-//! async fn hello() -> &'static str { "secure hello" }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     #[cfg(feature = "cert-gen")]
-//!     {
-//!         use tachyon_web::tls;
-//!
-//!         let app = Router::new().route("/", get(hello));
-//!
-//!         let cert = tls::generate_self_signed_cert(vec!["localhost".to_string()])?;
-//!
-//!         tachyon_web::Server::new(app)
-//!             .start_all(
-//!                 "0.0.0.0:443",
-//!                 Some("0.0.0.0:80"), // optional HTTP → HTTPS redirect
-//!                 cert.cert_pem,
-//!                 cert.key_pem,
-//!             )
-//!             .await?;
-//!     }
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Native Tor `.onion` hidden services
-//!
-//! With the `tor` feature, `Server::serve_tor` publishes the app directly as a v3 Tor hidden
-//! service — via [`arti-client`](https://docs.rs/arti-client)/[`tor-hsservice`](https://docs.rs/tor-hsservice) —
-//! with no external `tor` daemon or reverse proxy required:
-//!
-//! ```rust,no_run
-//! use axum::{Router, routing::get};
-//!
-//! async fn hello() -> &'static str { "Hello from an onion service!" }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//! #   #[cfg(feature = "tor")]
-//! #   {
-//!     let app = Router::new().route("/", get(hello));
-//!     tachyon_web::Server::new(app).serve_tor("my-hidden-service").await?;
-//! #   }
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Native I2P `.b32.i2p` eepsites
-//!
-//! With the `i2p` feature, `Server::serve_i2p` publishes the app directly as an I2P eepsite —
-//! via the vendored, statically-linked [`libi2pd`](https://github.com/PurpleI2P/i2pd) router —
-//! with no external `i2pd`/Java-I2P process required:
-//!
-//! ```rust,no_run
-//! use axum::{Router, routing::get};
-//!
-//! async fn hello() -> &'static str { "Hello from an eepsite!" }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//! #   #[cfg(feature = "i2p")]
-//! #   {
-//!     let app = Router::new().route("/", get(hello));
-//!     tachyon_web::Server::new(app).serve_i2p("my-eepsite").await?;
-//! #   }
-//!     Ok(())
-//! }
-//! ```
-//!
-//! Unlike every other feature, `i2p` links C++ through project-specific FFI bindings
-//! ([`i2pd-sys`](https://docs.rs/i2pd-sys)/[`tachyon-i2p`](https://docs.rs/tachyon-i2p)).
-//! This crate's own `#![forbid(unsafe_code)]` still holds, but says nothing about that boundary.
-//! Read the `server::i2p` module docs before enabling it in anything security-sensitive.
+//! Axum's own features (`json`, `ws`, `macros`, …) are enabled on your `axum` dependency.
+//! At least one of `http1`/`http2` must stay enabled.
 
 #![forbid(unsafe_code, elided_lifetimes_in_paths)]
 #![allow(clippy::multiple_crate_versions)]
@@ -147,81 +81,67 @@
 
 macro_rules! telemetry_debug {
     ($($arg:tt)*) => {{
-        #[cfg(feature = "telemetry")]
+        #[cfg(feature = "tracing")]
         tracing::debug!($($arg)*);
-        #[cfg(not(feature = "telemetry"))]
+        #[cfg(not(feature = "tracing"))]
         let _ = format_args!($($arg)*);
     }};
 }
-#[cfg(any(feature = "lets-encrypt", feature = "tor", feature = "i2p"))]
 macro_rules! telemetry_info {
     ($($arg:tt)*) => {{
-        #[cfg(feature = "telemetry")]
+        #[cfg(feature = "tracing")]
         tracing::info!($($arg)*);
-        #[cfg(not(feature = "telemetry"))]
+        #[cfg(not(feature = "tracing"))]
         let _ = format_args!($($arg)*);
     }};
 }
-#[cfg(any(feature = "lets-encrypt", feature = "tor"))]
 macro_rules! telemetry_warn {
     ($($arg:tt)*) => {{
-        #[cfg(feature = "telemetry")]
+        #[cfg(feature = "tracing")]
         tracing::warn!($($arg)*);
-        #[cfg(not(feature = "telemetry"))]
+        #[cfg(not(feature = "tracing"))]
         let _ = format_args!($($arg)*);
     }};
 }
 macro_rules! telemetry_error {
     ($($arg:tt)*) => {{
-        #[cfg(feature = "telemetry")]
+        #[cfg(feature = "tracing")]
         tracing::error!($($arg)*);
-        #[cfg(not(feature = "telemetry"))]
+        #[cfg(not(feature = "tracing"))]
         let _ = format_args!($($arg)*);
     }};
 }
-#[cfg(any(feature = "lets-encrypt", feature = "tor", feature = "i2p"))]
-pub(crate) use telemetry_info;
-#[cfg(any(feature = "lets-encrypt", feature = "tor"))]
-pub(crate) use telemetry_warn;
-pub(crate) use {telemetry_debug, telemetry_error};
+pub(crate) use {telemetry_debug, telemetry_error, telemetry_info, telemetry_warn};
 
-#[cfg(all(feature = "cnsa", feature = "lets-encrypt"))]
+#[cfg(all(feature = "cnsa", feature = "acme"))]
 compile_error!(
-    "the `cnsa` and `lets-encrypt` features are mutually exclusive: CNSA 2.0 requires an \
-     ML-DSA-87 certificate, which public ACME services do not issue"
+    "the `cnsa` and `acme` features are mutually exclusive: CNSA 2.0 requires an ML-DSA-87 \
+     certificate, which public ACME services do not issue"
 );
-
-#[cfg(all(
-    doctest,
-    feature = "json",
-    feature = "matched-path",
-    feature = "original-uri",
-    feature = "http1",
-    feature = "http2",
-    feature = "tower-log",
-    feature = "ws",
-    feature = "form",
-    feature = "query",
-    feature = "tls",
-    feature = "cert-gen",
-    feature = "http3",
-    not(feature = "cnsa"),
-    feature = "lets-encrypt",
-    feature = "tor",
-    feature = "i2p",
-))]
-#[doc = include_str!("../README.md")]
-struct ReadmeDoctests;
 
 #[cfg(not(any(feature = "http1", feature = "http2")))]
 compile_error!(
     "tachyon-web requires at least one of the \"http1\" or \"http2\" features to serve anything"
 );
 
+#[cfg(all(
+    doctest,
+    feature = "http1",
+    feature = "http2",
+    feature = "acme",
+    feature = "tor",
+    feature = "i2p",
+    not(feature = "cnsa"),
+))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+mod error;
+mod info;
 pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
-pub use axum::*;
-pub use server::{DeploymentProfile, Limits, MultiServer, Server};
-#[cfg(feature = "tls")]
-pub use server::{HttpsServer, RustlsConfig, bind_rustls};
+
+pub use error::Error;
+pub use info::{Endpoint, Network, ServerInfo};
+pub use server::{Bind, IpNetwork, Limits, SecurityPolicy, Serve, Server};

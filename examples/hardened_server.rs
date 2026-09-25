@@ -39,8 +39,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::net::SocketAddr;
-use tachyon_web::Server;
-use tachyon_web::server::{DeploymentProfile, IpNetwork, SecurityPolicy};
+use tachyon_web::{IpNetwork, Limits, SecurityPolicy, Server};
 
 /// The forwarding headers this deployment would honor, and what actually survived to the
 /// handler. Anything a peer outside `trusted_proxies` sends is gone by the time this runs.
@@ -89,9 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .route("/whoami", get(whoami))
         .route("/echo", post(echo));
 
-    // Only these names are served. An empty list would reject *every* authority; not calling
-    // `allowed_hosts` at all is what disables the check, so the fail-safe direction is to
-    // configure it explicitly rather than to leave it out.
+    // Only these names are served. Left out, the list is derived from the server's own names
+    // (TLS domains, bound IPs, onion/I2P addresses) — a plain-HTTP server on a wildcard
+    // address has none, so it is stated here.
     let security = SecurityPolicy::new()
         .allowed_hosts(["localhost", "127.0.0.1", "example.test"])
         // Forwarding headers are believed only from these networks. Everything else has them
@@ -116,29 +115,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Turn it on only when a load balancer in front of you terminates TLS and speaks h2c.
         .allow_h2c(false);
 
-    let server = Server::new(app)
-        .security_policy(security)
-        // Bounds on what a hostile peer can consume. These are shared across every transport a
-        // `Server` runs, so adding listeners does not multiply the ceiling.
+    // Bounds on what a hostile peer can consume, shared across every transport a server runs.
+    let limits = Limits::default()
+        // Also the app's `DefaultBodyLimit`, so extractors accept exactly this much.
         .max_body_size(64 * 1024)
         .max_connections(1_024)
         // Excess requests are shed with 503 immediately rather than queued — a queue under
         // overload just converts a throughput problem into a latency and memory problem.
-        .max_active_requests(256)
-        // `ExtremePrivacy` additionally disables TLS session resumption and lowers the
-        // connection, handler and HTTP/3 stream ceilings; `Hardened` is the default.
-        .deployment_profile(DeploymentProfile::Hardened);
+        .max_active_requests(256);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
     println!("listening on http://{addr}");
-    let limits = server.limits();
     println!(
         "limits: {} connections, {} concurrent handlers, {} byte bodies",
         limits.max_connections, limits.max_active_requests, limits.max_body_size,
     );
 
-    server.serve_http(listener).await?;
+    Server::new(app)
+        .security(security)
+        .limits(limits)
+        .http(addr)
+        .serve()
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
     Ok(())
 }

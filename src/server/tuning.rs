@@ -11,8 +11,7 @@
 //! defaults, so it tells "went through here" from "got hyper's defaults" by
 //! `enable_connect_protocol` instead.
 
-/// Applies the HTTP/1.1 connection tuning shared by every listener. `writev` stays per call
-/// site: TLS buffers its own records, so vectored writes are a different tradeoff there.
+/// Applies the HTTP/1.1 connection tuning shared by every listener.
 #[cfg(feature = "http1")]
 macro_rules! tune_http1 {
     ($builder:expr) => {{
@@ -54,8 +53,7 @@ macro_rules! tune_http2 {
             // otherwise hold its connection permit forever.
             .keep_alive_interval($crate::server::REQUEST_TIMEOUT)
             .keep_alive_timeout($crate::server::REQUEST_TIMEOUT);
-        // RFC 8441: let `ws::WebSocketUpgrade` accept WebSocket-over-HTTP/2 requests.
-        #[cfg(feature = "ws")]
+        // RFC 8441: lets the app's `WebSocketUpgrade` accept WebSocket-over-HTTP/2 requests.
         let _ = tuned.enable_connect_protocol();
     }};
 }
