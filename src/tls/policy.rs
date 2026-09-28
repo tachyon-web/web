@@ -269,7 +269,7 @@ impl TlsPolicy {
     /// [`CryptoProvider::install_default`].
     ///
     /// Only the first call in a process installs anything. Call it before bootstrapping your
-    /// own arti `TorClient` for [`OnionConfig::client`](crate::server::tor::OnionConfig), so
+    /// own arti `TorClient` for [`OnionConfig::client`](crate::tor::OnionConfig), so
     /// its relay TLS uses the build's validated module too. Keep that policy broad: many
     /// relays don't support post-quantum groups yet.
     pub fn install_as_process_default(&self) {

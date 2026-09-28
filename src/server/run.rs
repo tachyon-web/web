@@ -47,8 +47,9 @@ impl Serve {
     /// closed.
     ///
     /// A handler that never finishes — an endless stream — holds that wait open; bound it with
-    /// your own timeout. Dropping the server future instead stops accepting immediately and
-    /// still lets open connections finish in the background.
+    /// your own timeout. Dropping the server future instead stops accepting immediately: TCP
+    /// connections still finish their requests in the background, while HTTP/3, onion and I2P
+    /// connections close with the endpoint they run on.
     pub fn with_graceful_shutdown(
         mut self,
         signal: impl Future<Output = ()> + Send + 'static,
@@ -292,15 +293,17 @@ impl Startup {
 
     /// The host allow-list the policy resolves to; `None` answers any host.
     fn allowed_hosts(&self, security: &super::SecurityPolicy) -> Option<Vec<String>> {
-        let hosts = match security.host_rule() {
-            HostRule::Auto => (!self.names.is_empty()).then(|| self.names.clone()),
+        match security.host_rule() {
+            HostRule::Auto if self.names.is_empty() => {
+                crate::telemetry_warn!(
+                    "[server] no names to allow-list: any Host header is answered"
+                );
+                None
+            }
+            HostRule::Auto => Some(self.names.clone()),
             HostRule::Any => None,
             HostRule::Only(hosts) => Some(hosts.to_vec()),
-        };
-        if hosts.is_none() {
-            crate::telemetry_warn!("[server] no host allow-list: any Host header is answered");
         }
-        hosts
     }
 
     fn spawn(

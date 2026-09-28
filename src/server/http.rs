@@ -41,7 +41,8 @@ pub(crate) fn body_time_earned(bytes: usize) -> std::time::Duration {
 
 pin_project_lite::pin_project! {
     /// Bounds how long a request body may take to arrive: [`REQUEST_TIMEOUT`] of grace, plus
-    /// whatever [`body_time_earned`] grants for each chunk received.
+    /// whatever [`body_time_earned`] grants for each chunk received. Also caps its size, with
+    /// the same [`LengthLimitError`](http_body_util::LengthLimitError) Axum answers `413` for.
     ///
     /// Bodies stream lazily, so without this a client could send headers declaring a
     /// `Content-Length` and then never send the body, holding the connection open
@@ -52,20 +53,18 @@ pin_project_lite::pin_project! {
     /// registered and dropped unused on every bodyless GET.
     struct DeadlineBody<B> {
         #[pin]
-        inner: B,
+        inner: http_body_util::Limited<B>,
         deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-        remaining: usize,
         failed: bool,
         status: Arc<AtomicU8>,
     }
 }
 
 impl<B> DeadlineBody<B> {
-    const fn new(inner: B, max_body_size: usize, status: Arc<AtomicU8>) -> Self {
+    fn new(inner: B, max_body_size: usize, status: Arc<AtomicU8>) -> Self {
         Self {
-            inner,
+            inner: http_body_util::Limited::new(inner, max_body_size),
             deadline: None,
-            remaining: max_body_size,
             failed: false,
             status,
         }
@@ -78,7 +77,9 @@ where
     B::Error: Into<axum::BoxError>,
 {
     type Data = Bytes;
-    type Error = axum::Error;
+    // `Limited`'s own error type, unwrapped: Axum looks through exactly two layers for
+    // `LengthLimitError`, and a third would turn the limit's `413` into a `400`.
+    type Error = axum::BoxError;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -94,7 +95,7 @@ where
         if deadline.as_mut().poll(cx).is_ready() {
             *this.failed = true;
             this.status.store(BODY_FAILED, Ordering::Release);
-            return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
+            return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "timed out reading request body",
             )))));
@@ -102,15 +103,6 @@ where
         match this.inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    let Some(remaining) = this.remaining.checked_sub(data.len()) else {
-                        *this.failed = true;
-                        this.status.store(BODY_FAILED, Ordering::Release);
-                        return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "request body exceeds configured limit",
-                        )))));
-                    };
-                    *this.remaining = remaining;
                     let extended = deadline
                         .deadline()
                         .checked_add(body_time_earned(data.len()));
@@ -121,8 +113,9 @@ where
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
+                *this.failed = true;
                 this.status.store(BODY_FAILED, Ordering::Release);
-                Poll::Ready(Some(Err(axum::Error::new(e))))
+                Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
                 this.status.store(BODY_COMPLETE, Ordering::Release);
@@ -320,6 +313,18 @@ pub(crate) async fn hyper_handler(
     origin: Origin,
 ) -> Result<Response<Body>, std::io::Error> {
     let (parts, incoming_body) = req.into_parts();
+    let is_http1 = matches!(
+        parts.version,
+        hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+    );
+    // An HTTP/1.1 body left unread would be parsed as the next request, so the connection
+    // closes after any response that didn't consume its request's body.
+    let close = |response: &mut Response<Body>| {
+        let _ = response.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    };
     if incoming_body.size_hint().upper().is_some_and(|size| {
         u64::try_from(state.limits.max_body_size).is_ok_and(|limit| size > limit)
     }) {
@@ -328,22 +333,11 @@ pub(crate) async fn hyper_handler(
         // without `nosniff`/HSTS and with whatever `Server` header the stack added.
         let mut response = (hyper::StatusCode::PAYLOAD_TOO_LARGE, Body::empty()).into_response();
         state.finalize(&mut response, origin);
-        if matches!(
-            parts.version,
-            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
-        ) && !incoming_body.is_end_stream()
-        {
-            let _ = response.headers_mut().insert(
-                hyper::header::CONNECTION,
-                hyper::header::HeaderValue::from_static("close"),
-            );
+        if is_http1 {
+            close(&mut response);
         }
         return Ok(response);
     }
-    let is_http1 = matches!(
-        parts.version,
-        hyper::Version::HTTP_10 | hyper::Version::HTTP_11
-    );
     let (body, body_status) = body_with_deadline(incoming_body, state.limits.max_body_size);
 
     let mut response = state
@@ -351,10 +345,7 @@ pub(crate) async fn hyper_handler(
         .await;
     if is_http1 && body_status.is_some_and(|status| status.load(Ordering::Acquire) != BODY_COMPLETE)
     {
-        let _ = response.headers_mut().insert(
-            hyper::header::CONNECTION,
-            hyper::header::HeaderValue::from_static("close"),
-        );
+        close(&mut response);
     }
     Ok(response)
 }

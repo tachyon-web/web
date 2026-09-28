@@ -104,7 +104,7 @@ pub(crate) fn resolve_redirect_host<'a>(
         .map(String::as_str)
 }
 /// The ACME HTTP-01 answer for a pending challenge token, or a `308` to the HTTPS URL.
-fn redirect_or_challenge<B>(
+pub(crate) fn redirect_or_challenge<B>(
     req: &Request<B>,
     allowed_hosts: &[String],
     port_suffix: &str,

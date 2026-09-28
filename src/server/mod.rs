@@ -1,19 +1,8 @@
-//! [`Server`]: publishes an Axum [`Router`] over any mix of transports.
-//!
-//! Every transport is added the same way and runs under one [`serve`](Server::serve):
-//!
-//! | Method | Serves | Feature |
-//! |---|---|---|
-//! | [`http`](Server::http) | HTTP/1.1, plus h2c with [`SecurityPolicy::allow_h2c`] | *(always)* |
-//! | `https` | HTTP/1.1 + HTTP/2 over TLS, plus HTTP/3 on the same port with `http3` | `tls` |
-//! | `redirect` | `308` to HTTPS, and ACME HTTP-01 answers | `tls` |
-//! | `onion` | a Tor v3 onion service | `tor` |
-//! | `i2p` | an I2P eepsite (breaks `forbid(unsafe_code)`, see `server::i2p`) | `i2p` |
-//!
-//! All of them share one set of [`Limits`], one [`SecurityPolicy`], one TLS policy, and one
-//! graceful shutdown.
+//! [`Server`] and the transports it runs.
 
 mod accept;
+#[cfg(any(feature = "tor", feature = "i2p"))]
+mod anonymous;
 mod bind;
 pub(crate) mod conn;
 #[cfg(feature = "http3")]
@@ -23,7 +12,7 @@ mod http;
 pub mod i2p;
 mod limits;
 #[cfg(feature = "tls")]
-mod redirect;
+pub(crate) mod redirect;
 mod run;
 pub(crate) mod security;
 mod shared;
@@ -66,8 +55,17 @@ pub(crate) const NO_PEER_ADDR: std::net::SocketAddr =
 
 /// Publishes an Axum [`Router`] over any mix of transports.
 ///
-/// Add transports, optionally tune [`limits`](Self::limits), [`security`](Self::security)
-/// and the TLS policy, then [`serve`](Self::serve):
+/// | Method | Serves | Feature |
+/// |---|---|---|
+/// | [`http`](Self::http) | HTTP/1.1, plus h2c with [`SecurityPolicy::allow_h2c`] | *(always)* |
+/// | `https` | HTTP/1.1 + HTTP/2 over TLS, plus HTTP/3 on the same port with `http3` | `tls` |
+/// | `redirect` | `308` to HTTPS, and ACME HTTP-01 answers | `tls` |
+/// | `onion` | a Tor v3 onion service | `tor` |
+/// | `i2p` | an I2P eepsite (breaks `forbid(unsafe_code)`, see the `i2p` module) | `i2p` |
+///
+/// All of them share one set of [`Limits`], one [`SecurityPolicy`], one TLS policy, and one
+/// graceful shutdown. Add transports, optionally tune [`limits`](Self::limits),
+/// [`security`](Self::security) and the TLS policy, then [`serve`](Self::serve):
 ///
 /// ```rust,no_run
 /// use axum::{Router, routing::get};
@@ -170,7 +168,7 @@ impl Server {
         self
     }
 
-    /// Publishes an I2P eepsite ([breaks `forbid(unsafe_code)`](i2p)).
+    /// Publishes an I2P eepsite ([breaks `forbid(unsafe_code)`](crate::i2p)).
     #[cfg(feature = "i2p")]
     #[must_use]
     pub fn i2p(mut self, config: i2p::I2pConfig) -> Self {

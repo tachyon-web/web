@@ -157,5 +157,13 @@ mod tests {
             .validate()
             .expect_err("spaces are not allowed");
         assert!(err.to_string().contains("not a nickname!!"));
+        #[cfg(feature = "tls")]
+        assert!(
+            OnionConfig::new("valid-nickname")
+                .tls(crate::tls::Tls::new())
+                .validate()
+                .is_err(),
+            "a TLS set without certificates"
+        );
     }
 }

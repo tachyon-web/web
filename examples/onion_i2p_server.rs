@@ -15,9 +15,9 @@
 use std::fmt::Write as _;
 
 use axum::{Router, routing::get};
-use tachyon_web::server::i2p::I2pConfig;
-use tachyon_web::server::tor::OnionConfig;
+use tachyon_web::i2p::I2pConfig;
 use tachyon_web::tls::{KeyAlgorithm, Tls};
+use tachyon_web::tor::OnionConfig;
 use tachyon_web::{Network, Server, ServerInfo};
 
 async fn mirrors(info: ServerInfo) -> String {

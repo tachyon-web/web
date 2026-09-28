@@ -1,4 +1,15 @@
-//! Routing, path/query extraction, JSON payloads, custom status codes.
+//! Routing, path/query extraction, JSON payloads, custom status codes, graceful shutdown.
+//!
+//! Run with:
+//!
+//! ```sh
+//! cargo run --example hello_world
+//!
+//! curl -sS http://127.0.0.1:8080/hello/world
+//! curl -sS 'http://127.0.0.1:8080/search?q=tachyon&limit=5'
+//! curl -sS http://127.0.0.1:8080/api/users -H 'Content-Type: application/json' \
+//!     -d '{"username":"ada","email":"ada@example.com"}'
+//! ```
 
 use axum::http::StatusCode;
 use axum::{

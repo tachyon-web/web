@@ -51,14 +51,13 @@ impl IpNetwork {
     ///
     /// # Errors
     ///
-    /// Returns an error if `prefix` exceeds 32 for IPv4 or 128 for IPv6.
-    pub fn new(address: IpAddr, prefix: u8) -> Result<Self, std::io::Error> {
+    /// [`Error::Config`](crate::Error::Config) if `prefix` exceeds 32 for IPv4 or 128 for IPv6.
+    pub fn new(address: IpAddr, prefix: u8) -> Result<Self, crate::Error> {
         let width = if address.is_ipv4() { 32 } else { 128 };
         if prefix > width {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "network prefix exceeds address width",
-            ));
+            return Err(crate::Error::config(format!(
+                "network prefix /{prefix} exceeds {address}'s width"
+            )));
         }
         Ok(Self { address, prefix })
     }
@@ -90,25 +89,16 @@ impl IpNetwork {
 }
 
 impl std::str::FromStr for IpNetwork {
-    type Err = std::io::Error;
+    type Err = crate::Error;
 
+    /// Parses CIDR notation, e.g. `10.0.0.0/8` or `2001:db8::/32`.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (address, prefix) = value.split_once('/').ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "network must use CIDR notation",
-            )
-        })?;
-        let address = address.parse::<IpAddr>().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid IP: {e}"))
-        })?;
-        let prefix = prefix.parse::<u8>().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("invalid network prefix: {e}"),
-            )
-        })?;
-        Self::new(address, prefix)
+        let invalid = || crate::Error::config(format!("{value:?} is not a CIDR network"));
+        let (address, prefix) = value.split_once('/').ok_or_else(invalid)?;
+        Self::new(
+            address.parse().map_err(|_| invalid())?,
+            prefix.parse().map_err(|_| invalid())?,
+        )
     }
 }
 
@@ -432,7 +422,11 @@ pub(crate) fn authority_host(authority: &str) -> Option<&str> {
     }
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
         let bracket_end = rest.find(']')?.checked_add(2)?;
-        (authority.get(..bracket_end)?, authority.get(bracket_end..)?)
+        let port = authority.get(bracket_end..)?;
+        if !port.is_empty() && !port.starts_with(':') {
+            return None;
+        }
+        (authority.get(..bracket_end)?, port)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
         if host.contains(':') {
             return None;
@@ -533,6 +527,74 @@ mod tests {
         let network = "10.2.0.0/16".parse::<IpNetwork>().expect("valid CIDR");
         assert!(network.contains("10.2.4.8".parse().expect("valid IP")));
         assert!(!network.contains("10.3.4.8".parse().expect("valid IP")));
+        let network = "2001:db8::/32".parse::<IpNetwork>().expect("valid CIDR");
+        assert!(network.contains("2001:db8::1".parse().expect("valid IP")));
+        assert!(!network.contains("2001:db9::1".parse().expect("valid IP")));
+        assert!(!network.contains("10.2.4.8".parse().expect("valid IP")));
+
+        let v4 = std::net::Ipv4Addr::from(rand::random::<u32>()).into();
+        let v6 = std::net::Ipv6Addr::from(rand::random::<u128>()).into();
+        assert!(IpNetwork::new(v4, 32).is_ok() && IpNetwork::new(v4, 33).is_err());
+        assert!(IpNetwork::new(v6, 128).is_ok() && IpNetwork::new(v6, 129).is_err());
+        for bad in ["10.0.0.0", "10.0.0/8", "10.0.0.0/x"] {
+            assert!(bad.parse::<IpNetwork>().is_err(), "{bad}");
+        }
+    }
+
+    /// Two framings for one body is the request-smuggling primitive (RFC 9112 §6.3): a
+    /// fronting proxy and this server could each pick a different one.
+    #[test]
+    fn ambiguous_message_framing_is_a_bad_request() {
+        let policy = SecurityPolicy::new();
+        let length = rand::random::<u32>().to_string();
+        let status = |headers: &[(&str, &str)]| {
+            let mut builder = Request::builder().uri("/");
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut request = builder.body(Body::empty()).expect("valid request");
+            policy
+                .inspect(&mut request, None, false, None)
+                .map(|response| response.status())
+        };
+
+        assert_eq!(status(&[("content-length", &length)]), None);
+        assert_eq!(
+            status(&[
+                ("transfer-encoding", "chunked"),
+                ("content-length", &length)
+            ]),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            status(&[("content-length", &length), ("content-length", "0x1")]),
+            Some(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    /// Every fail-safe default can be switched off, and switching it off does exactly that.
+    #[test]
+    fn relaxed_defaults_let_tunnels_forwarding_and_raw_responses_through() {
+        let policy = SecurityPolicy::new()
+            .allow_connect(true)
+            .strip_untrusted_forwarding_headers(false)
+            .harden_responses(false);
+        let mut tunnel = Request::builder()
+            .method(hyper::Method::CONNECT)
+            .uri("example.com:443")
+            .header("x-forwarded-for", "198.51.100.7")
+            .body(Body::empty())
+            .expect("valid request");
+        assert!(policy.inspect(&mut tunnel, None, false, None).is_none());
+        assert!(tunnel.headers().contains_key("x-forwarded-for"));
+
+        let mut response = empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        let _ = response.headers_mut().insert(
+            hyper::header::SERVER,
+            hyper::header::HeaderValue::from_static("app"),
+        );
+        policy.finalize_response(&mut response, true);
+        assert_eq!(response.headers().len(), 1);
     }
 
     /// A proxy reaching a dual-stack listener is reported as `::ffff:a.b.c.d`. Without

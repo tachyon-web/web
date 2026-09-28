@@ -11,7 +11,7 @@
 //! ```rust,no_run
 //! use axum::{Router, routing::get};
 //! use tachyon_web::{Network, Server, ServerInfo};
-//! use tachyon_web::server::tor::OnionConfig;
+//! use tachyon_web::tor::OnionConfig;
 //!
 //! async fn address(info: ServerInfo) -> String {
 //!     info.endpoints()

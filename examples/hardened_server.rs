@@ -101,7 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "10.0.0.0/8".parse::<IpNetwork>()?,
             IpNetwork::new(std::net::IpAddr::from([192, 168, 0, 0]), 16)?,
         ])
-        // All three are already the default; spelled out so this example documents them.
+        // These four settings are already the default; spelled out so this example documents
+        // them.
         .strip_untrusted_forwarding_headers(true)
         .allow_connect(false)
         // `nosniff`, `no-referrer`, `no-store` on errors, HSTS on secure transports, and

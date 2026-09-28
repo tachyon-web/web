@@ -114,9 +114,10 @@ impl Slot {
         }
     }
 
-    #[cfg(all(test, feature = "acme"))]
-    pub(crate) fn is_loaded(&self) -> bool {
-        self.0.read().is_ok_and(|slot| slot.is_some())
+    /// When the certificate being served expires, or `None` before one is loaded.
+    #[cfg(feature = "acme")]
+    pub(crate) fn expiry(&self) -> Option<SystemTime> {
+        Some(self.0.read().ok()?.as_ref()?.info.not_after)
     }
 }
 
@@ -255,12 +256,7 @@ pub(crate) fn build(
                 slot.set(key, info);
             }
             Source::PemFiles { cert, key } => {
-                let (key, info) = provided(
-                    &std::fs::read(cert)?,
-                    &std::fs::read(key)?,
-                    policy,
-                    &endpoints,
-                )?;
+                let (key, info) = provided(&read_pem(cert)?, &read_pem(key)?, policy, &endpoints)?;
                 slot.set(key, info);
             }
             #[cfg(feature = "acme")]
@@ -365,6 +361,15 @@ fn provided(
         policy,
         endpoints,
     )
+}
+
+fn read_pem(path: &std::path::Path) -> Result<Vec<u8>, Error> {
+    std::fs::read(path).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        ))
+    })
 }
 
 /// A self-signed certificate for `names`, reused from `store` when one was generated there
@@ -569,5 +574,12 @@ mod tests {
             assert_eq!(info.algorithm, Some(KeyAlgorithm::EcdsaP384));
         }
         assert!(format!("{tls:?}").contains("PemFiles"));
+
+        let missing = dir.path().join(format!("{:x}.pem", rand::random::<u64>()));
+        let tls = Tls::new().pem_files(&missing, &key_file);
+        match build(&tls, &TlsPolicy::new(), &[], "https://x", Vec::new()) {
+            Err(Error::Io(e)) => assert!(e.to_string().contains(&*missing.to_string_lossy())),
+            _ => panic!("a missing certificate file must fail the build, naming the file"),
+        }
     }
 }

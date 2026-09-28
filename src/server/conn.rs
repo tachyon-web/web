@@ -103,7 +103,6 @@ where
     Ok(())
 }
 
-// Both tests drive the connection with HTTP/1.1 first.
 #[cfg(all(test, feature = "http1"))]
 mod tests {
     use super::*;
@@ -112,7 +111,6 @@ mod tests {
 
     /// Drives `serve_connection` over an in-memory duplex pipe — the helper every transport
     /// calls, so this covers the negotiation they share.
-    #[cfg(feature = "http1")]
     #[tokio::test]
     async fn serve_connection_round_trips_a_request_over_a_duplex_pipe() {
         let (mut client_io, server_io) = tokio::io::duplex(8 * 1024);

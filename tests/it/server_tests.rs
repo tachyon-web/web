@@ -95,6 +95,33 @@ async fn the_body_limit_applies_to_extractors_and_the_wire_alike() {
     assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// A chunked body declares no length, so it is cut off on the wire as it crosses the limit —
+/// and refused with the same `413` as one that declared its size up front.
+#[tokio::test]
+async fn a_chunked_body_over_the_limit_is_refused_like_a_declared_one() {
+    let limit = rand::random_range(1024..4096);
+    let router = Router::new().route(
+        "/",
+        post(|body: Bytes| async move { body.len().to_string() }),
+    );
+    let server = TestServer::spawn_with(router, |server| {
+        server.limits(Limits::default().max_body_size(limit))
+    })
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
+    let body = vec![b'x'; limit + 1];
+    let head = format!(
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&body).await.unwrap();
+    stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+    let head = read_head(&mut stream).await;
+    assert!(head.starts_with("http/1.1 413"), "{head}");
+}
+
 /// With h2c off (the default) the HTTP/2 stack is not reachable on a plaintext port at all.
 #[cfg(feature = "http2")]
 #[tokio::test]

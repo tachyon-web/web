@@ -75,6 +75,17 @@ async fn contradictory_configurations_fail_before_binding() {
                 .serve()
                 .await
         ));
+        let tls = Tls::new()
+            .domains(["localhost"])
+            .self_signed(KeyAlgorithm::MlDsa87);
+        assert!(config_error(
+            Server::new(Router::new())
+                .https("127.0.0.1:0", tls)
+                .redirect("127.0.0.1:0")
+                .redirect("127.0.0.1:0")
+                .serve()
+                .await
+        ));
         assert!(config_error(
             Server::new(Router::new())
                 .https("127.0.0.1:0", Tls::new().self_signed(KeyAlgorithm::MlDsa87))
@@ -107,6 +118,7 @@ fn authority_host_strips_the_port_and_keeps_ipv6_brackets() {
     assert_eq!(authority_host("[2001:db8::1]:443"), Some("[2001:db8::1]"));
     assert_eq!(authority_host("[::1"), None);
     assert_eq!(authority_host("[::1]junk"), None);
+    assert_eq!(authority_host("[::1]8443"), None);
     assert_eq!(authority_host("example.com:not-a-port"), None);
     assert_eq!(authority_host("example.com:65536"), None);
     assert_eq!(authority_host("user@example.com"), None);

@@ -37,7 +37,7 @@
 //! ```rust,no_run
 //! use axum::{Router, routing::get};
 //! use tachyon_web::{Network, Server, ServerInfo};
-//! use tachyon_web::server::i2p::I2pConfig;
+//! use tachyon_web::i2p::I2pConfig;
 //!
 //! async fn address(info: ServerInfo) -> String {
 //!     info.endpoints()
@@ -63,17 +63,17 @@
 //!
 //! [`I2pConfig::signature_type`] picks the identity's signature algorithm, used only when the
 //! keys are first generated (default [`tachyon_i2p::SigType::Eddsa25519`]).
-//! [`I2pConfig::crypto_type`] narrows the encryption types the `LeaseSet2` advertises, on every
+//! [`I2pConfig::encryption_types`] narrows the encryption types the `LeaseSet2` advertises, on every
 //! run. By default that is `ElGamal` + ECIES-X25519, plus ML-KEM-768 hybrid on a PQ-capable
 //! backend:
 //!
 //! ```rust,no_run
-//! use tachyon_web::server::i2p::I2pConfig;
+//! use tachyon_web::i2p::I2pConfig;
 //! use tachyon_i2p::{CryptoType, SigType};
 //!
 //! let config = I2pConfig::new("my-eepsite")
 //!     .signature_type(SigType::Eddsa25519)
-//!     .crypto_type(CryptoType::EciesX25519); // classical-only, no ML-KEM component
+//!     .encryption_types([CryptoType::EciesX25519]); // classical-only, no ML-KEM component
 //! ```
 
 mod config;

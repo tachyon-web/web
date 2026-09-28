@@ -17,10 +17,8 @@ use tor_rtcompat::PreferredRuntime;
 use super::OnionConfig;
 use super::config::parse_nickname;
 use crate::server::accept::ConnectionLimit;
-use crate::server::conn::serve_connection;
-use crate::server::http::hyper_handler;
-use crate::server::shared::{Origin, Shared};
-use crate::server::stall::WriteDeadline;
+use crate::server::anonymous::{Acceptor, serve_stream};
+use crate::server::shared::Shared;
 use crate::{Endpoint, Error, Network, Reachability};
 
 /// The virtual port plaintext HTTP clients connect to, as a browser assumes for `http://`.
@@ -28,13 +26,6 @@ const ONION_HTTP_PORT: u16 = 80;
 /// The virtual port HTTPS clients connect to.
 #[cfg(feature = "tls")]
 const ONION_HTTPS_PORT: u16 = 443;
-
-#[cfg(feature = "tls")]
-type Acceptor = tokio_rustls::TlsAcceptor;
-/// Uninhabited: without `tls` there is never an acceptor.
-#[cfg(not(feature = "tls"))]
-#[derive(Clone)]
-enum Acceptor {}
 
 /// Publishes `config`'s onion service and serves it until the service stops or the future is
 /// dropped.
@@ -60,27 +51,10 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<()
         .map(|addr| addr.display_unredacted().to_string())
         .ok_or_else(|| Error::transport("arti reported no onion address"))?
         .into();
-    shared.allow_host(&host);
+    shared.allow_hosts([host.to_string()]);
 
     #[cfg(feature = "tls")]
-    let acceptor = match &config.tls {
-        Some(tls) => {
-            let url = format!("https://{host}");
-            let names: Vec<String> = std::iter::once(host.to_string())
-                .chain(tls.domains.iter().cloned())
-                .collect();
-            let built = crate::tls::certs::build(
-                tls,
-                &shared.tls_policy,
-                &names,
-                &url,
-                crate::server::alpn(false),
-            )?;
-            shared.info.add_certificates(built.store);
-            Some(tokio_rustls::TlsAcceptor::from(built.config))
-        }
-        None => None,
-    };
+    let acceptor = crate::server::anonymous::acceptor(&shared, config.tls.as_ref(), &host)?;
     #[cfg(not(feature = "tls"))]
     let acceptor: Option<Acceptor> = None;
     #[cfg(feature = "tls")]
@@ -102,8 +76,12 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<()
     let mut last_state = None;
     let streams = tor_hsservice::handle_rend_requests(requests);
     tokio::pin!(streams);
+    // On shutdown, stop taking streams but keep `service` alive: dropping it cuts the
+    // connections still draining. The task is aborted once they have closed.
+    let mut draining = false;
     loop {
         tokio::select! {
+            () = shared.shutdown.requested(), if !draining => draining = true,
             Some(status) = status_events.next() => {
                 let state = status.state();
                 if last_state != Some(state) {
@@ -117,7 +95,7 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<()
                     shared.info.set_reachability(&host, reachability);
                 }
             }
-            request = streams.next() => {
+            request = streams.next(), if !draining => {
                 let Some(request) = request else { break };
                 let permit = shared.connections.acquire().await;
                 let shared = shared.clone();
@@ -129,6 +107,7 @@ pub(crate) async fn serve(shared: Arc<Shared>, config: OnionConfig) -> Result<()
                     }
                 });
             }
+            else => std::future::pending().await,
         }
     }
     drop(service);
@@ -228,44 +207,30 @@ async fn handle_stream(
         request.shutdown_circuit()?;
         return Ok(());
     };
-    let action = route_onion_request(begin.port(), acceptor.is_some(), redirect_http);
-    if action == OnionAction::Reject {
-        request.shutdown_circuit()?;
-        return Ok(());
-    }
-    let stream = WriteDeadline::new(accept_onion_stream(request).await?);
-    let handler = shared.clone();
-    match action {
-        OnionAction::Reject => Ok(()),
+    match route_onion_request(begin.port(), acceptor.is_some(), redirect_http) {
+        OnionAction::Reject => {
+            request.shutdown_circuit()?;
+            Ok(())
+        }
         OnionAction::ServePlaintext => {
-            let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(handler.clone(), req, Origin::plain(None))
-            });
-            let http2 = shared.security.allows_h2c();
-            serve_connection(stream, svc, http2, &shared.shutdown).await
+            serve_stream(shared, accept_onion_stream(request).await?, None).await
+        }
+        #[cfg(feature = "tls")]
+        OnionAction::ServeTls => {
+            serve_stream(shared, accept_onion_stream(request).await?, acceptor).await
         }
         #[cfg(feature = "tls")]
         OnionAction::Redirect => {
+            use crate::server::shared::Origin;
+            let stream =
+                crate::server::stall::WriteDeadline::new(accept_onion_stream(request).await?);
+            let handler = shared.clone();
             let svc = hyper::service::service_fn(move |req: hyper::Request<_>| {
                 let mut response = redirect_response(&req, &host);
                 handler.finalize(&mut response, Origin::plain(None));
                 async move { Ok::<_, std::io::Error>(response) }
             });
-            serve_connection(stream, svc, false, &shared.shutdown).await
-        }
-        #[cfg(feature = "tls")]
-        OnionAction::ServeTls => {
-            let Some(acceptor) = acceptor else {
-                return Ok(());
-            };
-            let Some(tls) = crate::server::http::tls_handshake(&shared, &acceptor, stream).await
-            else {
-                return Ok(());
-            };
-            let svc = hyper::service::service_fn(move |req| {
-                hyper_handler(handler.clone(), req, Origin::tls(None))
-            });
-            serve_connection(tls, svc, true, &shared.shutdown).await
+            crate::server::conn::serve_connection(stream, svc, false, &shared.shutdown).await
         }
     }
 }

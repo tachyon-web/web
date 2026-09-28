@@ -176,6 +176,10 @@ mod tests {
         std::fs::create_dir(store.join("not-a-file")).expect("mkdir");
         assert!(opened.read("not-a-file").is_err());
 
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&store, &link).expect("create symlink");
+        assert!(Store::open(&link).is_err(), "a symlinked store is refused");
+
         std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o750))
             .expect("loosen permissions");
         assert!(Store::open(&store).is_err());

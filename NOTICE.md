@@ -1,8 +1,8 @@
 # Third-party notices
 
 Tachyon-Web builds directly on [Axum](https://github.com/tokio-rs/axum) as its application
-layer: `Router`, extractors, responses, and middleware are Axum's, re-exported unmodified
-(`pub use axum::*` in `src/lib.rs`). Tachyon adds the transport, hardening, and deployment
+layer: `Router`, extractors, responses, and middleware are Axum's, used unmodified from the
+application's own `axum` dependency. Tachyon adds the transport, hardening, and deployment
 layers around it.
 
 Axum is used under the MIT license:

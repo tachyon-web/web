@@ -10,7 +10,7 @@
 
 use axum::Router;
 use axum::routing::get;
-use tachyon_web::server::tor::OnionConfig;
+use tachyon_web::tor::OnionConfig;
 use tachyon_web::{Network, Reachability, Server, ServerInfo};
 
 /// Publishes an onion service, fetches a page from it through a second Tor client, and checks

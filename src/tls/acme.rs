@@ -198,10 +198,9 @@ impl Manager {
         )
     }
 
-    /// Activates the cached certificate if it is still valid, returning its expiry. A
-    /// certificate inside the renewal window is still activated, so a failing renewal doesn't
-    /// take the listener down with it.
-    pub(crate) fn load_cached(&self) -> Option<SystemTime> {
+    /// Activates the cached certificate if it is still valid. A certificate inside the renewal
+    /// window is still activated, so a failing renewal doesn't take the listener down with it.
+    pub(crate) fn load_cached(&self) {
         let stem = self.cert_stem();
         let loaded = (|| {
             let cert = self.store.read(&format!("{stem}.crt"))?;
@@ -213,24 +212,16 @@ impl Manager {
         })();
         match loaded {
             Ok(Some((key, info))) if info.not_after > SystemTime::now() => {
-                if !same_names(&info.names, &self.domains) {
+                if same_names(&info.names, &self.domains) {
+                    self.slot.set(key, info);
+                    info!("[acme] loaded cached certificate {stem}");
+                } else {
                     warn!("[acme] cached {stem} does not cover {:?}", self.domains);
-                    return None;
                 }
-                let expiry = info.not_after;
-                self.slot.set(key, info);
-                info!("[acme] loaded cached certificate {stem}");
-                Some(expiry)
             }
-            Ok(Some(_)) => {
-                warn!("[acme] cached {stem} has expired");
-                None
-            }
-            Ok(None) => None,
-            Err(e) => {
-                warn!("[acme] cached {stem} is unusable: {e}");
-                None
-            }
+            Ok(Some(_)) => warn!("[acme] cached {stem} has expired"),
+            Ok(None) => {}
+            Err(e) => warn!("[acme] cached {stem} is unusable: {e}"),
         }
     }
 
@@ -251,37 +242,30 @@ impl Manager {
         )
     }
 
-    /// The renewal loop; runs until the server stops. The active certificate's expiry is
-    /// tracked in memory, so a cache write that failed neither triggers a daily re-order nor
-    /// lets an older cached certificate replace the one being served.
+    /// The renewal loop; runs until the server stops. Renewal is judged by the certificate
+    /// actually being served, so a cache write that failed neither triggers a daily re-order
+    /// nor lets an older cached certificate replace it.
     pub(crate) async fn run(self) {
         let mut backoff = BACKOFF_INITIAL;
-        let mut active_expiry = None;
         loop {
-            if active_expiry.is_none_or(renewal_due) {
-                active_expiry = self.load_cached().or(active_expiry);
-            }
-            if active_expiry.is_none_or(renewal_due) {
-                match self.provision().await {
-                    Ok(expiry) => active_expiry = Some(expiry),
-                    Err(e) => {
-                        error!("[acme] provisioning failed: {e}. Retrying in {backoff:?}");
-                        tokio::time::sleep(backoff).await;
-                        backoff = backoff
-                            .checked_mul(2)
-                            .unwrap_or(BACKOFF_MAX)
-                            .min(BACKOFF_MAX);
-                        continue;
-                    }
-                }
+            if self.slot.expiry().is_none_or(renewal_due)
+                && let Err(e) = self.provision().await
+            {
+                error!("[acme] provisioning failed: {e}. Retrying in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = backoff
+                    .checked_mul(2)
+                    .unwrap_or(BACKOFF_MAX)
+                    .min(BACKOFF_MAX);
+                continue;
             }
             backoff = BACKOFF_INITIAL;
             tokio::time::sleep(CHECK_INTERVAL).await;
         }
     }
 
-    /// Runs the full HTTP-01 flow, caches the result, activates it, and returns its expiry.
-    async fn provision(&self) -> Result<SystemTime, Error> {
+    /// Runs the full HTTP-01 flow, caches the result, and activates it.
+    async fn provision(&self) -> Result<(), Error> {
         info!("[acme] ordering a certificate for {:?}", self.domains);
         let account = self.account().await?;
         let identifiers: Vec<Identifier> = self
@@ -332,10 +316,9 @@ impl Manager {
         {
             error!("[acme] failed to cache {stem}: {e}");
         }
-        let expiry = info.not_after;
         self.slot.set(key, info);
         info!("[acme] issued and activated {stem}");
-        Ok(expiry)
+        Ok(())
     }
 
     /// An [`AccountBuilder`] whose client talks to the CA with the build's default policy — the
@@ -524,10 +507,11 @@ mod tests {
         let (cert, key) = cert_for(&domains, Duration::from_hours(10 * 24));
         write_cached(&manager, &cert, &key);
 
+        manager.load_cached();
         let expiry = manager
-            .load_cached()
+            .slot
+            .expiry()
             .expect("a still-valid cert is activated");
-        assert!(manager.slot.is_loaded());
         assert!(renewal_due(expiry));
     }
 
@@ -541,20 +525,22 @@ mod tests {
         let (cert, _) = cert_for(&domains, Duration::from_hours(90 * 24));
         let (_, stale_key) = cert_for(&domains, Duration::from_hours(90 * 24));
         write_cached(&manager, &cert, &stale_key);
-        assert!(manager.load_cached().is_none());
+        manager.load_cached();
+        assert!(manager.slot.expiry().is_none());
 
         let mut wider = domains;
         wider.extend(random_domains());
         let (cert, key) = cert_for(&wider, Duration::from_hours(90 * 24));
         write_cached(&manager, &cert, &key);
-        assert!(manager.load_cached().is_none());
-        assert!(!manager.slot.is_loaded());
+        manager.load_cached();
+        assert!(manager.slot.expiry().is_none());
     }
 
     /// HTTP-01 cannot prove a wildcard, and IP literals would be ordered as DNS names and never
-    /// match their cache, re-ordering on every start.
+    /// match their cache, re-ordering on every start. Nor can it issue without a store to keep
+    /// the account in, or for an address only an anonymity network can reach.
     #[test]
-    fn acme_refuses_names_http01_cannot_validate() {
+    fn acme_refuses_configurations_it_cannot_order() {
         let tls = |name: String| {
             crate::tls::Tls::new()
                 .domains([name])
@@ -566,5 +552,38 @@ mod tests {
         assert!(validate(format!("*.{}", random_domains().remove(0))).is_err());
         let ip = std::net::Ipv4Addr::from(rand::random::<u32>());
         assert!(validate(ip.to_string()).is_err());
+
+        let storeless = crate::tls::Tls::new()
+            .domains(random_domains())
+            .acme(Acme::lets_encrypt());
+        assert!(crate::tls::certs::validate(&storeless, false).is_err());
+        assert!(crate::tls::certs::validate(&tls(random_domains().remove(0)), true).is_err());
+    }
+
+    /// The port-80 listener answers a registered HTTP-01 token with its key authorization, and
+    /// redirects it like any other path once the token is gone.
+    #[tokio::test]
+    async fn the_redirect_listener_answers_only_active_challenges() {
+        use http_body_util::BodyExt as _;
+
+        let token = format!("{:x}", rand::random::<u128>());
+        let key_authorization = format!("{token}.{:x}", rand::random::<u128>());
+        let hosts = random_domains();
+        let request = || {
+            hyper::Request::get(format!("/.well-known/acme-challenge/{token}"))
+                .header(hyper::header::HOST, hosts.concat())
+                .body(())
+                .expect("request")
+        };
+
+        register_challenge(token.clone(), key_authorization.clone());
+        let answer = crate::server::redirect::redirect_or_challenge(&request(), &hosts, "");
+        assert_eq!(answer.status(), hyper::StatusCode::OK);
+        let body = answer.into_body().collect().await.expect("body").to_bytes();
+        assert_eq!(body, key_authorization.as_bytes());
+
+        unregister_challenge(&token);
+        let moved = crate::server::redirect::redirect_or_challenge(&request(), &hosts, "");
+        assert_eq!(moved.status(), hyper::StatusCode::PERMANENT_REDIRECT);
     }
 }

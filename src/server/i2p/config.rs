@@ -46,7 +46,7 @@ impl I2pConfig {
     ///
     /// Defaults: plaintext, keys at `./.tachyon-i2p/<nickname>.keys`,
     /// [`SigType::default`], and libi2pd's automatic encryption set (see
-    /// [`crypto_type`](Self::crypto_type)).
+    /// [`encryption_types`](Self::encryption_types)).
     #[must_use]
     pub fn new(nickname: impl Into<String>) -> Self {
         Self {
@@ -79,36 +79,25 @@ impl I2pConfig {
         self
     }
 
-    /// Advertises exactly one encryption algorithm — shorthand for
-    /// [`encryption_types`](Self::encryption_types) with one entry.
-    ///
-    /// By default libi2pd publishes `ElGamal` + ECIES-X25519, plus ML-KEM-768+X25519 on a
-    /// post-quantum-capable backend, which suits most callers.
-    #[must_use]
-    pub fn crypto_type(mut self, crypto: CryptoType) -> Self {
-        self.encryption_types = vec![crypto];
-        self
-    }
-
     /// Overrides the encryption algorithms this destination's `LeaseSet2` advertises, on every
     /// run. The first entry is preferred; peers skip entries they don't understand, so later
     /// entries are fallbacks:
     ///
     /// ```rust,no_run
-    /// use tachyon_web::server::i2p::I2pConfig;
+    /// use tachyon_web::i2p::I2pConfig;
     /// use tachyon_i2p::CryptoType;
     ///
-    /// let config = I2pConfig::new("my-eepsite").encryption_types(&[
+    /// let config = I2pConfig::new("my-eepsite").encryption_types([
     ///     CryptoType::EciesMlkem1024X25519, // preferred: strongest post-quantum option
     ///     CryptoType::EciesX25519,          // fallback: peers that don't understand ML-KEM yet
     /// ]);
     /// ```
     ///
-    /// An empty slice restores the default automatic hybrid set described on
-    /// [`crypto_type`](Self::crypto_type)'s docs.
+    /// By default (or given an empty list) libi2pd publishes `ElGamal` + ECIES-X25519, plus
+    /// ML-KEM-768+X25519 on a post-quantum-capable backend, which suits most callers.
     #[must_use]
-    pub fn encryption_types(mut self, types: &[CryptoType]) -> Self {
-        self.encryption_types = types.to_vec();
+    pub fn encryption_types(mut self, types: impl IntoIterator<Item = CryptoType>) -> Self {
+        self.encryption_types = types.into_iter().collect();
         self
     }
 
@@ -190,12 +179,12 @@ mod tests {
     fn encryption_types_keep_preference_order_and_replace_each_other() {
         use tachyon_i2p::CryptoType;
         let config = I2pConfig::new("nick")
-            .encryption_types(&[CryptoType::EciesMlkem1024X25519, CryptoType::EciesX25519]);
+            .encryption_types([CryptoType::EciesMlkem1024X25519, CryptoType::EciesX25519]);
         assert_eq!(
             config.encryption_types,
             [CryptoType::EciesMlkem1024X25519, CryptoType::EciesX25519]
         );
-        let config = config.crypto_type(CryptoType::EciesX25519);
+        let config = config.encryption_types([CryptoType::EciesX25519]);
         assert_eq!(config.encryption_types, [CryptoType::EciesX25519]);
     }
 }

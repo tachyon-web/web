@@ -74,16 +74,26 @@ async fn send_head_only(
     let _ = write_within(stream.finish()).await;
 }
 
-/// Serves HTTP/3 on `quic_server` until the future is dropped.
+/// Serves HTTP/3 on `quic_server` until the future is dropped. Stops accepting on shutdown,
+/// but keeps the endpoint open: the connections still draining live on it.
 pub(crate) async fn serve_h3(shared: Arc<Shared>, mut quic_server: tachyon_quic::s2n_quic::Server) {
     let port = quic_server.local_addr().ok().map(|addr| addr.port());
-    while let Some(conn) = quic_server.accept().await {
+    loop {
+        let conn = tokio::select! {
+            biased;
+            () = shared.shutdown.requested() => break,
+            conn = quic_server.accept() => conn,
+        };
+        let Some(conn) = conn else {
+            return;
+        };
         let permit = shared.connections.acquire().await;
         let shared = shared.clone();
         ConnectionLimit::serve(permit, async move {
             shared.handle_h3_connection(conn, port).await;
         });
     }
+    std::future::pending::<()>().await;
 }
 
 impl Shared {
@@ -150,12 +160,7 @@ impl Shared {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    let err_str = e.to_string();
-                    if !err_str.contains("application error")
-                        && !err_str.contains("ConnectionError")
-                    {
-                        crate::telemetry_debug!("[h3] stream accept error: {}", e);
-                    }
+                    crate::telemetry_debug!("[h3] connection closed: {e}");
                     break;
                 }
             }
@@ -249,12 +254,9 @@ impl Shared {
         let body_bytes = match self.read_h3_body(&parts, &mut stream).await {
             Ok(bytes) => bytes,
             Err(status) => {
-                let mut response = Response::builder()
-                    .status(status)
-                    .body(())
-                    .unwrap_or_else(|_| Response::new(()));
+                let mut response = crate::server::security::empty_response(status);
                 self.finalize(&mut response, origin);
-                send_head_only(&mut stream, response).await;
+                send_head_only(&mut stream, response.map(|_| ())).await;
                 return;
             }
         };

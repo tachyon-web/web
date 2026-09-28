@@ -1,8 +1,8 @@
 //! Tests for native I2P `.b32.i2p` eepsite support (the `i2p` feature).
 //!
-//! Most coverage lives as unit tests inside `src/server/i2p.rs` — `I2pConfig`'s builder
-//! defaults/toggles and its keys-file path resolution are pure and tested there without
-//! needing any network access.
+//! Most coverage lives as unit tests inside `src/server/i2p/config.rs` — `I2pConfig`'s
+//! nickname validation, encryption types and keys-file path resolution are pure and tested
+//! there without needing any network access.
 //!
 //! This file covers one full round-trip test that starts the vendored `libi2pd` router,
 //! publishes an eepsite, and fetches a page from it over a real I2P stream (via a second,
@@ -16,7 +16,7 @@
 
 use axum::Router;
 use tachyon_i2p::I2pRouter;
-use tachyon_web::server::i2p::I2pConfig;
+use tachyon_web::i2p::I2pConfig;
 
 /// Publishes a real eepsite serving a tiny [`Router`], connects to it from a second, transient
 /// destination sharing the same [`I2pRouter`], and asserts the HTTP response round-trips

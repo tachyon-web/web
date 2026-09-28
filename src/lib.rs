@@ -70,7 +70,7 @@
 //! | `fips` | | AWS-LC's FIPS 140-3 module in approved mode, and the restricted TLS policy |
 //! | `cnsa` | | the CNSA 2.0 profile: `fips`, ML-KEM-1024, ML-DSA-87 only; excludes `acme` |
 //! | `tor` | | Tor v3 onion services via `arti-client` |
-//! | `i2p` | | I2P eepsites via an embedded `libi2pd` — links C++, see `server::i2p` |
+//! | `i2p` | | I2P eepsites via an embedded `libi2pd` — links C++, see the `i2p` module |
 //!
 //! Axum's own features (`json`, `ws`, `macros`, …) are enabled on your `axum` dependency.
 //! At least one of `http1`/`http2` must stay enabled.
@@ -143,10 +143,14 @@ struct ReadmeDoctests;
 
 mod error;
 mod info;
-pub mod server;
+mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
 
 pub use error::Error;
 pub use info::{Endpoint, Network, Reachability, ServerInfo};
+#[cfg(feature = "i2p")]
+pub use server::i2p;
+#[cfg(feature = "tor")]
+pub use server::tor;
 pub use server::{Bind, IpNetwork, Limits, SecurityPolicy, Serve, Server};

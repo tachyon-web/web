@@ -147,7 +147,7 @@ listeners, and each with its own optional `Tls` set. See
 [`examples/onion_i2p_server.rs`](examples/onion_i2p_server.rs).
 
 `i2p` is the one feature that links C++ through an FFI shim (`tachyon-i2p`/`i2pd-sys`), so it sits
-outside the crate's `#![forbid(unsafe_code)]` guarantee. Read the `tachyon_web::server::i2p` module
+outside the crate's `#![forbid(unsafe_code)]` guarantee. Read the `tachyon_web::i2p` module
 docs before using it for anything security-sensitive.
 
 ## Examples

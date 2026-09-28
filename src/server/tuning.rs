@@ -47,7 +47,7 @@ macro_rules! tune_http2 {
             // ~512 fields (the HPACK half of CVE-2026-49975).
             .max_header_list_size(16 * 1024)
             // Per stream: bounds what a peer holding its window shut can pin (the other half of
-            // CVE-2026-49975) — 12.8 MiB per connection here vs. 80 MiB at hyper's default.
+            // CVE-2026-49975) — 12.5 MiB per connection here vs. ~78 MiB at hyper's default.
             .max_send_buf_size(64 * 1024)
             // `keep_alive_timeout` does nothing without an interval; a silent peer would
             // otherwise hold its connection permit forever.

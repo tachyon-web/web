@@ -227,6 +227,44 @@ async fn the_handshake_permit_is_released_once_a_handshake_completes() {
     task.abort();
 }
 
+/// Graceful shutdown stops every TLS-side transport — HTTPS, the redirect listener and, with
+/// `http3`, the QUIC endpoint — and resolves `Ok` once their connections close.
+#[tokio::test]
+async fn graceful_shutdown_stops_every_tls_transport() {
+    let https = TcpListener::bind("127.0.0.1:0").await.expect("bind https");
+    let redirect = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind redirect");
+    let url = format!("https://{}/", https.local_addr().unwrap());
+    let tls = Tls::new()
+        .domains(["127.0.0.1"])
+        .self_signed(KeyAlgorithm::EcdsaP256);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(
+        Server::new(Router::new().route("/", get(|| async { "ok" })))
+            .https(https, tls)
+            .redirect(redirect)
+            .serve()
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .into_future(),
+    );
+
+    let client = tls_client();
+    assert_eq!(
+        client.get(&url).send().await.expect("request").status(),
+        200
+    );
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server returns once its connections close")
+        .unwrap()
+        .expect("a graceful stop is not an error");
+    assert!(client.get(&url).send().await.is_err());
+}
+
 /// A failed bind fails the start, and releases every listener bound before it.
 #[tokio::test]
 async fn a_failed_bind_fails_the_start_and_frees_the_other_ports() {

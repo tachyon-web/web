@@ -98,14 +98,19 @@ impl Shared {
         self.hosts.read().ok().and_then(|hosts| hosts.clone())
     }
 
-    /// Adds a published `.onion`/`.b32.i2p` address to an enforced allow-list.
+    /// Adds names an anonymity transport learned once running — its published address, and
+    /// its certificates' names — to an enforced allow-list.
     #[cfg(any(feature = "tor", feature = "i2p"))]
-    pub(crate) fn allow_host(&self, host: &str) {
+    pub(crate) fn allow_hosts(&self, names: impl IntoIterator<Item = String>) {
         if let Ok(mut slot) = self.hosts.write()
             && let Some(hosts) = slot.as_ref()
         {
             let mut hosts = hosts.to_vec();
-            hosts.push(host.to_string());
+            for name in names {
+                if !hosts.iter().any(|host| host.eq_ignore_ascii_case(&name)) {
+                    hosts.push(name);
+                }
+            }
             *slot = Some(hosts.into());
         }
     }

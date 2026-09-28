@@ -27,8 +27,8 @@ pub struct Limits {
     /// Handlers running at once; excess requests get an immediate `503` rather than a queue.
     /// Default: 1,024.
     pub max_active_requests: usize,
-    /// TLS handshakes in flight; excess connections are dropped before any asymmetric crypto.
-    /// Default: 1,024.
+    /// TLS-over-TCP handshakes in flight; excess connections are dropped before any asymmetric
+    /// crypto. HTTP/3's QUIC handshakes are bounded by the QUIC stack instead. Default: 1,024.
     pub max_tls_handshakes: usize,
     /// HTTP/3 streams per QUIC connection. H3 bodies are buffered, so one connection can pin
     /// about `max_h3_streams × max_body_size`. Default: 32.
