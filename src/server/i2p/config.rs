@@ -101,8 +101,8 @@ impl I2pConfig {
         self
     }
 
-    /// Publishes through an already-started router. Only one may run per process, so this is
-    /// how a second eepsite shares it.
+    /// Publishes through an already-started router. Only one may run per process, so a server
+    /// with more than one eepsite must give each of them the same router.
     #[must_use]
     pub fn router(mut self, router: I2pRouter) -> Self {
         self.router = Some(router);
@@ -116,6 +116,11 @@ impl I2pConfig {
     pub fn tls(mut self, tls: crate::tls::Tls) -> Self {
         self.tls = Some(tls);
         self
+    }
+
+    /// Whether serving this eepsite starts a router of its own.
+    pub(crate) const fn starts_router(&self) -> bool {
+        self.router.is_none()
     }
 
     pub(crate) fn validate(&self) -> Result<(), Error> {

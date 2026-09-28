@@ -178,7 +178,7 @@ Axum's own features (`json`, `ws`, `macros`, …) belong on your `axum` dependen
 | `http3` | | HTTP/3 over QUIC beside every HTTPS endpoint, via [`tachyon-quic`](https://crates.io/crates/tachyon-quic) |
 | `acme` | | in-process ACME (Let's Encrypt, or any RFC 8555 CA) issuance and renewal |
 | `fips` | | AWS-LC's FIPS 140-3 Level 1 module in approved mode, and the restricted TLS policy |
-| `cnsa` | | the CNSA 2.0 profile: `fips`, TLS 1.3 AES-256-GCM, ML-KEM-1024, ML-DSA-87 only, no resumption; excludes `acme` |
+| `cnsa` | | the CNSA 2.0 profile: `fips`, TLS 1.3 AES-256-GCM, ML-KEM-1024, ML-DSA-87 only, no resumption; excludes `acme`, `tls12-legacy`, `tor` and `i2p` |
 | `tor` | | Tor v3 onion services via `arti-client` |
 | `i2p` | | I2P eepsites via an embedded `libi2pd`. Links `unsafe` FFI — see [Tor and I2P](#tor-and-i2p) |
 

@@ -142,6 +142,23 @@ impl Server {
                 ));
             }
         }
+        #[cfg(feature = "i2p")]
+        {
+            let eepsites = self
+                .transports
+                .iter()
+                .filter_map(|t| match t {
+                    Transport::I2p(config) => Some(config),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if eepsites.len() > 1 && eepsites.iter().any(|config| config.starts_router()) {
+                return Err(Error::config(
+                    "only one I2P router runs per process: give every eepsite the same \
+                     I2pConfig::router",
+                ));
+            }
+        }
         for transport in &self.transports {
             match transport {
                 #[cfg(feature = "tor")]

@@ -1,16 +1,18 @@
-//! One clearnet endpoint, three certificates, plus a Tor mirror — and a page that shows
-//! visitors exactly what they can pin.
+//! One clearnet endpoint, three certificates — and a page that shows visitors exactly what
+//! they can pin.
 //!
 //! - **Let's Encrypt ECDSA P-256**: what every browser is served, because it is first.
-//! - **Self-signed ML-DSA-87**: post-quantum clients offer ML-DSA, which no browser does yet,
-//!   so only they receive it.
+//! - **Self-signed ML-DSA-87**: served to clients that offer ML-DSA but not P-256; no browser
+//!   offers ML-DSA yet.
 //! - **Self-signed ECDSA P-521**: a pinning client that offers *only*
 //!   `ecdsa_secp521r1_sha512` receives it and verifies it against its pin instead of a CA.
 //!
 //! The store keeps the self-signed keys across restarts, so their fingerprints — rendered at
 //! `/.well-known/pins` — stay valid for pins and attestation reports.
 //!
-//! Needs everything `lets_encrypt.rs` does (public DNS, port 80 reachable). Run with:
+//! Needs everything `lets_encrypt.rs` does (public DNS, port 80 reachable), and like it orders
+//! from Let's Encrypt staging: switch to `Acme::lets_encrypt()` for a browser-trusted
+//! certificate. Run with:
 //!
 //! ```sh
 //! cargo run --example multi_cert --features acme

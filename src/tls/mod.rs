@@ -221,7 +221,8 @@ impl Tls {
     ///
     /// Required for [`acme`](Self::acme). Without it self-signed certificates are regenerated on
     /// every start, so nothing can pin them. The directory is created `0700` if missing and
-    /// refused if it is a symlink, grants group or other access, or belongs to another user.
+    /// refused if it is a symlink, grants group or other access, or (on Linux and Android)
+    /// belongs to another user.
     #[must_use]
     pub fn store(mut self, dir: impl Into<PathBuf>) -> Self {
         self.store = Some(dir.into());

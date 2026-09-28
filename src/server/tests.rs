@@ -93,6 +93,14 @@ async fn contradictory_configurations_fail_before_binding() {
                 .await
         ));
     }
+    #[cfg(feature = "i2p")]
+    assert!(config_error(
+        Server::new(Router::new())
+            .i2p(i2p::I2pConfig::new(format!("a{:x}", rand::random::<u64>())))
+            .i2p(i2p::I2pConfig::new(format!("b{:x}", rand::random::<u64>())))
+            .serve()
+            .await
+    ));
     #[cfg(feature = "acme")]
     {
         use crate::tls::{Acme, Tls};

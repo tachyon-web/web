@@ -66,9 +66,9 @@
 //! | `tls` | | TLS 1.3 via `rustls` + `aws-lc-rs`, and self-signed certificate generation |
 //! | `tls12-legacy` | | additionally offer TLS 1.2 |
 //! | `http3` | | HTTP/3 beside every HTTPS endpoint |
-//! | `acme` | | in-process ACME (Let's Encrypt) issuance and renewal |
+//! | `acme` | | in-process ACME (Let's Encrypt, or any RFC 8555 CA) issuance and renewal |
 //! | `fips` | | AWS-LC's FIPS 140-3 module in approved mode, and the restricted TLS policy |
-//! | `cnsa` | | the CNSA 2.0 profile: `fips`, ML-KEM-1024, ML-DSA-87 only; excludes `acme` |
+//! | `cnsa` | | the CNSA 2.0 profile: `fips`, ML-KEM-1024, ML-DSA-87 only; excludes `acme`, `tls12-legacy`, `tor` and `i2p` |
 //! | `tor` | | Tor v3 onion services via `arti-client` |
 //! | `i2p` | | I2P eepsites via an embedded `libi2pd` — links C++, see the `i2p` module |
 //!
@@ -122,6 +122,12 @@ compile_error!(
 #[cfg(all(feature = "cnsa", feature = "tls12-legacy"))]
 compile_error!(
     "the `cnsa` and `tls12-legacy` features are mutually exclusive: CNSA 2.0 is TLS 1.3 only"
+);
+
+#[cfg(all(feature = "cnsa", any(feature = "tor", feature = "i2p")))]
+compile_error!(
+    "the `cnsa` feature is mutually exclusive with `tor` and `i2p`: neither network's own \
+     cryptography is CNSA 2.0, and a CNSA-only TLS provider cannot reach Tor relays"
 );
 
 #[cfg(not(any(feature = "http1", feature = "http2")))]

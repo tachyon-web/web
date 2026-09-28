@@ -113,10 +113,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake
       - run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,cnsa --all-targets
       - run: cargo test --locked -p tachyon-web --no-default-features --features http1,cnsa --lib
-      # CNSA is only ever exercised above without an anonymity transport, and the anonymity
-      # transports never without TLS. Both combinations have broken the build before while
-      # every other job stayed green, so they get their own checks here.
-      - run: cargo clippy --locked -p tachyon-web --no-default-features --features http1,http2,cnsa,tor,i2p --all-targets
+      # `cnsa` excludes `tor` and `i2p`, so they are checked here without it — with TLS and,
+      # since no other job does, without. Both have broken the build before while every other
+      # job stayed green.
       - run: cargo clippy --locked -p tachyon-web --all-targets --features tls,acme,http3,tor,i2p
       - run: cargo clippy --locked -p tachyon-web --all-targets --no-default-features --features http1,tor,i2p
       # Each anonymity transport on its own with TLS, where no other transport keeps shared

@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-1.0, a minor bump (`0.x`) is where breaking changes land; patch releases stay
 compatible. While the crate is `0.0.x`, every release may break.
 
-## Unreleased
+## [0.0.3] - 2026-09-28
 
 A rewrite around real Axum: Tachyon is now the transport layer only, and the app is written
 against your own `axum` 0.8 dependency.
@@ -42,4 +42,6 @@ against your own `axum` 0.8 dependency.
 - `SecurityPolicy`, including opt-in h2c via `allow_h2c`.
 - `tracing` feature (default) for transport-layer events.
 - `tls12-legacy` feature to additionally offer TLS 1.2.
-- `cnsa` feature for the CNSA 2.0 profile.
+- `cnsa` feature for the CNSA 2.0 profile; it excludes `acme`, `tls12-legacy`, `tor` and `i2p`.
+
+[0.0.3]: https://crates.io/crates/tachyon-web/0.0.3

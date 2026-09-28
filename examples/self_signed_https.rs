@@ -2,7 +2,7 @@
 //! local-development counterpart to `lets_encrypt.rs`.
 //!
 //! Two self-signed certificates share the endpoint: ECDSA P-256 for ordinary clients, and
-//! ML-DSA-65 for clients that offer ML-DSA. Uses unprivileged ports so it runs without root;
+//! ML-DSA-65 for clients that offer ML-DSA but not P-256. Uses unprivileged ports so it runs without root;
 //! with `--features http3`, HTTP/3 is served on the same port over UDP.
 //!
 //! Run with:
