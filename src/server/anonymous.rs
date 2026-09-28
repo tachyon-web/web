@@ -75,7 +75,9 @@ where
         }
         #[cfg(feature = "tls")]
         Some(acceptor) => {
-            let Some(tls) = crate::server::http::tls_handshake(&shared, &acceptor, stream).await
+            let timeout = crate::server::ANONYMOUS_TLS_HANDSHAKE_TIMEOUT;
+            let Some(tls) =
+                crate::server::http::tls_handshake(&shared, &acceptor, stream, timeout).await
             else {
                 return Ok(());
             };

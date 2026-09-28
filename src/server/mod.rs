@@ -37,6 +37,10 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Handshake timeout for TLS connections.
 #[cfg(feature = "tls")]
 pub(crate) const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Handshake timeout for TLS over Tor and I2P. The server waits about two round trips for a
+/// handshake, and a single onion-circuit or I2P-tunnel round trip can take seconds.
+#[cfg(all(feature = "tls", any(feature = "tor", feature = "i2p")))]
+pub(crate) const ANONYMOUS_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a single write may make no progress before the connection (or, on HTTP/3, the
 /// stream) is abandoned.
 ///
@@ -252,13 +256,14 @@ fn enforce_fips_compliance() -> Result<(), crate::Error> {
 /// memory, rather than something wrong with one connection — the signal to back off instead
 /// of spinning.
 ///
-/// `23`/`24`/`10024` are `ENFILE`/`EMFILE`/`WSAEMFILE`; the platform-gated codes below are
-/// `ENOMEM`/`ENOBUFS` or their equivalents.
+/// Raw codes because `std::io::ErrorKind` has no variant for descriptor exhaustion.
 pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
     let Some(code) = e.raw_os_error() else {
         return false;
     };
-    if matches!(code, 23 | 24 | 10024) {
+    #[cfg(unix)]
+    if matches!(code, 23 | 24) {
+        // ENFILE | EMFILE
         return true;
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -279,8 +284,8 @@ pub(crate) fn is_resource_exhaustion(e: &std::io::Error) -> bool {
         return true;
     }
     #[cfg(windows)]
-    if matches!(code, 10055 | 8) {
-        // WSAENOBUFS | WSA_NOT_ENOUGH_MEMORY
+    if matches!(code, 10024 | 10055 | 8) {
+        // WSAEMFILE | WSAENOBUFS | WSA_NOT_ENOUGH_MEMORY
         return true;
     }
     false

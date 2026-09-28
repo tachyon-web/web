@@ -15,8 +15,8 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use instant_acme::{
-    Account, AccountBuilder, AccountCredentials, BodyWrapper, ChallengeType, Identifier,
-    NewAccount, NewOrder, OrderStatus,
+    Account, AccountBuilder, AccountCredentials, AuthorizationStatus, BodyWrapper, ChallengeType,
+    Identifier, NewAccount, NewOrder, OrderStatus,
 };
 
 use super::certs::{Issuer, Slot, certify, names_id};
@@ -345,11 +345,14 @@ impl Manager {
         );
         match self.store.read(&file) {
             Ok(Some(json)) => match serde_json::from_slice::<AccountCredentials>(&json) {
+                // Restoring only fetches the CA directory, so a failure here is the network, not
+                // the account: registering anew would overwrite good credentials and burn the
+                // CA's new-account rate limit on every outage.
                 Ok(credentials) => {
-                    match Self::account_builder()?.from_credentials(credentials).await {
-                        Ok(account) => return Ok(account),
-                        Err(e) => warn!("[acme] cached account rejected, registering anew: {e}"),
-                    }
+                    return Self::account_builder()?
+                        .from_credentials(credentials)
+                        .await
+                        .map_err(acme_error);
                 }
                 Err(e) => warn!("[acme] cached account unparsable, registering anew: {e}"),
             },
@@ -415,6 +418,13 @@ async fn run_http01_challenges(
         let mut auths = order.authorizations();
         while let Some(auth) = auths.next().await {
             let mut auth = auth.map_err(acme_error)?;
+            // RFC 8555 §7.5.1: only pending authorizations take a response. The CA reuses recent
+            // validations, so a renewal often finds some already valid.
+            match auth.status {
+                AuthorizationStatus::Pending => {}
+                AuthorizationStatus::Valid => continue,
+                status => return Err(acme_error(format!("authorization is {status:?}"))),
+            }
             let mut challenge = auth
                 .challenge(ChallengeType::Http01)
                 .ok_or_else(|| acme_error("the CA offered no HTTP-01 challenge"))?;

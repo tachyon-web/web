@@ -240,7 +240,8 @@ pub(crate) async fn serve_tls(
         let shared = shared.clone();
         let acceptor = acceptor.clone();
         ConnectionLimit::serve(permit, async move {
-            let Some(tls) = tls_handshake(&shared, &acceptor, WriteDeadline::new(stream)).await
+            let io = WriteDeadline::new(stream);
+            let Some(tls) = tls_handshake(&shared, &acceptor, io, TLS_HANDSHAKE_TIMEOUT).await
             else {
                 return;
             };
@@ -266,6 +267,7 @@ pub(crate) async fn tls_handshake<IO>(
     shared: &Shared,
     acceptor: &TlsAcceptor,
     io: IO,
+    timeout: std::time::Duration,
 ) -> Option<tokio_rustls::server::TlsStream<IO>>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -274,7 +276,7 @@ where
         crate::telemetry_debug!("[tls] handshake shed at concurrency limit");
         return None;
     };
-    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(io)).await {
+    match tokio::time::timeout(timeout, acceptor.accept(io)).await {
         Ok(Ok(stream)) => Some(stream),
         Ok(Err(e)) => {
             crate::telemetry_debug!("[tls] handshake error: {e}");

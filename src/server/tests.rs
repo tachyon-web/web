@@ -157,13 +157,8 @@ fn redirects_only_ever_target_an_allowed_host() {
 
 #[test]
 fn is_resource_exhaustion_matches_only_known_codes() {
-    for code in [23, 24, 10024] {
-        assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(
-            code
-        )));
-    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    for code in [12, 105] {
+    for code in [23, 24, 12, 105] {
         assert!(is_resource_exhaustion(&std::io::Error::from_raw_os_error(
             code
         )));

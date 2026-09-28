@@ -226,33 +226,13 @@ async fn handle_stream(
                 crate::server::stall::WriteDeadline::new(accept_onion_stream(request).await?);
             let handler = shared.clone();
             let svc = hyper::service::service_fn(move |req: hyper::Request<_>| {
-                let mut response = redirect_response(&req, &host);
+                let mut response = crate::server::redirect::https_redirect(&req, &host, "");
                 handler.finalize(&mut response, Origin::plain(None));
                 async move { Ok::<_, std::io::Error>(response) }
             });
             crate::server::conn::serve_connection(stream, svc, false, &shared.shutdown).await
         }
     }
-}
-
-/// The `308` (method-preserving) to the `https://` form of a plaintext onion request.
-#[cfg(feature = "tls")]
-fn redirect_response<B>(
-    req: &hyper::Request<B>,
-    onion_host: &str,
-) -> hyper::Response<axum::body::Body> {
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-    hyper::Response::builder()
-        .status(hyper::StatusCode::PERMANENT_REDIRECT)
-        .header(
-            hyper::header::LOCATION,
-            format!("https://{onion_host}{path_and_query}"),
-        )
-        .body(axum::body::Body::empty())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -278,18 +258,5 @@ mod tests {
             assert_eq!(route_onion_request(80, true, true), OnionAction::Redirect);
             assert_eq!(route_onion_request(443, true, true), OnionAction::ServeTls);
         }
-    }
-
-    #[cfg(feature = "tls")]
-    #[test]
-    fn redirect_preserves_path_and_query() {
-        let host = format!("{:x}.onion", rand::random::<u128>());
-        let req = hyper::Request::get("/foo?x=1").body(()).expect("request");
-        let response = super::redirect_response(&req, &host);
-        assert_eq!(response.status(), hyper::StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(
-            response.headers()[hyper::header::LOCATION],
-            format!("https://{host}/foo?x=1").as_str()
-        );
     }
 }

@@ -455,9 +455,11 @@ mod tests {
         let get_body = recv_all(&mut get_stream).await;
         assert_eq!(get_body, b"hello from h3");
 
-        // POST /echo with a Content-Length under `max_body_size` — covers the `recv_data`
-        // accumulation loop and the Content-Length pre-allocation branch in `read_h3_body`.
-        let payload = b"round trip me over quic".to_vec();
+        // POST /echo with an exact Content-Length under `max_body_size` — covers the
+        // `recv_data` accumulation loop and the pre-allocation branch in `read_h3_body`.
+        let payload: Vec<u8> = (0..rand::random_range(1..64 * 1024))
+            .map(|_| rand::random())
+            .collect();
         let post_req = hyper::Request::builder()
             .method("POST")
             .uri("https://localhost/echo")
@@ -530,40 +532,6 @@ mod tests {
                 "declared {declared}, sent {actual}"
             );
         }
-
-        drop(send_request);
-        driver_task.abort();
-    }
-
-    /// The happy path the check above must not break: a body whose length matches its declared
-    /// `Content-Length` exactly still round-trips.
-    #[tokio::test]
-    async fn h3_exact_content_length_still_round_trips() {
-        let app = Router::new().route("/echo", post(echo));
-        let (addr, cert_pem) = start_h3_server(app, Limits::default(), None);
-
-        let (mut send_request, driver_task) = h3_connect(addr, &cert_pem).await;
-
-        let payload = vec![b'z'; 4096];
-        let req = hyper::Request::builder()
-            .method("POST")
-            .uri("https://localhost/echo")
-            .header(hyper::header::CONTENT_LENGTH, payload.len())
-            .body(())
-            .expect("build POST request");
-        let mut stream = send_request
-            .send_request(req)
-            .await
-            .expect("send POST request");
-        stream
-            .send_data(Bytes::from(payload.clone()))
-            .await
-            .expect("send POST body");
-        stream.finish().await.expect("finish POST request stream");
-
-        let response = stream.recv_response().await.expect("recv response");
-        assert_eq!(response.status(), hyper::StatusCode::OK);
-        assert_eq!(recv_all(&mut stream).await, payload);
 
         drop(send_request);
         driver_task.abort();

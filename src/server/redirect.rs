@@ -130,17 +130,22 @@ pub(crate) fn redirect_or_challenge<B>(
         .get(hyper::header::HOST)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    let Some(redirect_host) = resolve_redirect_host(host, allowed_hosts) else {
-        return empty_response(StatusCode::BAD_REQUEST);
-    };
+    resolve_redirect_host(host, allowed_hosts).map_or_else(
+        || empty_response(StatusCode::BAD_REQUEST),
+        |redirect_host| https_redirect(req, redirect_host, port_suffix),
+    )
+}
+
+/// A `308` to `req` on `https://{host}{port_suffix}`. Only an origin-form target has a path to
+/// carry over; `*` and authority-form targets go to `/`.
+pub(crate) fn https_redirect<B>(req: &Request<B>, host: &str, port_suffix: &str) -> Response<Body> {
     let path_and_query = req
         .uri()
         .path_and_query()
-        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-    let location = format!(
-        "https://{}{port_suffix}{path_and_query}",
-        UrlHost(redirect_host)
-    );
+        .map(hyper::http::uri::PathAndQuery::as_str)
+        .filter(|target| target.starts_with('/'))
+        .unwrap_or("/");
+    let location = format!("https://{}{port_suffix}{path_and_query}", UrlHost(host));
     let Ok(location) = hyper::header::HeaderValue::from_str(&location) else {
         return empty_response(StatusCode::BAD_REQUEST);
     };
@@ -153,7 +158,7 @@ pub(crate) fn redirect_or_challenge<B>(
 
 #[cfg(test)]
 mod tests {
-    use super::UrlHost;
+    use super::{UrlHost, https_redirect};
 
     /// Allow-list entries hold IPv6 literals unbracketed, so splicing one straight into a
     /// `Location` produced `https://::1:8443/` — not a URL any client can follow.
@@ -162,5 +167,35 @@ mod tests {
         assert_eq!(UrlHost("::1").to_string(), "[::1]");
         assert_eq!(UrlHost("[::1]").to_string(), "[::1]");
         assert_eq!(UrlHost("example.com").to_string(), "example.com");
+    }
+
+    /// The path and query survive; an asterisk-form target has no path and must not be spliced
+    /// onto the host as `https://host*`.
+    #[test]
+    fn redirects_keep_the_path_of_origin_form_targets_only() {
+        let host = format!("{:x}.example", rand::random::<u64>());
+        let query = rand::random::<u32>();
+        let location = |method: hyper::Method, target: String| {
+            let req = hyper::Request::builder()
+                .method(method)
+                .uri(target)
+                .body(())
+                .expect("request");
+            let response = https_redirect(&req, &host, ":8443");
+            assert_eq!(response.status(), hyper::StatusCode::PERMANENT_REDIRECT);
+            response.headers()[hyper::header::LOCATION]
+                .to_str()
+                .expect("ASCII location")
+                .to_string()
+        };
+
+        assert_eq!(
+            location(hyper::Method::GET, format!("/a/b?q={query}")),
+            format!("https://{host}:8443/a/b?q={query}")
+        );
+        assert_eq!(
+            location(hyper::Method::OPTIONS, "*".to_string()),
+            format!("https://{host}:8443/")
+        );
     }
 }
