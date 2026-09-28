@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # Marvin (rsa 0.9), pulled in only by arti via the `tor` feature; no fixed release exists.
+    # Arti as a client/onion service only verifies RSA signatures (public-key ops, unaffected);
+    # RSA private keys exist only in the relay role, which this crate never runs.
+    # Re-check on every arti bump.
+    "RUSTSEC-2023-0071",
+]
